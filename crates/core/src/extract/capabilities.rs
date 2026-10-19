@@ -176,6 +176,17 @@ pub(super) fn infer(ctx: &mut Ctx) {
                 if FILE_CALLS.contains(&n) && fileish {
                     add(&r.enclosing, "FILE_IO");
                 }
+                if recv_last == "playerprefs" || recv_last == "editorprefs" {
+                    add(&r.enclosing, "LOCAL_STORAGE");
+                }
+                if recv.contains("unitywebrequest")
+                    || rtype.contains("unitywebrequest")
+                    || n == "SendWebRequest"
+                    || n == "GetHttpsCallable"
+                    || (n == "CallAsync" && (recv.contains("callable") || recv.contains("function")))
+                {
+                    add(&r.enclosing, "NETWORK_IO");
+                }
                 if recv.contains("cache") || recv.contains("redis") || rtype.contains("cache") {
                     add(&r.enclosing, "CACHE");
                 }
@@ -194,6 +205,7 @@ pub(super) fn infer(ctx: &mut Ctx) {
             "database" => add(&m.enclosing, "DB_WRITE"),
             "cache" => add(&m.enclosing, "CACHE"),
             "global_var" => add(&m.enclosing, "GLOBAL_STATE"),
+            "storage" => add(&m.enclosing, "LOCAL_STORAGE"),
             _ => {}
         }
     }

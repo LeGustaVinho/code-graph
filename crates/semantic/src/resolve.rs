@@ -108,6 +108,19 @@ const STOP_NAMES: &[&str] = &[
 
 const MAX_AMBIGUOUS: usize = 12;
 
+/// Language keyword / primitive types that can appear as static call receivers.
+const BUILTIN_TYPES: &[&str] = &[
+    "string", "int", "long", "short", "byte", "sbyte", "uint", "ulong", "ushort", "float", "double", "decimal", "bool", "char",
+    "object", "nint", "nuint", "dynamic", "Math", "Mathf", "String", "Int32", "Int64", "Boolean", "Double", "Single", "Object",
+    "Array", "Number", "JSON", "Promise", "console", "str", "dict", "list", "len",
+];
+
+enum Chain {
+    Type(usize, Confidence, String),
+    External,
+    Unknown,
+}
+
 pub struct FileResolver<'a> {
     pub index: &'a SymbolIndex,
     pub file: &'a str,
@@ -297,11 +310,17 @@ impl<'a> FileResolver<'a> {
         let mut target = t;
         let mut evidence = evidence;
         if self.index.syms[t].sym.kind.is_type() {
-            let ctor = self
+            let ctors: Vec<usize> = self
                 .index
                 .children
                 .get(&self.index.syms[t].sym.id)
-                .and_then(|kids| kids.iter().copied().find(|k| self.index.syms[*k].sym.kind == SymbolKind::Constructor));
+                .map(|kids| kids.iter().copied().filter(|k| self.index.syms[*k].sym.kind == SymbolKind::Constructor).collect())
+                .unwrap_or_default();
+            let ctor = ctors
+                .iter()
+                .copied()
+                .find(|c| r.arg_count.map(|a| accepts_args(&self.index.syms[*c].sym.params, a)).unwrap_or(true))
+                .or_else(|| ctors.first().copied());
             if let Some(c) = ctor {
                 target = c;
                 evidence = format!("{evidence} (constructor)");
@@ -389,16 +408,38 @@ impl<'a> FileResolver<'a> {
             }
             n => {
                 let sym = format!("{tname}.{method}");
+                // Production code never dispatches to test doubles: if exactly one candidate is
+                // a real implementation, link it (inferred) and name the excluded doubles.
+                let caller_is_test = self.index.get(&r.enclosing).map(|s| s.sym.is_test || codegraph_core::extract::is_test_path(&s.file)).unwrap_or(false);
+                if !caller_is_test {
+                    let (doubles, real): (Vec<usize>, Vec<usize>) = targets.iter().partition(|t| self.is_test_double(**t));
+                    if real.len() == 1 && !doubles.is_empty() {
+                        let owner = |i: usize| self.index.get(self.index.syms[i].sym.parent_id.as_deref().unwrap_or("")).map(|p| p.sym.name.clone()).unwrap_or_default();
+                        let excluded: Vec<String> = doubles.iter().map(|d| owner(*d)).collect();
+                        let ev = format!("single production implementation {} of {tname} (test doubles excluded: {})", owner(real[0]), excluded.join(", "));
+                        self.emit_call(r, real[0], Confidence::Inferred, ev, "dispatch-resolver");
+                        return;
+                    }
+                }
                 self.emit_unresolved_call(r, &sym, format!("{n} potential implementations of {sym}"), &targets);
             }
         }
     }
 
     fn call_on_type(&mut self, r: &Reference, t: usize, conf: Confidence, ev: String, field: Option<&str>) -> bool {
-        let methods: Vec<usize> =
+        let mut methods: Vec<usize> =
             self.index.members_named(t, &r.name).into_iter().filter(|m| self.index.syms[*m].sym.kind.is_callable()).collect();
         if methods.is_empty() {
             return false;
+        }
+        // Overload resolution by arity: keep only the overloads that accept this many arguments.
+        if methods.len() > 1 {
+            if let Some(argc) = r.arg_count {
+                let fit: Vec<usize> = methods.iter().copied().filter(|m| accepts_args(&self.index.syms[*m].sym.params, argc)).collect();
+                if !fit.is_empty() {
+                    methods = fit;
+                }
+            }
         }
         for m in &methods {
             self.emit_call(r, *m, conf, ev.clone(), "call-resolver");
@@ -422,6 +463,11 @@ impl<'a> FileResolver<'a> {
                     if let Some(t) = self.enclosing_type(&r.enclosing) {
                         let tn = self.index.syms[t].sym.name.clone();
                         if self.call_on_type(r, t, Confidence::Exact, format!("same-class method of {tn}"), None) {
+                            return;
+                        }
+                        // Not declared in the project: inherited from an engine/framework base
+                        // (`StartCoroutine`, `Instantiate`, `GetComponent`).
+                        if self.has_external_base(t) && matches!(self.index.resolve_value(&r.name, file, &r.enclosing), Resolved::None) {
                             return;
                         }
                     }
@@ -466,6 +512,23 @@ impl<'a> FileResolver<'a> {
                         }
                     }
                     return;
+                }
+                let head = recv_l.split(['.', '?', '[', '(']).next().unwrap_or(recv_l);
+                // Built-in C# / TS type keywords used as static receivers (`string.IsNullOrEmpty`).
+                if BUILTIN_TYPES.contains(&head) {
+                    return;
+                }
+                // Members inherited from an external base (`gameObject.SetActive`, `transform.position`).
+                if r.receiver_type.is_none() && r.root_type.is_none() && head.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false) {
+                    if let Some(t) = self.enclosing_type(&r.enclosing) {
+                        if self.index.members_named(t, head).is_empty()
+                            && self.has_external_base(t)
+                            && matches!(self.index.resolve_value(head, file, &r.enclosing), Resolved::None)
+                            && self.index.import_binding(file, head).is_none()
+                        {
+                            return;
+                        }
+                    }
                 }
                 let field = recv_l.strip_prefix("this.").or_else(|| recv_l.strip_prefix("self."));
                 // Typed receiver (declared / inferred static type).
@@ -516,9 +579,141 @@ impl<'a> FileResolver<'a> {
                         Resolved::Many(_) => {}
                     }
                 }
+                // Member chains: `GameInstance.Network.Call()`, `_renderer.material.SetColor()`.
+                if recv_l.contains('.') && !recv_l.contains('(') && !recv_l.contains('[') {
+                    match self.resolve_chain(r, recv_l) {
+                        Chain::Type(t, c, ev) => {
+                            self.call_on_type(r, t, c, ev, None);
+                            return;
+                        }
+                        Chain::External => return,
+                        Chain::Unknown => {}
+                    }
+                }
                 self.global_by_name(r, true);
             }
         }
+    }
+
+    /// A method used as a value (`event += OnClick`, `AddListener(OnClick)`, `setTimeout(this.tick)`)
+    /// is a reference to that method: record it as a CALLS edge flagged as a delegate.
+    fn method_group(&mut self, r: &Reference) -> bool {
+        let target = match r.receiver.as_deref() {
+            None if self.lang == Language::CSharp => self.enclosing_type(&r.enclosing).and_then(|t| {
+                self.index.members_named(t, &r.name).into_iter().find(|m| matches!(self.index.syms[*m].sym.kind, SymbolKind::Method))
+            }),
+            None => match self.index.resolve_value(&r.name, self.file, &r.enclosing) {
+                Resolved::One(t, _, _) if self.index.syms[t].sym.kind == SymbolKind::Function => Some(t),
+                _ => None,
+            },
+            Some("this") | Some("self") => self.enclosing_type(&r.enclosing).and_then(|t| {
+                self.index.members_named(t, &r.name).into_iter().find(|m| matches!(self.index.syms[*m].sym.kind, SymbolKind::Method))
+            }),
+            _ => None,
+        };
+        let Some(m) = target else { return false };
+        let e = Edge::new(&r.enclosing, self.file, Some(self.target(m)), relation::CALLS, Confidence::Exact, format!("method reference {} passed as delegate/callback", r.name), "call-resolver", r.line)
+            .with_meta(json!({ "delegate": true }));
+        self.push(e);
+        true
+    }
+
+    /// Mock / fake / stub implementations, or anything living in a test folder.
+    fn is_test_double(&self, member: usize) -> bool {
+        let s = &self.index.syms[member];
+        let owner = s.sym.parent_id.as_deref().and_then(|p| self.index.get(p)).map(|p| p.sym.name.as_str()).unwrap_or("");
+        let lower = owner.to_ascii_lowercase();
+        codegraph_core::extract::is_test_path(&s.file)
+            || ["mock", "fake", "stub", "dummy", "spy"].iter().any(|p| lower.starts_with(p) || lower.ends_with(p))
+    }
+
+    /// True when the type (or one of its project ancestors) derives from a type outside the project.
+    fn has_external_base(&self, t: usize) -> bool {
+        let mut stack = vec![t];
+        let mut seen = HashSet::new();
+        while let Some(x) = stack.pop() {
+            let s = &self.index.syms[x];
+            if !seen.insert(s.sym.id.clone()) {
+                continue;
+            }
+            let resolved = self.index.bases.get(&s.sym.id).cloned().unwrap_or_default();
+            if s.sym.bases.len() > resolved.len() {
+                return true;
+            }
+            stack.extend(resolved.iter().filter_map(|(b, _)| self.index.by_id.get(b).copied()));
+        }
+        false
+    }
+
+    /// Walks `head.member.member` through declared field / property types.
+    fn resolve_chain(&self, r: &Reference, recv: &str) -> Chain {
+        let segs: Vec<&str> = recv.split('.').map(|s| s.trim_end_matches(['?', '!']).trim()).filter(|s| !s.is_empty()).collect();
+        if segs.len() < 2 {
+            return Chain::Unknown;
+        }
+        let upper = |s: &str| s.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false);
+        let (mut cur, mut conf, start) = if segs[0] == "this" || segs[0] == "self" || segs[0] == "base" {
+            match self.enclosing_type(&r.enclosing) {
+                Some(t) => (t, Confidence::Exact, 1),
+                None => return Chain::Unknown,
+            }
+        } else if let Some(rt) = &r.root_type {
+            match self.index.resolve_type(rt, self.file) {
+                Resolved::One(t, c, _) => (t, c, 1),
+                Resolved::None => return Chain::External,
+                Resolved::Many(_) => return Chain::Unknown,
+            }
+        } else if upper(segs[0]) {
+            // Longest namespace-qualified prefix naming a project type (`Game.Core.Foo.Bar`).
+            let mut found = None;
+            for k in (1..=segs.len()).rev() {
+                if k == 1 {
+                    if let Resolved::One(t, c, _) = self.index.resolve_type(segs[0], self.file) {
+                        found = Some((t, c, 1));
+                    }
+                } else {
+                    let prefix = segs[..k].join(".");
+                    let hit = self.index.syms.iter().position(|s| {
+                        s.sym.kind.is_type() && (s.sym.qualified_name == prefix || s.sym.qualified_name.ends_with(&format!(".{prefix}")))
+                    });
+                    if let Some(t) = hit {
+                        found = Some((t, Confidence::Exact, k));
+                        break;
+                    }
+                }
+            }
+            match found {
+                Some(f) => f,
+                // `UnityEngine.Debug`, `System.IO.File`: a qualified external type.
+                None if segs.iter().all(|s| upper(s)) => return Chain::External,
+                None => return Chain::Unknown,
+            }
+        } else {
+            return Chain::Unknown;
+        };
+        for seg in &segs[start..] {
+            let member = self.index.members_named(cur, seg).into_iter().find(|m| {
+                matches!(self.index.syms[*m].sym.kind, SymbolKind::Field | SymbolKind::Property | SymbolKind::Const | SymbolKind::Variable)
+            });
+            match member {
+                Some(m) => {
+                    let ms = &self.index.syms[m];
+                    let Some(ty) = ms.sym.type_ref.clone() else { return Chain::Unknown };
+                    match self.index.resolve_type(&ty, &ms.file) {
+                        Resolved::One(t, c, _) => {
+                            cur = t;
+                            conf = conf.weakest(c);
+                        }
+                        Resolved::None => return Chain::External,
+                        Resolved::Many(_) => return Chain::Unknown,
+                    }
+                }
+                None if self.has_external_base(cur) => return Chain::External,
+                None => return Chain::Unknown,
+            }
+        }
+        let tn = self.index.syms[cur].sym.name.clone();
+        Chain::Type(cur, conf, format!("member chain {recv}: {tn}"))
     }
 
     /// Last resort: match by name across the project (inferred / unresolved).
@@ -640,6 +835,9 @@ impl<'a> FileResolver<'a> {
     }
 
     fn var_access(&mut self, r: &Reference) {
+        if r.kind == RefKind::Read && self.method_group(r) {
+            return;
+        }
         let rel = if r.kind == RefKind::Write { relation::WRITES_VAR } else { relation::READS_VAR };
         let is_var = |idx: &SymbolIndex, i: usize| idx.syms[i].sym.kind.is_variable();
         let file = self.file;
@@ -678,6 +876,14 @@ impl<'a> FileResolver<'a> {
             let e = Edge::new(&r.enclosing, file, Some(self.target(t)), rel, c, ev, "var-tracker", r.line);
             self.push(e);
         }
+    }
+}
+
+/// True when a callable with these parameters can be invoked with `argc` arguments.
+fn accepts_args(params: &Option<codegraph_core::ParamInfo>, argc: u32) -> bool {
+    match params {
+        None => true,
+        Some(p) => argc >= p.required && (p.variadic || argc <= p.total),
     }
 }
 

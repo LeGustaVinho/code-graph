@@ -165,7 +165,7 @@ pub fn trace_error_flow(ctx: &Ctx, p: ErrorFlowParams) -> ToolResult {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityParams {
-    /// Tags: DB_READ, DB_WRITE, NETWORK_IO, FILE_IO, ASYNC, AUTH_REQUIRED, CACHE, CONFIG_READ, THROWS, GLOBAL_STATE, LOGGING, EVENT_EMIT.
+    /// Tags: DB_READ, DB_WRITE, NETWORK_IO, FILE_IO, LOCAL_STORAGE, ASYNC, AUTH_REQUIRED, CACHE, CONFIG_READ, THROWS, GLOBAL_STATE, LOGGING, EVENT_EMIT.
     pub tags: Vec<String>,
     /// Optional module filter (path fragment or qualified-name prefix).
     pub module: Option<String>,
@@ -345,6 +345,15 @@ pub fn find_orphaned_symbols(ctx: &Ctx, p: OrphanParams) -> ToolResult {
                 None => {
                     external_base.insert(src);
                 }
+            }
+        }
+    }
+    // Methods invoked by name (`Invoke("Foo")`, `StartCoroutine("Foo")`, `SendMessage("Foo")`, reflection).
+    {
+        let mut st = conn.prepare("SELECT DISTINCT literal_value FROM literal_occurrence WHERE literal_type = 'string' AND length(literal_value) BETWEEN 3 AND 80")?;
+        for v in st.query_map([], |r| r.get::<_, String>(0))?.flatten() {
+            if v.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                dynamic_names.insert(v);
             }
         }
     }

@@ -195,6 +195,9 @@ pub struct Reference {
     /// Statically known type of the receiver (from declarations in scope).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver_type: Option<String>,
+    /// For member chains (`a.b.c`), the declared type of the head `a` (or the enclosing class for `this.`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arg_count: Option<u32>,
     pub line: u32,

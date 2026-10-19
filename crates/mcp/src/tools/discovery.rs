@@ -45,7 +45,8 @@ pub fn search_universal(ctx: &Ctx, p: SearchParams) -> ToolResult {
     let include_literals = p.kind.as_deref() == Some("literal");
     let (rows, total) = query::search(ctx.conn, &p.query, p.kind.as_deref(), limit, include_literals)?;
     let mut out = Out::new();
-    out.h(format!("{} match(es) for '{}' ({:.1} ms)", total, p.query, t0.elapsed().as_secs_f64() * 1000.0));
+    let total_label = if total >= 1000 { "1000+".to_string() } else { total.to_string() };
+    out.h(format!("{total_label} match(es) for '{}' ({:.1} ms)", p.query, t0.elapsed().as_secs_f64() * 1000.0));
     let json = wants_json(&p.format);
     for n in &rows {
         out.item(if json { node_json(n) } else { node_line_sig(n) });

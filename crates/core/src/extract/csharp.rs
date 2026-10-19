@@ -16,6 +16,133 @@ struct ClassInfo {
 
 pub(crate) fn extract(ctx: &mut Ctx, root: Node) {
     visit_container(ctx, root);
+    // Statements outside any declaration in a file that failed to parse are parser
+    // recovery artifacts, not a C# 9 top-level program.
+    if root.has_error() {
+        let m = &mut ctx.facts.symbols[0];
+        if m.entry_kind.as_deref() == Some("main (top-level statements)") {
+            m.is_entrypoint = false;
+            m.entry_kind = None;
+        }
+    }
+}
+
+/// Methods the Unity engine / editor invokes by name on MonoBehaviour, ScriptableObject,
+/// Editor, EditorWindow and StateMachineBehaviour subclasses.
+const UNITY_MESSAGES: &[&str] = &[
+    "Awake",
+    "Start",
+    "Update",
+    "FixedUpdate",
+    "LateUpdate",
+    "OnEnable",
+    "OnDisable",
+    "OnDestroy",
+    "OnValidate",
+    "Reset",
+    "OnGUI",
+    "OnApplicationPause",
+    "OnApplicationFocus",
+    "OnApplicationQuit",
+    "OnTriggerEnter",
+    "OnTriggerExit",
+    "OnTriggerStay",
+    "OnTriggerEnter2D",
+    "OnTriggerExit2D",
+    "OnTriggerStay2D",
+    "OnCollisionEnter",
+    "OnCollisionExit",
+    "OnCollisionStay",
+    "OnCollisionEnter2D",
+    "OnCollisionExit2D",
+    "OnCollisionStay2D",
+    "OnControllerColliderHit",
+    "OnMouseDown",
+    "OnMouseUp",
+    "OnMouseUpAsButton",
+    "OnMouseEnter",
+    "OnMouseExit",
+    "OnMouseOver",
+    "OnMouseDrag",
+    "OnBecameVisible",
+    "OnBecameInvisible",
+    "OnDrawGizmos",
+    "OnDrawGizmosSelected",
+    "OnRenderObject",
+    "OnPreRender",
+    "OnPostRender",
+    "OnPreCull",
+    "OnWillRenderObject",
+    "OnRenderImage",
+    "OnAnimatorMove",
+    "OnAnimatorIK",
+    "OnParticleCollision",
+    "OnParticleTrigger",
+    "OnParticleSystemStopped",
+    "OnTransformParentChanged",
+    "OnTransformChildrenChanged",
+    "OnRectTransformDimensionsChange",
+    "OnCanvasGroupChanged",
+    "OnDidApplyAnimationProperties",
+    "OnBeforeTransformParentChanged",
+    "OnInspectorGUI",
+    "OnSceneGUI",
+    "OnSelectionChange",
+    "OnHierarchyChange",
+    "OnProjectChange",
+    "OnFocus",
+    "OnLostFocus",
+    "OnInspectorUpdate",
+    "CreateGUI",
+    "CreateInspectorGUI",
+    "OnPreviewGUI",
+    "HasPreviewGUI",
+    "OnBeforeSerialize",
+    "OnAfterDeserialize",
+    "OnStateEnter",
+    "OnStateExit",
+    "OnStateUpdate",
+    "OnStateMove",
+    "OnStateIK",
+    "OnStateMachineEnter",
+    "OnStateMachineExit",
+    "OnWizardCreate",
+    "OnWizardUpdate",
+    "OnWizardOtherButton",
+    "OnPostprocessAllAssets",
+    "OnPreprocessTexture",
+    "OnPostprocessTexture",
+    "OnPreprocessModel",
+    "OnPostprocessModel",
+    "OnPreprocessAsset",
+    "OnPreprocessBuild",
+    "OnPostprocessBuild",
+    "OnProcessScene",
+    "OnServerInitialized",
+    "OnConnectedToServer",
+];
+
+/// Attributes that make Unity call a method without any code reference.
+const UNITY_HOOK_ATTRS: &[&str] = &[
+    "MenuItem",
+    "InitializeOnLoadMethod",
+    "RuntimeInitializeOnLoadMethod",
+    "ContextMenu",
+    "ContextMenuItem",
+    "DidReloadScripts",
+    "PostProcessBuild",
+    "PostProcessScene",
+    "OnOpenAsset",
+    "OnOpenAssetAttribute",
+    "Shortcut",
+    "ClutchShortcut",
+    "SettingsProvider",
+    "CustomEditor",
+    "DrawGizmo",
+];
+
+fn uses_unity(ctx: &Ctx) -> bool {
+    ctx.facts.imports.iter().any(|i| i.module.starts_with("UnityEngine") || i.module.starts_with("UnityEditor"))
 }
 
 fn named_children(node: Node) -> Vec<Node> {
@@ -524,6 +651,15 @@ fn visit_callable(ctx: &mut Ctx, node: Node, kind: SymbolKind, cls: &ClassInfo) 
     if attrs.iter().any(|a| matches!(attr_name(a), "Function" | "FunctionName")) {
         s.is_entrypoint = true;
         s.entry_kind = Some("serverless function".into());
+    }
+    if !s.is_entrypoint && uses_unity(ctx) {
+        if let Some(a) = attrs.iter().find(|a| UNITY_HOOK_ATTRS.contains(&attr_name(a))) {
+            s.is_entrypoint = true;
+            s.entry_kind = Some(format!("unity hook [{}]", attr_name(a)));
+        } else if kind == SymbolKind::Method && !cls.bases.is_empty() && UNITY_MESSAGES.contains(&name.as_str()) {
+            s.is_entrypoint = true;
+            s.entry_kind = Some(format!("unity message {name}"));
+        }
     }
     let is_exception_filter = cls.bases.iter().any(|b| {
         let b = clean_type(b);
@@ -1068,7 +1204,18 @@ fn special_call<'t>(
     }
 
     // ---- State mutations ----
+    let prefs = recv_lower.ends_with("playerprefs") || recv_lower.ends_with("editorprefs");
     match name {
+        "SetInt" | "SetFloat" | "SetString" | "SetBool" | "DeleteKey" | "DeleteAll" if prefs => {
+            let store = if recv_lower.ends_with("editorprefs") { "EditorPrefs" } else { "PlayerPrefs" };
+            let key = first_str.clone().unwrap_or_else(|| "*".into());
+            ctx.push_mutation(&format!("{store}:{key}"), "storage", line);
+        }
+        "Get" | "Post" | "Put" | "Delete" | "Head" | "PostWwwForm" if recv_lower.ends_with("unitywebrequest") => {
+            if let Some(url) = first_str.clone() {
+                ctx.push_http_call(name.trim_end_matches("WwwForm"), &url, "UnityWebRequest", line);
+            }
+        }
         "SaveChanges" | "SaveChangesAsync" => {
             let target = rtype.map(|t| t.to_string()).unwrap_or_else(|| receiver.unwrap_or("DbContext").to_string());
             ctx.push_mutation(&format!("{target}.SaveChanges"), "database", line);

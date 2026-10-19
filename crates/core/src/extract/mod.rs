@@ -18,6 +18,13 @@ use crate::model::*;
 /// Tree-sitter is error tolerant and every extractor works on partial trees.
 pub fn extract_file(path: &str, lang: Language, source: &str) -> FileFacts {
     let line_count = source.lines().count().max(1) as u32;
+    let neutralized;
+    let source = if lang == Language::CSharp && source.contains('#') {
+        neutralized = neutralize_csharp_preprocessor(source);
+        neutralized.as_str()
+    } else {
+        source
+    };
     let mut ctx = Ctx::new(path, lang, source, line_count);
     match lang {
         Language::Prisma => prisma::extract(&mut ctx),
@@ -372,12 +379,28 @@ impl<'a> Ctx<'a> {
                 return;
             }
         }
+        let receiver_type = receiver_type.map(|t| clean_type(&t)).filter(|t| !t.is_empty());
+        let root_type = match (&receiver, &receiver_type) {
+            (Some(r), None) if r.contains('.') => {
+                let head = r.split(['.', '?', '[', '(', '!']).next().unwrap_or("").trim();
+                let t = if head == "this" || head == "self" {
+                    self.class_name()
+                } else if self.is_local(head) || self.is_field(head) || self.is_module_var(head) {
+                    self.var_type(head)
+                } else {
+                    None
+                };
+                t.map(|t| clean_type(&t)).filter(|t| !t.is_empty())
+            }
+            _ => None,
+        };
         self.facts.refs.push(Reference {
             kind,
             enclosing,
             name: name.to_string(),
             receiver,
-            receiver_type: receiver_type.map(|t| clean_type(&t)).filter(|t| !t.is_empty()),
+            receiver_type,
+            root_type,
             arg_count,
             line,
             catch_types,
@@ -931,4 +954,61 @@ pub fn strip_parens(s: &str) -> &str {
     let t = s.trim();
     let t = t.strip_prefix('(').unwrap_or(t);
     t.strip_suffix(')').unwrap_or(t)
+}
+
+/// Makes C# with conditional compilation parseable: keeps the first branch of every
+/// `#if` chain (as if its condition held), blanks `#elif` / `#else` branches and all
+/// directive lines. Every removed byte becomes a space (newlines kept), so byte offsets
+/// and line numbers are identical to the original file.
+pub fn neutralize_csharp_preprocessor(src: &str) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(src.len());
+    // One flag per open `#if`: is the current branch of that level active?
+    let mut stack: Vec<bool> = Vec::new();
+    for line in src.split_inclusive('\n') {
+        let t = line.trim_start();
+        let directive = t.starts_with('#');
+        let blank = if directive {
+            let word: String = t[1..].trim_start().chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+            match word.as_str() {
+                "if" => stack.push(true),
+                "elif" | "else" => {
+                    if let Some(top) = stack.last_mut() {
+                        *top = false;
+                    }
+                }
+                "endif" => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+            true
+        } else {
+            stack.iter().any(|active| !active)
+        };
+        if blank {
+            out.extend(line.bytes().map(|b| if b == b'\n' || b == b'\r' { b } else { b' ' }));
+        } else {
+            out.extend_from_slice(line.as_bytes());
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| src.to_string())
+}
+
+#[cfg(test)]
+mod preprocessor_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_first_branch_and_offsets() {
+        let src = "class A {\n#if UNITY_EDITOR\n  void E() {}\n#else\n  void E() { broken(\n#endif\n  void F() {}\n}\n";
+        let out = neutralize_csharp_preprocessor(src);
+        assert_eq!(out.len(), src.len());
+        assert_eq!(out.lines().count(), src.lines().count());
+        assert!(out.contains("void E() {}") && !out.contains("broken") && !out.contains("#if"));
+        let f = extract_file("A.cs", Language::CSharp, src);
+        let names: Vec<&str> = f.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"E") && names.contains(&"F"), "{names:?}");
+        let fsym = f.symbols.iter().find(|s| s.name == "F").unwrap();
+        assert_eq!(fsym.start_line, 7);
+    }
 }

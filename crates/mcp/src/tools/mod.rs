@@ -170,7 +170,7 @@ pub fn registry() -> Vec<ToolDef> {
         // 5.4 Behavior
         tool!("get_state_mutations", "Fields, globals, database entities and cache keys mutated by a function (optionally including its callees).", behavior::MutationParams, behavior::get_state_mutations),
         tool!("trace_error_flow", "Where an exception (type name or message fragment) is thrown and where it is caught (try/catch, propagation through callers, global handlers).", behavior::ErrorFlowParams, behavior::trace_error_flow),
-        tool!("find_by_capability", "Functions by side-effect tags: DB_READ, DB_WRITE, NETWORK_IO, FILE_IO, ASYNC, AUTH_REQUIRED, CACHE, CONFIG_READ, THROWS, GLOBAL_STATE, LOGGING, EVENT_EMIT.", behavior::CapabilityParams, behavior::find_by_capability),
+        tool!("find_by_capability", "Functions by side-effect tags: DB_READ, DB_WRITE, NETWORK_IO, FILE_IO, LOCAL_STORAGE, ASYNC, AUTH_REQUIRED, CACHE, CONFIG_READ, THROWS, GLOBAL_STATE, LOGGING, EVENT_EMIT.", behavior::CapabilityParams, behavior::find_by_capability),
         tool!("get_entrypoints", "All entrypoints: HTTP routes, main()/top-level programs, CLI commands, event handlers, serverless functions.", behavior::EntrypointParams, behavior::get_entrypoints),
         tool!("find_orphaned_symbols", "Dead-code candidates: symbols with no incoming references (excluding entrypoints, tests, overrides, framework-invoked members).", behavior::OrphanParams, behavior::find_orphaned_symbols),
         // 5.5 Data contracts & extraction
@@ -249,8 +249,88 @@ pub fn call_tool(engine: &Engine, name: &str, args: Value) -> (String, bool) {
 // ---------------------------------------------------------------------------
 
 /// Resolves a symbol reference (id, qualified name, `Type.member`, name, `file:line`).
+/// Splits on commas that are not nested inside `<>`, `()` or `[]`.
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in s.chars() {
+        match c {
+            '<' | '(' | '[' => {
+                depth += 1;
+                cur.push(c)
+            }
+            '>' | ')' | ']' => {
+                depth -= 1;
+                cur.push(c)
+            }
+            ',' if depth == 0 => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+}
+
+/// Type part of a parameter (`Dictionary<T, object> data` → `Dictionary<T, object>`), whitespace-free, lowercase.
+fn param_type(p: &str) -> String {
+    let p = p.trim();
+    let close = p.rfind(['>', ']', ')']).map(|i| i + 1).unwrap_or(0);
+    let ty = match p[close..].trim_start().find(' ') {
+        _ if p[close..].trim().is_empty() => p,
+        _ => {
+            // Drop a trailing parameter name when present (`int count`).
+            let tail_start = p[close..].rfind(' ').map(|i| close + i);
+            match tail_start {
+                Some(i) if !p[..i].trim().is_empty() => &p[..i],
+                _ => p,
+            }
+        }
+    };
+    ty.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase()
+}
+
+/// Splits an overload selector: `Name(int, string)` → (Name, types) and `Name/2` → (Name, count).
+fn split_overload(input: &str) -> (&str, Option<Vec<String>>, Option<u32>) {
+    let t = input.trim();
+    if let (Some(open), true) = (t.find('('), t.ends_with(')')) {
+        let inner = t[open + 1..t.len() - 1].trim();
+        if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
+            return (&t[..open], None, inner.parse().ok());
+        }
+        return (&t[..open], Some(split_top_level(inner).iter().map(|p| param_type(p)).collect()), None);
+    }
+    if let Some((name, n)) = t.rsplit_once('/') {
+        if let Ok(n) = n.parse::<u32>() {
+            return (name, None, Some(n));
+        }
+    }
+    (t, None, None)
+}
+
+/// Resolves a symbol reference (id, qualified name, `Type.member`, name, `file:line`), with
+/// optional overload selectors `Name(type, type)` / `Name/<param count>`.
 pub fn resolve_symbol(conn: &Connection, input: &str) -> Result<Node, ToolError> {
-    let nodes = query::find_nodes(conn, input, 12)?;
+    let (base, types, count) = split_overload(input);
+    let mut nodes = query::find_nodes(conn, base, 50)?;
+    if let Some(n) = count {
+        nodes.retain(|x| x.sym.params.as_ref().map(|p| p.total == n).unwrap_or(false));
+    }
+    if let Some(types) = &types {
+        let declared = |x: &Node| -> Vec<String> { x.sym.params.as_ref().map(|p| p.list.iter().map(|q| param_type(q.ty.as_deref().unwrap_or(""))).collect()).unwrap_or_default() };
+        nodes.retain(|x| declared(x).len() == types.len());
+        // Exact type text first (distinguishes `Dictionary<T, object>` from `Dictionary<T, Dictionary<…>>`),
+        // then base type names (`Dictionary` matches `Dictionary<T, object>`).
+        let exact: Vec<Node> = nodes.iter().filter(|x| declared(x) == *types).cloned().collect();
+        if !exact.is_empty() {
+            nodes = exact;
+        } else {
+            let base_of = |t: &str| codegraph_core::extract::clean_type(t).to_ascii_lowercase();
+            nodes.retain(|x| declared(x).iter().zip(types).all(|(have, want)| base_of(have) == base_of(want) || have.ends_with(&format!(".{want}"))));
+        }
+    }
     match nodes.len() {
         0 => Err(ToolError::NotFound(format!("No symbol matches '{input}'. Use search_universal to find candidates."))),
         1 => Ok(nodes.into_iter().next().unwrap()),
@@ -267,9 +347,20 @@ pub fn resolve_symbol(conn: &Connection, input: &str) -> Result<Node, ToolError>
             {
                 return Ok(types[0].clone());
             }
-            let mut msg = format!("'{input}' is ambiguous ({} matches); pass one of these ids:\n", nodes.len());
+            let overloads = defs.windows(2).all(|w| w[0].sym.qualified_name == w[1].sym.qualified_name);
+            let mut msg = if overloads {
+                format!(
+                    "'{input}' has {} overloads; select one with `{base}(type, type)`, `{base}/<param count>` or an id:
+",
+                    nodes.len()
+                )
+            } else {
+                format!("'{input}' is ambiguous ({} matches); pass one of these ids:
+", nodes.len())
+            };
             for n in nodes.iter().take(10) {
-                msg.push_str(&format!("{} {}\n", n.sym.id, fmt::node_line(n)));
+                msg.push_str(&format!("{} {} | {}
+", n.sym.id, fmt::node_line(n), n.sym.signature));
             }
             Err(ToolError::NotFound(msg.trim_end().to_string()))
         }

@@ -176,7 +176,10 @@ pub fn get_config_matrix(ctx: &Ctx, p: ConfigParams) -> ToolResult {
         } else {
             let who = enc.as_ref().and_then(|x| encl.get(x)).map(display).unwrap_or_default();
             let d = default.as_ref().map(|d| format!(", default {}", codegraph_core::extract::truncate(d, 40))).unwrap_or_default();
-            e.0.push(format!("{file}:{line} in {who} ({src}{d})"));
+            let entry = format!("{file}:{line} in {who} ({src}{d})");
+            if !e.0.contains(&entry) {
+                e.0.push(entry);
+            }
         }
     }
     let read_keys = keys.values().filter(|v| !v.0.is_empty()).count();
