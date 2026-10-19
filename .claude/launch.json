@@ -4,15 +4,44 @@
     {
       "name": "codegraph-ui-fixtures",
       "runtimeExecutable": "target/debug/codegraph.exe",
-      "runtimeArgs": ["ui", "fixtures/fullstack", "--no-open", "--port", "4321"],
+      "runtimeArgs": [
+        "ui",
+        "fixtures/fullstack",
+        "--no-open",
+        "--port",
+        "4321"
+      ],
       "port": 4321
     },
     {
       "name": "codegraph-ui-dev",
       "runtimeExecutable": "target/debug/codegraph.exe",
-      "runtimeArgs": ["ui", "fixtures/fullstack", "--no-open", "--port", "4322"],
-      "env": { "CODEGRAPH_UI_DEV": "crates/ui/assets" },
+      "runtimeArgs": [
+        "ui",
+        "fixtures/fullstack",
+        "--no-open",
+        "--port",
+        "4322"
+      ],
+      "env": {
+        "CODEGRAPH_UI_DEV": "crates/ui/assets"
+      },
       "port": 4322
+    },
+    {
+      "name": "codegraph-ui-unity",
+      "runtimeExecutable": "target/release/codegraph.exe",
+      "runtimeArgs": [
+        "ui",
+        "D:/Entidades/EmergentsWorlds/warcodes-mobileapp",
+        "--no-open",
+        "--port",
+        "4323"
+      ],
+      "env": {
+        "CODEGRAPH_UI_DEV": "crates/ui/assets"
+      },
+      "port": 4323
     }
   ]
 }

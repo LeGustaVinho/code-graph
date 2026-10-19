@@ -1,7 +1,9 @@
 //! Local Graph Explorer: an Axum HTTP server serving an embedded single-page app
 //! (Cytoscape.js) plus a small JSON API over the code graph.
 
-use std::collections::HashSet;
+mod tree;
+
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +48,8 @@ pub async fn serve(engine: Arc<Engine>, addr: SocketAddr) -> Result<()> {
         .route("/api/node/{id}", get(node_detail))
         .route("/api/overview", get(overview))
         .route("/api/source/{id}", get(source))
+        .route("/api/tree", get(tree_children))
+        .route("/api/rollup", post(rollup))
         .route("/api/tool/{name}", post(run_tool))
         .route("/api/reindex", post(reindex))
         .fallback(static_handler)
@@ -292,7 +296,95 @@ async fn graph(State(engine): State<AppState>, Query(q): Query<GraphQ>) -> Resul
             }
         }
         let edges: Vec<Value> = edges.iter().filter(|e| nodes.contains_key(&e.source_id)).map(edge_json).collect();
-        Ok(Json(json!({ "nodes": node_list, "edges": edges })))
+        // Containment chain of every node (nearest first) so the client can nest by class / file / namespace.
+        let tree = tree::get(&conn)?;
+        let mut containers: HashMap<String, Value> = HashMap::new();
+        for n in node_list.iter_mut() {
+            let Some(id) = n["id"].as_str().map(str::to_string) else { continue };
+            let chain = tree.ancestors(&id);
+            for a in &chain {
+                if !containers.contains_key(a) {
+                    if let Some(v) = tree.item_json(a) {
+                        containers.insert(a.clone(), v);
+                    }
+                }
+            }
+            n["ancestors"] = json!(chain);
+        }
+        Ok(Json(json!({ "nodes": node_list, "edges": edges, "containers": containers })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct TreeQ {
+    id: Option<String>,
+    /// Comma-separated parents whose direct children are wanted (batch form of `id`).
+    ids: Option<String>,
+    /// Levels of descendants to include (1 = direct children).
+    depth: Option<usize>,
+    limit: Option<usize>,
+}
+
+/// Children of a hierarchy item (roots when `id` is empty), plus the item's ancestor path.
+async fn tree_children(State(engine): State<AppState>, Query(q): Query<TreeQ>) -> Result<Json<Value>, ApiError> {
+    blocking(move || {
+        let conn = engine.reader()?;
+        let tree = tree::get(&conn)?;
+        let id = q.id.filter(|s| !s.is_empty());
+        let batch: Vec<Option<String>> =
+            q.ids.as_deref().unwrap_or("").split(',').filter(|s| !s.is_empty()).map(|s| Some(s.to_string())).collect();
+        let depth = if batch.is_empty() { q.depth.unwrap_or(1).clamp(1, 8) } else { 1 };
+        let limit = q.limit.unwrap_or(600).clamp(10, 5000);
+        let mut items = Vec::new();
+        let mut truncated = false;
+        let mut level: Vec<Option<String>> = if batch.is_empty() { vec![id.clone()] } else { batch };
+        'outer: for _ in 0..depth {
+            let mut next = Vec::new();
+            for p in level {
+                let kids = tree.children_json(p.as_deref());
+                if items.len() + kids.len() > limit {
+                    truncated = true;
+                    break 'outer;
+                }
+                for k in kids {
+                    if k["child_count"].as_u64().unwrap_or(0) > 0 {
+                        next.push(k["id"].as_str().map(str::to_string));
+                    }
+                    items.push(k);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            level = next;
+        }
+        let (item, path) = match &id {
+            Some(i) => (tree.item_json(i), tree.ancestors(i).iter().rev().filter_map(|a| tree.item_json(a)).collect()),
+            None => (None, Vec::new()),
+        };
+        Ok(Json(json!({ "item": item, "path": path, "items": items, "truncated": truncated })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct RollupReq {
+    visible: Vec<String>,
+    relations: Option<Vec<String>>,
+    confidences: Option<Vec<String>>,
+}
+
+/// Relations aggregated onto the currently visible hierarchy items.
+async fn rollup(State(engine): State<AppState>, Json(req): Json<RollupReq>) -> Result<Json<Value>, ApiError> {
+    blocking(move || {
+        let conn = engine.reader()?;
+        let tree = tree::get(&conn)?;
+        let visible: HashSet<String> = req.visible.into_iter().collect();
+        let rels = req.relations.unwrap_or_else(|| DEFAULT_RELATIONS.iter().map(|s| s.to_string()).collect());
+        let confs = req.confidences.unwrap_or_else(|| vec!["exact".into(), "inferred".into()]);
+        let edges = tree.rollup(&conn, &visible, &rels, &confs)?;
+        Ok(Json(json!({ "edges": edges })))
     })
     .await
 }

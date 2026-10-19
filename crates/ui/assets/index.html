@@ -67,13 +67,30 @@
         </div>
         <div class="stage-tools">
           <span class="stage-count" id="stage-count"></span>
+          <div class="segmented" id="mode-ctl" role="tablist">
+            <button data-gmode="relations" data-i18n-title="mode.relationsHint"><i data-icon="graph" data-size="14"></i><span data-i18n="mode.relations">Relations</span></button>
+            <button data-gmode="hierarchy" data-i18n-title="mode.hierarchyHint"><i data-icon="tree" data-size="14"></i><span data-i18n="mode.hierarchy">Hierarchy</span></button>
+          </div>
           <div class="segmented" id="depth-ctl" hidden>
             <span class="seg-label" data-i18n="stage.depth">Depth</span>
             <button data-depth="1">1</button><button data-depth="2">2</button><button data-depth="3">3</button>
           </div>
-          <div class="select-wrap small">
+          <div class="tool-group" id="tree-tools" hidden>
+            <button class="icon-btn sm" id="tree-expand" data-i18n-title="tree.expandLevel"><i data-icon="unfold"></i></button>
+            <button class="icon-btn sm" id="tree-collapse" data-i18n-title="tree.collapseAll"><i data-icon="fold"></i></button>
+            <button class="icon-btn sm toggle" id="tree-links" data-i18n-title="tree.showLinks"><i data-icon="link"></i></button>
+          </div>
+          <div class="select-wrap small" id="group-wrap" data-i18n-title="group.label">
+            <i data-icon="group"></i>
+            <select id="group-select" data-i18n-aria="group.label"></select>
+          </div>
+          <div class="select-wrap small" id="layout-wrap">
             <i data-icon="layers"></i>
             <select id="layout-select" data-i18n-aria="stage.layout"></select>
+          </div>
+          <div class="select-wrap small" data-i18n-title="spacing.label">
+            <i data-icon="spacing"></i>
+            <select id="spacing-select" data-i18n-aria="spacing.label"></select>
           </div>
         </div>
       </div>
@@ -126,6 +143,10 @@
   <script src="i18n.js"></script>
   <script src="icons.js"></script>
   <script src="cytoscape.min.js"></script>
+  <script src="layout-base.js"></script>
+  <script src="cose-base.js"></script>
+  <script src="cytoscape-fcose.js"></script>
+  <script src="cytoscape-layout-utilities.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

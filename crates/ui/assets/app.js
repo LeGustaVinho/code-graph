@@ -57,6 +57,8 @@
     variable: { color: "#94a3b8", shape: "ellipse" },
     const: { color: "#c084fc", shape: "pentagon" },
     module: { color: "#64748b", shape: "rectangle" },
+    namespace: { color: "#0ea5e9", shape: "round-rectangle" },
+    directory: { color: "#a16207", shape: "round-rectangle" },
     literal: { color: "#eab308", shape: "tag" },
     unresolved: { color: "#ef4444", shape: "octagon" },
   };
@@ -69,6 +71,14 @@
   const DEFAULT_RELATIONS = ["CALLS", "HTTP_CALLS", "RESOLVES_DI", "INHERITS", "THROWS", "CAUGHT_BY", "TESTS"];
   const CONFIDENCES = ["exact", "inferred", "unresolved"];
   const LAYOUTS = ["auto", "force", "hierarchy", "concentric", "circle", "grid"];
+  const GROUPS = ["none", "class", "file", "namespace"];
+  const SPACING = { compact: 0.7, normal: 1, wide: 1.6 };
+  const TYPE_KINDS = new Set(["class", "interface", "struct", "enum", "type_alias", "data_model"]);
+  const HAS_FCOSE = typeof cytoscapeFcose !== "undefined";
+  /** Synthetic hierarchy containers (namespaces / folders) have no symbol behind them. */
+  const isSynthetic = (id) => /^(ns|dir):/.test(id);
+  /** Most items the hierarchy view draws at once. */
+  const TREE_CAP = 1500;
   const VIEWS = [
     { id: "dashboard", icon: "dashboard" },
     { id: "graph", icon: "graph" },
@@ -104,6 +114,12 @@
     lastIndexed: null,
     listFilter: "",
     cache: {},
+    graphMode: store.get("graphMode", "relations") === "hierarchy" ? "hierarchy" : "relations",
+    groupBy: GROUPS.includes(store.get("groupBy", "none")) ? store.get("groupBy", "none") : "none",
+    spacing: SPACING[store.get("spacing", "normal")] ? store.get("spacing", "normal") : "normal",
+    treeLinks: store.get("treeLinks", true),
+    // Hierarchy model: items by id, loaded child lists by parent ("" = roots), expanded containers.
+    tree: { items: new Map(), kids: new Map(), expanded: new Set() },
   };
 
   // ------------------------------------------------------------------ API
@@ -179,7 +195,8 @@
     renderLangSelect();
     renderChrome();
     renderInspector();
-    cy.edges().forEach((e) => e.data("rlabel", t("rel." + e.data("relation"))));
+    cy.edges().forEach((e) => e.data("rlabel", t("rel." + e.data("relation")) + (e.data("rollup") ? ` · ${num(e.data("count"))}` : "")));
+    renderLayoutSelect();
   }
 
   // ------------------------------------------------------------------ chrome (sidebar, stage bar)
@@ -234,23 +251,33 @@
   }
 
   function renderLayoutSelect() {
-    $("#layout-select").innerHTML = LAYOUTS.map((l) => {
-      const label = l === "auto" ? "Auto" : t("layout." + l);
-      return `<option value="${l}" ${state.layout === l ? "selected" : ""}>${esc(label)}</option>`;
-    }).join("");
+    const options = (values, current, label) =>
+      values.map((v) => `<option value="${v}" ${current === v ? "selected" : ""}>${esc(label(v))}</option>`).join("");
+    $("#layout-select").innerHTML = options(LAYOUTS, state.layout, (l) => (l === "auto" ? "Auto" : t("layout." + l)));
+    $("#group-select").innerHTML = options(GROUPS, state.groupBy, (g) => t("group." + g));
+    $("#spacing-select").innerHTML = options(Object.keys(SPACING), state.spacing, (s) => t("spacing." + s));
   }
 
   function renderStageBar() {
-    const crumbs = [`<button class="crumb ${state.focus ? "" : "current"}" data-crumb="home">${esc(t("stage.home"))}</button>`];
-    const trail = state.history.slice(-4);
+    const tree = state.graphMode === "hierarchy";
+    const crumbs = [`<button class="crumb ${state.focus && !tree ? "" : "current"}" data-crumb="home">${esc(t(tree ? "stage.tree" : "stage.home"))}</button>`];
+    const trail = tree ? [] : state.history.slice(-4);
     trail.forEach((h, i) => {
       crumbs.push(`<span class="crumb-sep">${icon("chevron", 13)}</span>`);
       const last = i === trail.length - 1;
       crumbs.push(`<button class="crumb ${last ? "current" : ""}" data-crumb="${esc(h.id)}" title="${esc(h.label)}">${esc(h.label)}</button>`);
     });
     $("#crumbs").innerHTML = crumbs.join("");
-    $("#btn-back").disabled = state.history.length === 0;
-    $("#depth-ctl").hidden = !state.focus;
+    $("#btn-back").disabled = tree || state.history.length === 0;
+    $$("#mode-ctl button").forEach((b) => {
+      b.classList.toggle("on", b.dataset.gmode === state.graphMode);
+      b.setAttribute("aria-selected", String(b.dataset.gmode === state.graphMode));
+    });
+    $("#tree-tools").hidden = !tree;
+    $("#tree-links").classList.toggle("on", state.treeLinks);
+    $("#group-wrap").hidden = tree;
+    $("#layout-wrap").hidden = tree;
+    $("#depth-ctl").hidden = tree || !state.focus;
     $$("#depth-ctl button").forEach((b) => b.classList.toggle("on", Number(b.dataset.depth) === state.depth));
     const n = cy.nodes(":visible").length;
     const e = cy.edges(":visible").length;
@@ -327,6 +354,43 @@
       },
       ...kindStyles,
       { selector: "node[?is_entrypoint]", style: { "border-color": "#f59e0b", "border-width": 3 } },
+      // Collapsed containers (namespace / folder / file / type with hidden children).
+      {
+        selector: "node.collapsed",
+        style: {
+          width: "mapData(child_count, 0, 60, 26, 54)",
+          height: "mapData(child_count, 0, 60, 22, 40)",
+          shape: "round-rectangle",
+          "font-weight": 600,
+          "border-width": 4,
+          "border-style": "double",
+          "border-color": surface,
+        },
+      },
+      // Expanded containers are drawn as boxes holding their children.
+      {
+        selector: "node:parent",
+        style: {
+          shape: "round-rectangle",
+          "background-opacity": 0.07,
+          "border-width": 1.5,
+          "border-opacity": 0.6,
+          padding: 16,
+          "text-valign": "top",
+          "text-halign": "center",
+          "text-margin-y": -4,
+          "font-weight": 650,
+          "font-size": 12,
+          "text-max-width": 420,
+          "corner-radius": 10,
+          "compound-sizing-wrt-labels": "include",
+          "min-width": 40,
+          "min-height": 24,
+          "min-zoomed-font-size": 4,
+        },
+      },
+      ...Object.entries(KINDS).map(([k, v]) => ({ selector: `node:parent[kind = '${k}']`, style: { "border-color": v.color, color: v.color } })),
+      { selector: "node:parent[kind = 'namespace'], node:parent[kind = 'directory']", style: { "border-style": "dashed", "background-opacity": 0.04 } },
       { selector: "node[kind = 'unresolved']", style: { "background-opacity": 0.12, "border-style": "dashed", "border-color": cssVar("--unresolved"), color: cssVar("--unresolved"), width: 18, height: 18 } },
       { selector: "node.focus", style: { "border-color": cssVar("--accent"), "border-width": 4, "font-weight": 700, "font-size": 12.5, "z-index": 10 } },
       { selector: "node:selected", style: { "overlay-color": cssVar("--accent"), "overlay-opacity": 0.14, "overlay-padding": 7 } },
@@ -356,6 +420,10 @@
       { selector: "edge[confidence = 'unresolved']", style: { "line-style": "dotted", "line-color": cssVar("--unresolved"), "target-arrow-color": cssVar("--unresolved"), "target-arrow-shape": "tee", width: 2, opacity: 0.8 } },
       { selector: "edge[relation = 'INHERITS']", style: { "target-arrow-fill": "hollow", "arrow-scale": 1 } },
       { selector: "edge[relation = 'HTTP_CALLS']", style: { width: 2.6 } },
+      // Relations rolled up onto collapsed containers: thicker = more underlying links.
+      { selector: "edge[?rollup]", style: { width: "mapData(count, 1, 40, 1.4, 7)", opacity: 0.45, "arrow-scale": 0.9 } },
+      // Dense graphs: edges recede until a node is selected (".hl" restores them).
+      { selector: "edge.faint", style: { opacity: 0.12 } },
       { selector: "edge.hl", style: { opacity: 1, width: 2.6, label: "data(rlabel)", "z-index": 8 } },
       { selector: "edge.dim", style: { opacity: 0.06 } },
       { selector: ".conf-hidden", style: { display: "none" } },
@@ -376,55 +444,341 @@
     renderStageBar();
   }
 
-  function layoutOptions(focusId) {
-    const animate = cy.nodes().length < 400;
-    const base = { animate, animationDuration: 320, fit: true, padding: 48 };
+  const spacingFactor = () => SPACING[state.spacing] || 1;
+
+  function layoutOptions(focusId, randomize) {
+    const f = spacingFactor();
+    const base = { animate: false, fit: false, padding: 48, nodeDimensionsIncludeLabels: true };
     let name = state.layout;
-    if (name === "auto") name = focusId ? "concentric" : "force";
+    // Nested boxes need a compound-aware layout.
+    if (state.graphMode === "hierarchy" || cy.nodes(":parent").length) name = "force";
+    else if (name === "auto") name = focusId ? "concentric" : "force";
     switch (name) {
       case "hierarchy":
-        return { ...base, name: "breadthfirst", directed: true, spacingFactor: 1.15, roots: focusId ? cy.getElementById(focusId) : undefined };
+        return { ...base, name: "breadthfirst", directed: true, spacingFactor: 1.15 * f, avoidOverlap: true, roots: focusId ? cy.getElementById(focusId) : undefined };
       case "concentric":
         return {
           ...base,
           name: "concentric",
-          minNodeSpacing: 70,
-          spacingFactor: 1.25,
+          minNodeSpacing: 60 * f,
+          spacingFactor: 1.2 * f,
           avoidOverlap: true,
           concentric: (n) => (n.id() === focusId ? 1000 : n.degree()),
           levelWidth: () => 2,
         };
       case "circle":
-        return { ...base, name: "circle", spacingFactor: 1.1 };
+        return { ...base, name: "circle", spacingFactor: 1.1 * f, avoidOverlap: true };
       case "grid":
-        return { ...base, name: "grid", avoidOverlap: true };
+        return { ...base, name: "grid", avoidOverlap: true, avoidOverlapPadding: 18 * f };
       default:
-        return { ...base, name: "cose", animate: false, nodeRepulsion: () => 9000, idealEdgeLength: () => 90, gravity: 0.3, numIter: 1500, randomize: true };
+        if (!HAS_FCOSE) return { ...base, name: "cose", nodeRepulsion: () => 9000 * f, idealEdgeLength: () => 90 * f, gravity: 0.3, numIter: 1500, randomize: true };
+        return {
+          ...base,
+          name: "fcose",
+          quality: "default",
+          randomize,
+          packComponents: true,
+          nodeRepulsion: () => 7000 * f * f,
+          idealEdgeLength: (e) => (e.data("rollup") ? 110 : 80) * f,
+          edgeElasticity: () => 0.4,
+          nestingFactor: 0.15,
+          gravity: 0.3,
+          gravityCompound: 1.2,
+          gravityRangeCompound: 1.4,
+          numIter: 2500,
+          nodeSeparation: 80 * f,
+          tile: true,
+          tilingPaddingVertical: 16 * f,
+          tilingPaddingHorizontal: 22 * f,
+          initialEnergyOnIncremental: 0.35,
+        };
     }
   }
 
-  function runLayout(focusId) {
-    const l = cy.layout(layoutOptions(focusId));
-    l.one("layoutstop", () => {
-      if (cy.zoom() > 1.25) {
-        cy.zoom(1.25);
-        cy.center(focusId ? cy.getElementById(focusId) : undefined);
+  // ---- overlap removal: separates label-inclusive boxes of siblings, innermost groups first.
+  function resolveOverlaps(pad) {
+    const groups = new Map();
+    cy.nodes(":visible").forEach((n) => {
+      const p = n.parent();
+      const key = p.nonempty() ? p.id() : "";
+      if (!groups.has(key)) groups.set(key, { depth: p.nonempty() ? p.ancestors().length + 1 : 0, nodes: [] });
+      groups.get(key).nodes.push(n);
+    });
+    [...groups.values()].sort((a, b) => b.depth - a.depth).forEach((g) => separate(g.nodes, pad));
+  }
+
+  function separate(nodes, pad) {
+    if (nodes.length < 2) return;
+    const boxes = nodes.map((n) => {
+      const bb = n.boundingBox({ includeLabels: true, includeOverlays: false, includeEdges: false, useCache: false });
+      return { n, x1: bb.x1 - pad / 2, x2: bb.x2 + pad / 2, y1: bb.y1 - pad / 2, y2: bb.y2 + pad / 2, dx: 0, dy: 0 };
+    });
+    const move = (b, x, y) => {
+      b.x1 += x; b.x2 += x; b.y1 += y; b.y2 += y; b.dx += x; b.dy += y;
+    };
+    for (let iter = 0; iter < 80; iter++) {
+      let moved = false;
+      boxes.sort((a, b) => a.x1 - b.x1); // sweep: only boxes whose x-ranges intersect are compared
+      for (let i = 0; i < boxes.length; i++) {
+        const a = boxes[i];
+        for (let j = i + 1; j < boxes.length && boxes[j].x1 < a.x2; j++) {
+          const b = boxes[j];
+          const ox = Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1);
+          const oy = Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1);
+          if (ox <= 0 || oy <= 0) continue;
+          moved = true;
+          // Push apart along the axis of least penetration, half each.
+          if (ox < oy) {
+            const s = (ox / 2 + 0.5) * (a.x1 + a.x2 <= b.x1 + b.x2 ? -1 : 1);
+            move(a, s, 0);
+            move(b, -s, 0);
+          } else {
+            const s = (oy / 2 + 0.5) * (a.y1 + a.y2 <= b.y1 + b.y2 ? -1 : 1);
+            move(a, 0, s);
+            move(b, 0, -s);
+          }
+        }
+      }
+      if (!moved) break;
+    }
+    cy.batch(() => {
+      for (const b of boxes) {
+        if (!b.dx && !b.dy) continue;
+        const targets = b.n.isParent() ? b.n.descendants().filter((d) => d.isChildless()) : b.n;
+        targets.forEach((d) => {
+          const p = d.position();
+          d.position({ x: p.x + b.dx, y: p.y + b.dy });
+        });
       }
     });
-    l.run();
+  }
+
+  /**
+   * Hierarchy layout: every box arranges its children in wrapped rows (in tree order),
+   * innermost boxes first, so the result is compact, stable and overlap-free by construction.
+   */
+  function packLayout() {
+    const gap = 16 * spacingFactor();
+    const order = new Map(state.graphMode === "hierarchy" ? treeVisible().map((id, i) => [id, i]) : []);
+    // Outside the hierarchy (grouped relations), boxes first, then types, then members by name.
+    const rank = (n) => (n.isParent() ? 0 : TYPE_KINDS.has(n.data("kind")) ? 1 : 2);
+    const cmp = (a, b) =>
+      order.has(a.id()) && order.has(b.id())
+        ? order.get(a.id()) - order.get(b.id())
+        : rank(a) - rank(b) || String(a.data("label")).localeCompare(String(b.data("label")));
+    const bbOf = (n) => n.boundingBox({ includeLabels: true, includeOverlays: false, includeEdges: false, useCache: false });
+    const shiftTo = (n, x, y) => {
+      const bb = bbOf(n);
+      const dx = x - bb.x1;
+      const dy = y - bb.y1;
+      if (!dx && !dy) return;
+      const leaves = n.isParent() ? n.descendants().filter((d) => d.isChildless()) : n;
+      leaves.forEach((d) => {
+        const p = d.position();
+        d.position({ x: p.x + dx, y: p.y + dy });
+      });
+    };
+    const arrange = (nodes, aspect) => {
+      const items = nodes
+        .sort(cmp)
+        .map((n) => {
+          const bb = bbOf(n);
+          return { n, w: bb.w, h: bb.h };
+        });
+      if (!items.length) return;
+      // Row wrapping width: the candidate whose packed shape is closest to the wanted aspect.
+      const size = (rowW) => {
+        let x = 0, y = 0, rowH = 0, w = 0;
+        for (const it of items) {
+          if (x > 0 && x + it.w > rowW) {
+            x = 0;
+            y += rowH + gap;
+            rowH = 0;
+          }
+          x += it.w + gap;
+          w = Math.max(w, x - gap);
+          rowH = Math.max(rowH, it.h);
+        }
+        return { w, h: y + rowH };
+      };
+      const minW = Math.max(...items.map((i) => i.w));
+      const maxW = items.reduce((s, i) => s + i.w + gap, 0);
+      let rowW = minW;
+      let best = Infinity;
+      for (let k = 0; k <= 16; k++) {
+        const cand = minW * Math.pow(Math.max(1, maxW / minW), k / 16);
+        const s = size(cand);
+        const r = s.w / Math.max(1, s.h);
+        const score = Math.max(r / aspect, aspect / r) + (s.w * s.h) / 1e9;
+        if (score < best) {
+          best = score;
+          rowW = cand;
+        }
+      }
+      let x = 0;
+      let y = 0;
+      let rowH = 0;
+      for (const it of items) {
+        if (x > 0 && x + it.w > rowW) {
+          x = 0;
+          y += rowH + gap;
+          rowH = 0;
+        }
+        shiftTo(it.n, x, y);
+        x += it.w + gap;
+        rowH = Math.max(rowH, it.h);
+      }
+    };
+    const visit = (n) => {
+      const kids = n.children();
+      kids.filter((k) => k.isParent()).forEach(visit);
+      arrange(kids.toArray(), 1.6);
+    };
+    const roots = cy.nodes().orphans();
+    roots.filter((r) => r.isParent()).forEach(visit);
+    arrange(roots.toArray(), Math.max(1, cy.width() / Math.max(1, cy.height())));
+  }
+
+  let layoutSeq = 0;
+  /** Runs the layout, removes overlaps, then animates nodes and viewport to the result. */
+  function runLayout(focusId, { randomize = true, fit = true, anchor = null } = {}) {
+    const seq = ++layoutSeq;
+    return new Promise((resolve) => {
+      if (!cy.nodes().length) return resolve();
+      const leaves = cy.nodes().filter((n) => n.isChildless());
+      const before = new Map(leaves.map((n) => [n.id(), { ...n.position() }]));
+      const finish = () => {
+        if (seq !== layoutSeq) return resolve();
+        resolveOverlaps(14 * spacingFactor());
+        const after = new Map(leaves.map((n) => [n.id(), { ...n.position() }]));
+        const vp0 = { zoom: cy.zoom(), pan: { ...cy.pan() } };
+        // Anchor: keep a box's top-left corner where it was on screen (expand / collapse in place).
+        const a = anchor && cy.getElementById(anchor.id);
+        if (a?.nonempty()) {
+          const bb = a.renderedBoundingBox({ includeLabels: true, includeOverlays: false, useCache: false });
+          cy.panBy({ x: anchor.box.x1 - bb.x1, y: anchor.box.y1 - bb.y1 });
+        } else if (fit) {
+          cy.fit(undefined, 48);
+          if (cy.zoom() > 1.25) {
+            cy.zoom(1.25);
+            cy.center(focusId ? cy.getElementById(focusId) : undefined);
+          }
+        }
+        const vp1 = { zoom: cy.zoom(), pan: { ...cy.pan() } };
+        if (leaves.length > 600 || matchMedia("(prefers-reduced-motion: reduce)").matches) return resolve();
+        cy.viewport(vp0);
+        cy.batch(() => leaves.forEach((n) => n.position(before.get(n.id()))));
+        const opts = { duration: 360, easing: "ease-out-cubic" };
+        leaves.forEach((n) => n.animate({ position: after.get(n.id()) }, opts));
+        cy.animate({ zoom: vp1.zoom, pan: vp1.pan }, opts);
+        // Animations only advance while the page paints (hidden tabs pause them): settle anything
+        // left behind so a later layout never starts from half-moved nodes.
+        setTimeout(() => {
+          if (seq === layoutSeq) {
+            cy.batch(() =>
+              leaves.forEach((n) => {
+                if (n.removed()) return;
+                n.stop(true);
+                n.position(after.get(n.id()));
+              })
+            );
+            cy.stop(true);
+            cy.viewport(vp1);
+          }
+          resolve();
+        }, opts.duration + 120);
+      };
+      // Nested boxes are packed unless the user explicitly asked for a force layout.
+      if (state.graphMode === "hierarchy" || (cy.nodes(":parent").length && state.layout !== "force")) {
+        packLayout();
+        return finish();
+      }
+      const l = cy.layout(layoutOptions(focusId, randomize));
+      l.one("layoutstop", finish);
+      l.run();
+    });
+  }
+
+  /**
+   * Replaces the graph with `els` but keeps nodes that survive (identity, position, selection).
+   * Re-adding a node under the same id while it still animates would leave it frozen, since
+   * Cytoscape tracks animating elements by id. Edges are always rebuilt.
+   */
+  function syncElements(els) {
+    const want = new Map();
+    for (const e of els) if (e.group === "nodes") want.set(e.data.id, e);
+    cy.batch(() => {
+      cy.elements().stop(true, true);
+      cy.edges().remove();
+      cy.nodes()
+        .filter((n) => !want.has(n.id()))
+        .remove();
+      for (const e of els) {
+        if (e.group !== "nodes") continue;
+        const cur = cy.getElementById(e.data.id);
+        if (cur.empty()) {
+          cy.add(e);
+          continue;
+        }
+        const parent = e.data.parent ?? null;
+        const curParent = cur.parent().nonempty() ? cur.parent().id() : null;
+        const node = parent !== curParent ? cur.move({ parent }) : cur;
+        const { parent: _p, ...data } = e.data;
+        for (const k of Object.keys(node.data())) if (!(k in data) && k !== "id" && k !== "parent") node.removeData(k);
+        node.data(data);
+        node.classes(e.classes || "");
+      }
+      cy.add(els.filter((e) => e.group === "edges"));
+      cy.nodes().forEach((n) => n.data("deg", n.degree()));
+    });
+  }
+
+  /** Orders node elements so every compound parent precedes its children. */
+  function parentsFirst(nodeEls) {
+    const byId = new Map(nodeEls.map((e) => [e.data.id, e]));
+    const out = [];
+    const done = new Set();
+    const visit = (e, guard = 0) => {
+      if (done.has(e.data.id) || guard > 64) return;
+      const p = e.data.parent && byId.get(e.data.parent);
+      if (p) visit(p, guard + 1);
+      else if (e.data.parent) e.data.parent = undefined;
+      done.add(e.data.id);
+      out.push(e);
+    };
+    nodeEls.forEach((e) => visit(e));
+    return out;
+  }
+
+  /** Nests relation-graph nodes inside their class / file / namespace boxes. */
+  function groupNodes(data) {
+    const gb = state.groupBy;
+    const containers = data.containers || {};
+    for (const c of Object.values(containers)) if (!state.tree.items.has(c.id)) state.tree.items.set(c.id, c);
+    if (gb === "none") return data.nodes.map((n) => ({ group: "nodes", data: n }));
+    const keep = (c) => TYPE_KINDS.has(c.kind) || (gb !== "class" && c.kind === "module") || (gb === "namespace" && (c.kind === "namespace" || c.kind === "directory"));
+    const present = new Set(data.nodes.map((n) => n.id));
+    const extra = new Map();
+    const els = data.nodes.map((n) => {
+      const chain = (n.ancestors || []).filter((a) => containers[a] && keep(containers[a]));
+      chain.forEach((a, i) => {
+        if (present.has(a) || extra.has(a)) return;
+        const c = containers[a];
+        extra.set(a, { group: "nodes", data: { ...c, qualified_name: c.title, parent: chain[i + 1], container: true } });
+      });
+      return { group: "nodes", data: { ...n, parent: chain[0] } };
+    });
+    // A container that is itself in the graph keeps its own chain (set above); extras get theirs here.
+    return parentsFirst([...extra.values(), ...els]);
   }
 
   function render(data, focusId) {
     const ids = new Set(data.nodes.map((n) => n.id));
-    const els = data.nodes.map((n) => ({ group: "nodes", data: n }));
+    const els = groupNodes(data);
     for (const e of data.edges) {
       if (ids.has(e.source) && ids.has(e.target)) els.push({ group: "edges", data: { ...e, rlabel: t("rel." + e.relation) } });
     }
-    cy.batch(() => {
-      cy.elements().remove();
-      cy.add(els);
-      cy.nodes().forEach((n) => n.data("deg", n.degree()));
-    });
+    syncElements(els);
     if (focusId) cy.getElementById(focusId).addClass("focus");
     applyConfidenceFilter();
     runLayout(focusId);
@@ -450,12 +804,17 @@
   }
 
   function focusNode(id, label, { push = true } = {}) {
+    if (isSynthetic(id)) return revealInTree(id);
     if (push && state.focus !== id) {
       state.history.push({ id, label: label || id });
       if (state.history.length > 30) state.history.shift();
     }
     state.focus = id;
     state.view = "graph";
+    if (state.graphMode !== "relations") {
+      state.graphMode = "relations";
+      store.set("graphMode", "relations");
+    }
     renderSidebar();
     loadGraph();
     select(id);
@@ -466,7 +825,247 @@
     state.history = [];
     state.view = "graph";
     renderSidebar();
-    loadGraph();
+    loadStage();
+  }
+
+  const loadStage = () => (state.graphMode === "hierarchy" ? loadTree() : loadGraph());
+
+  function setGraphMode(mode) {
+    if (state.graphMode === mode) return;
+    state.graphMode = mode;
+    store.set("graphMode", mode);
+    state.view = "graph";
+    renderSidebar();
+    renderStageBar();
+    loadStage();
+  }
+
+  // ------------------------------------------------------------------ hierarchy (namespace/folder → file → type → member)
+  const tree = state.tree;
+
+  /** Fetches direct children of the given parents ("" = roots) into the model. */
+  async function treeFetch(parents) {
+    const todo = parents.filter((p) => !tree.kids.has(p));
+    for (let i = 0; i < todo.length; i += 80) {
+      const chunk = todo.slice(i, i + 80);
+      const url = chunk.length === 1 && chunk[0] === "" ? "/api/tree?limit=5000" : `/api/tree?ids=${chunk.map(encodeURIComponent).join(",")}&limit=5000`;
+      const r = await api(url);
+      storeTreeItems(r.items);
+      if (!r.truncated) for (const p of chunk) if (!tree.kids.has(p)) tree.kids.set(p, []);
+    }
+  }
+
+  function storeTreeItems(items) {
+    const groups = new Map();
+    for (const it of items) {
+      tree.items.set(it.id, it);
+      const key = it.parent || "";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(it.id);
+    }
+    for (const [k, v] of groups) tree.kids.set(k, v);
+    return groups;
+  }
+
+  function treeVisible() {
+    const out = [];
+    const walk = (pid) => {
+      for (const id of tree.kids.get(pid) || []) {
+        out.push(id);
+        if (tree.expanded.has(id)) walk(id);
+      }
+    };
+    walk("");
+    return out;
+  }
+
+  const expandable = (id) => (tree.items.get(id)?.child_count || 0) > 0;
+
+  let treeSeq = 0;
+  async function loadTree() {
+    busy(true);
+    try {
+      await treeFetch([""]);
+      await renderTree();
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      busy(false);
+    }
+  }
+
+  async function renderTree({ fit = true, anchor = null } = {}) {
+    if (state.graphMode !== "hierarchy") return;
+    const seq = ++treeSeq;
+    const ids = treeVisible();
+    let edges = [];
+    if (state.treeLinks && ids.length) {
+      const r = await api("/api/rollup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ visible: ids, relations: [...state.relations], confidences: [...state.conf].filter((c) => c !== "unresolved") }),
+      });
+      edges = r.edges;
+    }
+    if (seq !== treeSeq || state.graphMode !== "hierarchy") return;
+    const pos = new Map();
+    cy.nodes().forEach((n) => pos.set(n.id(), { ...n.position() }));
+    const fresh = !ids.some((id) => pos.has(id));
+    const nodes = ids.map((id) => {
+      const it = tree.items.get(id);
+      const open = tree.expanded.has(id);
+      const parent = it.parent && tree.expanded.has(it.parent) ? it.parent : undefined;
+      const p = pos.get(id) || (parent && pos.get(parent));
+      const jitter = () => (Math.random() - 0.5) * 30;
+      return {
+        group: "nodes",
+        data: { ...it, parent, qualified_name: it.title, label: it.child_count && !open ? `${it.label} · ${num(it.child_count)}` : it.label, deg: 0 },
+        position: p ? { x: p.x + jitter(), y: p.y + jitter() } : undefined,
+        classes: it.child_count && !open ? "collapsed" : "",
+      };
+    });
+    const els = parentsFirst(nodes);
+    for (const e of edges) els.push({ group: "edges", data: { ...e, id: `r:${e.source}>${e.target}`, rlabel: `${t("rel." + e.relation)} · ${num(e.count)}` } });
+    const anchorEl = anchor && cy.getElementById(anchor);
+    const anchorBox = anchorEl?.nonempty() ? { id: anchor, box: anchorEl.renderedBoundingBox({ includeLabels: true, includeOverlays: false }) } : null;
+    syncElements(els);
+    cy.edges().toggleClass("faint", cy.edges().length > 250);
+    applyConfidenceFilter();
+    renderLegend();
+    renderStageBar();
+    if (state.selected && cy.getElementById(state.selected).length) cy.getElementById(state.selected).select();
+    await runLayout(null, { randomize: fresh, fit: fit && !anchorBox, anchor: anchorBox });
+  }
+
+  function collapseSubtree(id) {
+    tree.expanded.delete(id);
+    for (const k of tree.kids.get(id) || []) if (tree.expanded.has(k)) collapseSubtree(k);
+  }
+
+  async function toggleExpand(id) {
+    if (!expandable(id)) return;
+    busy(true);
+    try {
+      if (tree.expanded.has(id)) collapseSubtree(id);
+      else {
+        await treeFetch([id]);
+        if (treeVisible().length + (tree.kids.get(id) || []).length > TREE_CAP) return toast(t("tree.capped", { n: num(TREE_CAP) }), "error");
+        tree.expanded.add(id);
+      }
+      await renderTree({ anchor: id });
+      if (state.mode === "container" && state.selected === id) renderContainer();
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      busy(false);
+    }
+  }
+
+  /** Opens one more level everywhere (bounded by TREE_CAP). */
+  async function expandLevel() {
+    const targets = treeVisible().filter((id) => expandable(id) && !tree.expanded.has(id));
+    if (!targets.length) return;
+    busy(true);
+    try {
+      await treeFetch(targets);
+      let budget = TREE_CAP - treeVisible().length;
+      let capped = false;
+      for (const id of targets) {
+        const k = (tree.kids.get(id) || []).length;
+        if (k > budget) {
+          capped = true;
+          continue;
+        }
+        budget -= k;
+        tree.expanded.add(id);
+      }
+      if (capped) toast(t("tree.capped", { n: num(TREE_CAP) }));
+      await renderTree();
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      busy(false);
+    }
+  }
+
+  /** Expands a whole subtree in one request. */
+  async function expandSubtree(id) {
+    busy(true);
+    try {
+      const room = Math.max(10, TREE_CAP - treeVisible().length);
+      const r = await api(`/api/tree?id=${encodeURIComponent(id)}&depth=8&limit=${room}`);
+      const groups = storeTreeItems(r.items);
+      for (const p of groups.keys()) if (p) tree.expanded.add(p);
+      if (r.truncated) toast(t("tree.capped", { n: num(TREE_CAP) }));
+      await renderTree({ anchor: id });
+      if (state.mode === "container" && state.selected === id) renderContainer();
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      busy(false);
+    }
+  }
+
+  function collapseAll() {
+    tree.expanded.clear();
+    renderTree();
+  }
+
+  /** Switches to the hierarchy, opens every ancestor of `id`, then selects and centres it. */
+  async function revealInTree(id) {
+    busy(true);
+    try {
+      const r = await api(`/api/tree?id=${encodeURIComponent(id)}`);
+      if (!r.item) return toast(t("tree.notFound"), "error");
+      tree.items.set(r.item.id, r.item);
+      for (const p of r.path) tree.items.set(p.id, p);
+      await treeFetch(["", ...r.path.map((p) => p.id)]);
+      r.path.forEach((p) => tree.expanded.add(p.id));
+      state.view = "graph";
+      if (state.graphMode !== "hierarchy") {
+        state.graphMode = "hierarchy";
+        store.set("graphMode", "hierarchy");
+        renderSidebar();
+      }
+      await renderTree({ fit: false });
+      const n = cy.getElementById(id);
+      if (n.length) {
+        highlightNeighbourhood(n);
+        cy.animate({ center: { eles: n }, zoom: Math.min(1.25, Math.max(cy.zoom(), 0.8)) }, { duration: 300 });
+      }
+      isSynthetic(id) ? selectContainer(id) : select(id);
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      busy(false);
+    }
+  }
+
+  /** Row clicked in the inspector: select it on the canvas, revealing it first if needed. */
+  function openTreeItem(id) {
+    const n = cy.getElementById(id);
+    if (state.graphMode !== "hierarchy" || !n.length) return revealInTree(id);
+    highlightNeighbourhood(n);
+    cy.animate({ center: { eles: n } }, { duration: 250 });
+    isSynthetic(id) ? selectContainer(id) : select(id);
+  }
+
+  async function selectContainer(id) {
+    try {
+      await treeFetch([id]);
+    } catch (e) {
+      return toast(e.message, "error");
+    }
+    state.selected = id;
+    state.detail = null;
+    state.mode = "container";
+    inspector.scrollTop = 0;
+    renderContainer();
+    const node = cy.getElementById(id);
+    if (node.length) {
+      cy.elements().unselect();
+      node.select();
+    }
   }
 
   // Hover tooltip.
@@ -495,11 +1094,12 @@
       showTip(`<div class="tt-row">${kindBadge("unresolved")}</div><div class="tt-title">${esc(d.label)}</div>`, ev.renderedPosition);
       return;
     }
+    const kids = d.child_count ? `<div class="tt-ev">${esc(t("tree.children", { n: num(d.child_count) }))} · ${esc(t(n.isParent() ? "tree.hintCollapse" : "tree.hintExpand"))}</div>` : "";
     showTip(
       `<div class="tt-row">${kindBadge(d.kind)}${d.is_entrypoint ? `<span class="badge entry">${esc(t("ov.entry"))}</span>` : ""}</div>
        <div class="tt-title">${esc(d.qualified_name || d.label)}</div>
-       <div class="tt-mono">${esc(d.coords)}</div>
-       ${d.signature ? `<div class="tt-mono" style="margin-top:4px">${esc(d.signature.slice(0, 140))}</div>` : ""}`,
+       ${d.coords ? `<div class="tt-mono">${esc(d.coords)}</div>` : ""}
+       ${d.signature ? `<div class="tt-mono" style="margin-top:4px">${esc(d.signature.slice(0, 140))}</div>` : ""}${kids}`,
       ev.renderedPosition
     );
   });
@@ -510,6 +1110,16 @@
   cy.on("mouseover", "edge", (ev) => {
     const d = ev.target.data();
     ev.target.addClass("hl");
+    if (d.rollup) {
+      const label = (id) => tree.items.get(id)?.label || cy.getElementById(id).data("label") || id;
+      const rels = Object.entries(d.relations || {}).map(([r, c]) => `<span class="rel-tag">${esc(t("rel." + r))} · ${num(c)}</span>`).join(" ");
+      showTip(
+        `<div class="tt-row"><span class="conf-badge ${d.confidence}">${esc(t("conf." + d.confidence))}</span><b>${esc(t("tree.linkCount", { n: num(d.count) }))}</b></div>
+         <div class="tt-title">${esc(label(d.source))} → ${esc(label(d.target))}</div><div class="tt-row">${rels}</div>`,
+        ev.renderedPosition
+      );
+      return;
+    }
     showTip(
       `<div class="tt-row"><span class="conf-badge ${d.confidence}">${esc(t("conf." + d.confidence))}</span><span class="rel-tag">${esc(t("rel." + d.relation))}</span></div>
        <div class="tt-ev">${esc(d.evidence)}</div><div class="tt-mono" style="margin-top:4px">${esc(d.site)}</div>`,
@@ -525,11 +1135,14 @@
     const n = ev.target;
     if (n.data("kind") === "unresolved") return;
     highlightNeighbourhood(n);
-    select(n.id());
+    isSynthetic(n.id()) ? selectContainer(n.id()) : select(n.id());
   });
   cy.on("dbltap", "node", (ev) => {
     const n = ev.target;
-    if (n.data("kind") !== "unresolved") focusNode(n.id(), n.data("label"));
+    const d = n.data();
+    if (d.kind === "unresolved") return;
+    if (state.graphMode === "hierarchy" && d.child_count) return toggleExpand(n.id());
+    focusNode(n.id(), d.label);
   });
   cy.on("tap", (ev) => {
     if (ev.target === cy) cy.elements().removeClass("dim hl");
@@ -538,9 +1151,12 @@
   function highlightNeighbourhood(node) {
     cy.batch(() => {
       cy.elements().addClass("dim").removeClass("hl");
-      const nb = node.closedNeighborhood();
-      nb.removeClass("dim");
-      nb.edges().addClass("hl");
+      // A box counts with everything inside it; ancestors stay lit (their opacity cascades).
+      const core = node.union(node.descendants());
+      const edges = core.connectedEdges();
+      const nodes = core.union(edges.connectedNodes());
+      nodes.union(nodes.ancestors()).union(edges).removeClass("dim");
+      edges.addClass("hl");
     });
   }
 
@@ -558,8 +1174,47 @@
 
   function renderInspector() {
     if (state.mode === "node" && state.detail) return renderNode();
+    if (state.mode === "container" && tree.items.has(state.selected)) return renderContainer();
     if (state.mode === "list") return renderList();
     return renderDashboard();
+  }
+
+  /** Inspector for a hierarchy container: namespace or folder, with its contents. */
+  function renderContainer() {
+    const it = tree.items.get(state.selected);
+    if (!it) return;
+    const kids = (tree.kids.get(it.id) || []).map((k) => tree.items.get(k)).filter(Boolean);
+    const byKind = {};
+    for (const k of kids) byKind[k.kind] = (byKind[k.kind] || 0) + 1;
+    const chips = Object.entries(byKind)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, c]) => `<span class="chip"><span class="swatch" style="background:${kindColor(k)}"></span>${esc(t("kind." + k))} · ${num(c)}</span>`)
+      .join("");
+    const rows = kids
+      .slice(0, 300)
+      .map((k) => `<div class="row clickable" data-tree="${esc(k.id)}">
+        <span class="kind-dot" style="background:${kindColor(k.kind)}"></span>
+        <div class="main"><div class="title">${esc(k.label)}</div><div class="sub">${esc(k.coords || t("kind." + k.kind))}</div></div>
+        ${k.child_count ? `<span class="meta">${num(k.child_count)}</span>` : ""}</div>`)
+      .join("");
+    const open = tree.expanded.has(it.id);
+    const inTree = state.graphMode === "hierarchy";
+    inspector.innerHTML = `
+      <div class="insp-head">
+        <div class="badges">${kindBadge(it.kind)}</div>
+        <h2 class="insp-title">${esc(it.label)}</h2>
+        ${it.title && it.title !== it.label ? `<div class="insp-sub">${esc(it.title)}</div>` : ""}
+        <div class="action-row">
+          ${inTree
+            ? `<button class="btn primary sm" data-act="tree-toggle">${icon(open ? "fold" : "unfold", 13)}${esc(t(open ? "tree.collapse" : "tree.expand"))}</button>
+               <button class="btn sm" data-act="tree-expand-all">${icon("expand", 13)}${esc(t("tree.expandAll"))}</button>`
+            : `<button class="btn primary sm" data-act="reveal">${icon("tree", 13)}${esc(t("insp.reveal"))}</button>`}
+        </div>
+      </div>
+      <div class="pane">
+        <div class="section"><div class="section-title">${esc(t("tree.contents"))}<span class="count">${num(kids.length)}</span></div><div class="chips">${chips}</div></div>
+        ${rows ? `<div class="section"><div class="rows">${rows}</div></div>` : `<div class="empty-note">${esc(t("list.empty"))}</div>`}
+      </div>`;
   }
 
   function rowFor(n, meta = "") {
@@ -679,6 +1334,7 @@
         <div class="action-row">
           <button class="btn primary sm" data-act="coords">${icon("copy", 13)}${esc(t("insp.copyCoords"))}</button>
           <button class="btn sm" data-act="focus">${icon("focus", 13)}${esc(t("insp.focus"))}</button>
+          <button class="btn sm" data-act="reveal">${icon("tree", 13)}${esc(t("insp.reveal"))}</button>
           <a class="btn sm" href="${esc(editorUrl(n))}" style="text-decoration:none">${icon("external", 13)}${esc(t("insp.openEditor"))}</a>
         </div>
       </div>
@@ -887,6 +1543,9 @@
   }
 
   async function runAction(act) {
+    if (act === "tree-toggle") return toggleExpand(state.selected);
+    if (act === "tree-expand-all") return expandSubtree(state.selected);
+    if (act === "reveal" && state.mode === "container") return revealInTree(state.selected);
     const d = state.detail;
     if (!d) return;
     const n = d.node;
@@ -901,6 +1560,8 @@
         return copy(n.id);
       case "focus":
         return focusNode(n.id, n.label);
+      case "reveal":
+        return revealInTree(n.id);
       case "expand":
         state.depth = 2;
         return focusNode(n.id, n.label);
@@ -958,7 +1619,8 @@
   function commands() {
     return [
       { title: t("cmd.overview"), icon: "dashboard", run: () => setView("dashboard") },
-      { title: t("cmd.graph"), icon: "graph", run: () => setView("graph") },
+      { title: t("cmd.graph"), icon: "graph", run: () => (state.graphMode === "relations" ? setView("graph") : setGraphMode("relations")) },
+      { title: t("cmd.hierarchy"), icon: "tree", run: () => (state.graphMode === "hierarchy" ? setView("graph") : setGraphMode("hierarchy")) },
       { title: t("cmd.fit"), icon: "fit", run: () => cy.animate({ fit: { padding: 40 } }, { duration: 250 }) },
       { title: t("cmd.reindex"), icon: "refresh", run: reindex },
       { title: t("cmd.theme"), icon: effectiveTheme() === "dark" ? "sun" : "moon", run: toggleTheme },
@@ -1097,8 +1759,15 @@
       if (state.lastIndexed !== null && li !== state.lastIndexed) {
         state.lastIndexed = li;
         state.cache = {};
+        // Child lists may have changed; expanded containers are kept and refetched.
+        tree.items.clear();
+        tree.kids.clear();
         await loadOverview();
-        loadGraph();
+        if (state.graphMode === "hierarchy") {
+          await treeFetch(["", ...tree.expanded]).catch(() => {});
+          for (const id of [...tree.expanded]) if (!tree.items.has(id)) tree.expanded.delete(id);
+          renderTree({ fit: false });
+        } else loadGraph();
         if (state.selected && state.mode === "node") select(state.selected);
       } else {
         state.lastIndexed = li;
@@ -1131,10 +1800,15 @@
     if (el.closest("#palette")) return;
     const view = el.closest("[data-view]");
     if (view) return setView(view.dataset.view);
+    const treeRow = el.closest("[data-tree]");
+    if (treeRow) return openTreeItem(treeRow.dataset.tree);
+    const gmode = el.closest("[data-gmode]");
+    if (gmode) return setGraphMode(gmode.dataset.gmode);
     const open = el.closest("[data-open]");
     if (open) {
       const id = open.dataset.open;
       const node = cy.getElementById(id);
+      if (state.graphMode === "hierarchy") return openTreeItem(id);
       if (node.length && state.focus) {
         highlightNeighbourhood(node);
         select(id);
@@ -1167,7 +1841,7 @@
       state.relations.has(r) ? state.relations.delete(r) : state.relations.add(r);
       store.set("relations", [...state.relations]);
       renderSidebar();
-      return loadGraph();
+      return state.graphMode === "hierarchy" ? renderTree({ fit: false }) : loadGraph();
     }
     const conf = el.closest("[data-conf]");
     if (conf) {
@@ -1175,11 +1849,14 @@
       state.conf.has(c) ? state.conf.delete(c) : state.conf.add(c);
       store.set("confidence", [...state.conf]);
       renderSidebar();
+      // Roll-up edges are aggregated server-side per confidence.
+      if (state.graphMode === "hierarchy" && c !== "unresolved") return renderTree({ fit: false });
       return applyConfidenceFilter();
     }
     const crumb = el.closest("[data-crumb]");
     if (crumb) {
       const id = crumb.dataset.crumb;
+      if (id === "home" && state.graphMode === "hierarchy") return collapseAll();
       if (id === "home") return goHome();
       const idx = state.history.findIndex((h) => h.id === id);
       state.history = state.history.slice(0, idx + 1);
@@ -1201,6 +1878,24 @@
     state.layout = ev.target.value;
     store.set("layout", state.layout);
     runLayout(state.focus);
+  });
+  $("#group-select").addEventListener("change", (ev) => {
+    state.groupBy = ev.target.value;
+    store.set("groupBy", state.groupBy);
+    loadGraph();
+  });
+  $("#spacing-select").addEventListener("change", (ev) => {
+    state.spacing = ev.target.value;
+    store.set("spacing", state.spacing);
+    runLayout(state.graphMode === "hierarchy" ? null : state.focus, { randomize: false });
+  });
+  $("#tree-expand").addEventListener("click", expandLevel);
+  $("#tree-collapse").addEventListener("click", collapseAll);
+  $("#tree-links").addEventListener("click", () => {
+    state.treeLinks = !state.treeLinks;
+    store.set("treeLinks", state.treeLinks);
+    renderStageBar();
+    renderTree({ fit: false });
   });
   $("#btn-back").addEventListener("click", () => {
     state.history.pop();
@@ -1266,7 +1961,7 @@
   renderChrome();
   renderInspector();
   loadOverview().then(() => (state.lastIndexed = state.status?.stats?.last_indexed_at ?? null));
-  loadGraph();
+  loadStage();
   setInterval(pollStatus, 1500);
   setInterval(() => renderSidebar(), 30000);
 })();
