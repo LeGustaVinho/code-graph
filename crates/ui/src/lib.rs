@@ -44,6 +44,8 @@ pub async fn serve(engine: Arc<Engine>, addr: SocketAddr) -> Result<()> {
         .route("/api/search", get(search))
         .route("/api/graph", get(graph))
         .route("/api/node/{id}", get(node_detail))
+        .route("/api/overview", get(overview))
+        .route("/api/source/{id}", get(source))
         .route("/api/tool/{name}", post(run_tool))
         .route("/api/reindex", post(reindex))
         .fallback(static_handler)
@@ -75,6 +77,20 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, ApiError> + S
 async fn static_handler(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
+    // Development mode: serve assets from disk (CODEGRAPH_UI_DEV=<assets dir>) without rebuilding.
+    if let Some(dir) = std::env::var_os("CODEGRAPH_UI_DEV") {
+        let candidate = std::path::Path::new(&dir).join(path);
+        if !path.contains("..") {
+            if let Ok(bytes) = std::fs::read(&candidate) {
+                let mime = mime_guess::from_path(path).first_or_octet_stream();
+                return Response::builder()
+                    .header(header::CONTENT_TYPE, mime.as_ref())
+                    .header(header::CACHE_CONTROL, "no-store")
+                    .body(Body::from(bytes))
+                    .unwrap();
+            }
+        }
+    }
     match Assets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
@@ -349,6 +365,108 @@ async fn reindex(State(engine): State<AppState>) -> Result<Json<Value>, ApiError
     blocking(move || {
         let stats = engine.reindex_all(false)?;
         Ok(Json(serde_json::to_value(stats)?))
+    })
+    .await
+}
+
+/// Dashboard data: graph statistics plus the lists used by the sidebar views.
+async fn overview(State(engine): State<AppState>) -> Result<Json<Value>, ApiError> {
+    blocking(move || {
+        let conn = engine.reader()?;
+        let status = engine.status()?;
+        let pairs = |sql: &str| -> Result<Vec<(String, i64)>, ApiError> {
+            let mut st = conn.prepare(sql)?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, i64>(1)?)))?;
+            Ok(rows.flatten().collect())
+        };
+        let kinds = pairs("SELECT kind, COUNT(*) FROM node WHERE kind NOT IN ('module') GROUP BY kind ORDER BY 2 DESC")?;
+        let relations = pairs("SELECT relation, COUNT(*) FROM edge GROUP BY relation ORDER BY 2 DESC")?;
+        let rel_conf = {
+            let mut st = conn.prepare("SELECT relation, confidence, COUNT(*) FROM edge GROUP BY 1, 2")?;
+            let rows: Vec<Value> = st
+                .query_map([], |r| Ok(json!({ "relation": r.get::<_, String>(0)?, "confidence": r.get::<_, String>(1)?, "count": r.get::<_, i64>(2)? })))?
+                .flatten()
+                .collect();
+            rows
+        };
+        let node_list = |sql: &str| -> Result<Vec<Value>, ApiError> {
+            let mut st = conn.prepare(sql)?;
+            let rows: Vec<Node> = st.query_map([], codegraph_graph::store::node_from_row)?.flatten().collect();
+            Ok(rows.iter().map(|n| node_json(n, None)).collect())
+        };
+        let cols = codegraph_graph::store::NODE_COLS;
+        let entrypoints = node_list(&format!("SELECT {cols} FROM node WHERE is_entrypoint = 1 ORDER BY entry_kind, file_path LIMIT 200"))?;
+        let hotspots = node_list(&format!(
+            "SELECT {cols} FROM node WHERE kind IN ('function','method','constructor') AND cyclomatic_complexity > 1 ORDER BY cyclomatic_complexity DESC, file_path LIMIT 50"
+        ))?;
+        let models = {
+            let mut st = conn.prepare(&format!(
+                "SELECT {}, d.framework, (SELECT COUNT(*) FROM data_model_field f WHERE f.model_node_id = n.id) FROM data_model d JOIN node n ON n.id = d.model_node_id ORDER BY n.name",
+                cols.split(", ").map(|c| format!("n.{c}")).collect::<Vec<_>>().join(", ")
+            ))?;
+            let rows: Vec<Value> = st
+                .query_map([], |r| {
+                    let n = codegraph_graph::store::node_from_row(r)?;
+                    let mut v = node_json(&n, None);
+                    v["framework"] = json!(r.get::<_, Option<String>>(28)?);
+                    v["fields"] = json!(r.get::<_, i64>(29)?);
+                    Ok(v)
+                })?
+                .flatten()
+                .collect();
+            rows
+        };
+        let unresolved = {
+            let mut st = conn.prepare(&format!("SELECT {EDGE_COLS} FROM edge WHERE confidence = 'unresolved' AND relation IN ('CALLS', 'HTTP_CALLS', 'RESOLVES_DI') ORDER BY source_file, line_number LIMIT 200"))?;
+            let edges: Vec<EdgeRow> = st.query_map([], edge_from_row)?.flatten().collect();
+            let ids: Vec<String> = edges.iter().map(|e| e.source_id.clone()).collect();
+            let nodes = query::nodes_by_ids(&conn, &ids)?;
+            edges
+                .iter()
+                .map(|e| {
+                    let mut v = edge_json(e);
+                    if let Some(n) = nodes.get(&e.source_id) {
+                        v["source_label"] = json!(short_label(n));
+                        v["source_kind"] = json!(n.sym.kind.as_str());
+                    }
+                    v
+                })
+                .collect::<Vec<_>>()
+        };
+        Ok(Json(json!({
+            "status": status,
+            "kinds": kinds,
+            "relations": relations,
+            "relation_confidence": rel_conf,
+            "entrypoints": entrypoints,
+            "hotspots": hotspots,
+            "models": models,
+            "unresolved": unresolved,
+        })))
+    })
+    .await
+}
+
+/// Source lines of a symbol (read from disk; the freshness loop keeps ranges current).
+async fn source(State(engine): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    blocking(move || {
+        let conn = engine.reader()?;
+        let Some(n) = query::node(&conn, &id)? else {
+            return Err(ApiError(format!("node {id} not found")));
+        };
+        let text = std::fs::read_to_string(engine.root.join(&n.file_path))?;
+        let all: Vec<&str> = text.lines().collect();
+        let start = n.sym.start_line.max(1) as usize;
+        let end = (n.sym.end_line as usize).min(all.len()).min(start + 799);
+        let lines: Vec<Value> = (start..=end).map(|i| json!({ "n": i, "text": all.get(i - 1).copied().unwrap_or("") })).collect();
+        Ok(Json(json!({
+            "file": n.file_path,
+            "language": n.language,
+            "start": n.sym.start_line,
+            "end": n.sym.end_line,
+            "truncated": (n.sym.end_line as usize) > end,
+            "lines": lines,
+        })))
     })
     .await
 }

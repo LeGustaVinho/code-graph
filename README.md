@@ -5,7 +5,7 @@ Indexador de código de alto desempenho que constrói um **grafo semântico** do
 com **níveis formais de confiança** em cada relação, e o expõe como:
 
 - **Servidor MCP** (JSON-RPC 2.0 sobre stdio) com **28 ferramentas analíticas** e orçamento estrito de tokens;
-- **Graph Explorer** local (Axum + Cytoscape.js embutidos) em `http://localhost:4321`;
+- **Graph Explorer** local (Axum + Cytoscape.js embutidos) em `http://localhost:4321`, em português, inglês e espanhol;
 - **CLI** (`codegraph index | mcp | ui | query | tools | status`).
 
 Tudo em um **binário único** (~20 MB) sem dependências externas: gramáticas Tree-sitter,
@@ -82,6 +82,26 @@ Todas aceitam `max_token_budget`; quando o limite é atingido a resposta termina
 Argumentos são validados estritamente (campos desconhecidos são rejeitados). Símbolos podem ser
 passados por id (`sym_…`), nome, `Tipo.membro`, nome qualificado ou `arquivo:linha`.
 `codegraph tools --json` imprime os schemas completos.
+
+## Graph Explorer (`codegraph ui`)
+
+Interface web local servida pelo próprio binário (`http://localhost:4321`), disponível em
+**português, inglês e espanhol** — o idioma é detectado pelo navegador e pode ser trocado no
+seletor do topo ou pela paleta de comandos. Temas claro e escuro.
+
+- **Paleta de comandos** (`Ctrl+K` ou `/`): busca de símbolos e comandos (visões, tema, idioma, reindexar, exportar PNG).
+- **Barra lateral:** visões (Visão geral, Grafo, Pontos de entrada, Modelos de dados, Complexidade,
+  Não resolvidos) e filtros por nível de confiança e por tipo de relação, com contagens.
+- **Grafo:** linhas sólidas (`exact`), tracejadas (`inferred`) e pontilhadas em vermelho (`unresolved`);
+  tooltips com evidência, trilha de navegação com voltar, profundidade 1–3, 5 layouts, zoom/ajuste e exportação PNG.
+- **Inspetor** (redimensionável): Geral, Evidências, Fluxos & Fullstack, Contrato de Dados,
+  Código-fonte com destaque de sintaxe e Ação Rápida (copiar coordenadas para IA, abrir no VS Code, raio de impacto, testes).
+- **Status em tempo real** do índice (atualizado, reindexando, pendente).
+
+Atalhos: `Ctrl+K`/`/` paleta · `F` ajustar grafo · `Backspace` voltar.
+
+Para desenvolver a interface sem recompilar, aponte `CODEGRAPH_UI_DEV` para `crates/ui/assets`:
+os arquivos passam a ser servidos do disco.
 
 ## Arquitetura
 
