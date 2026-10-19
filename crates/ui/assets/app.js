@@ -72,6 +72,9 @@
   const CONFIDENCES = ["exact", "inferred", "unresolved"];
   const LAYOUTS = ["auto", "force", "hierarchy", "concentric", "circle", "grid"];
   const GROUPS = ["none", "class", "file", "namespace"];
+  /** Which edges are drawn: all, or only those of the selected node (both / incoming / outgoing). */
+  const EDGE_MODES = ["all", "selection", "in", "out"];
+  const EDGE_IN_COLOR = "#f59e0b";
   const SPACING = { compact: 0.7, normal: 1, wide: 1.6 };
   const TYPE_KINDS = new Set(["class", "interface", "struct", "enum", "type_alias", "data_model"]);
   const HAS_FCOSE = typeof cytoscapeFcose !== "undefined";
@@ -118,6 +121,8 @@
     groupBy: GROUPS.includes(store.get("groupBy", "none")) ? store.get("groupBy", "none") : "none",
     spacing: SPACING[store.get("spacing", "normal")] ? store.get("spacing", "normal") : "normal",
     treeLinks: store.get("treeLinks", true),
+    edgeMode: EDGE_MODES.includes(store.get("edgeMode", "all")) ? store.get("edgeMode", "all") : "all",
+    edgeAnchor: null,
     // Hierarchy model: items by id, loaded child lists by parent ("" = roots), expanded containers.
     tree: { items: new Map(), kids: new Map(), expanded: new Set() },
   };
@@ -241,6 +246,15 @@
         <span class="checkbox">${check}</span><span class="swatch" style="background:${REL_COLORS[r]}"></span><span class="label">${esc(t("rel." + r))}</span><span class="count">${num(relCounts[r] || 0)}</span></button>`
     ).join(""));
 
+    const anchor = state.edgeAnchor ? cy.getElementById(state.edgeAnchor) : cy.collection();
+    const dir = anchor.nonempty() ? anchorEdges(anchor) : null;
+    const edgeCount = { in: dir?.inE.length, out: dir?.outE.length, selection: dir && dir.inE.union(dir.outE).length };
+    const edgeSwatch = { in: `<span class="line-swatch dir" style="border-color:${EDGE_IN_COLOR}"></span>`, out: `<span class="line-swatch dir out"></span>` };
+    setHTML($("#edge-modes"), EDGE_MODES.map(
+      (m) => `<button class="filter ${state.edgeMode === m ? "" : "off"}" data-edgemode="${m}" title="${esc(t(`edges.${m}.desc`))}">
+        <span class="radio"></span>${edgeSwatch[m] || ""}<span class="label">${esc(t("edges." + m))}</span>${edgeCount[m] !== undefined && edgeCount[m] !== null ? `<span class="count">${num(edgeCount[m])}</span>` : ""}</button>`
+    ).join(""));
+
     const st = state.status?.stats;
     setHTML($("#index-info"), st
       ? `<span>${esc(t("index.files"))}</span><b>${num(st.files)}</b>
@@ -279,8 +293,9 @@
     $("#layout-wrap").hidden = tree;
     $("#depth-ctl").hidden = tree || !state.focus;
     $$("#depth-ctl button").forEach((b) => b.classList.toggle("on", Number(b.dataset.depth) === state.depth));
-    const n = cy.nodes(":visible").length;
-    const e = cy.edges(":visible").length;
+    // Counted from the filter classes: ":visible" lags until the next paint.
+    const n = cy.nodes().filter((x) => !x.hasClass("conf-hidden")).length;
+    const e = cy.edges().filter((x) => !x.hasClass("conf-hidden") && !x.hasClass("edge-off")).length;
     $("#stage-count").textContent = n ? t("stage.nodes", { n: num(n), e: num(e) }) : "";
   }
 
@@ -290,6 +305,11 @@
     const items = kinds.map((k) => `<span class="legend-item"><span class="swatch" style="background:${KINDS[k].color}"></span>${esc(t("kind." + k))}</span>`);
     items.push('<span class="legend-sep"></span>');
     for (const c of CONFIDENCES) items.push(`<span class="legend-item"><span class="line-swatch ${c}"></span>${esc(t("conf." + c))}</span>`);
+    if (state.edgeMode !== "all") {
+      items.push('<span class="legend-sep"></span>');
+      if (state.edgeMode !== "out") items.push(`<span class="legend-item"><span class="line-swatch dir" style="border-color:${EDGE_IN_COLOR}"></span>${esc(t("edges.legendIn"))}</span>`);
+      if (state.edgeMode !== "in") items.push(`<span class="legend-item"><span class="line-swatch dir out"></span>${esc(t("edges.legendOut"))}</span>`);
+    }
     $("#legend-body").innerHTML = items.join("");
     $("#legend").classList.toggle("collapsed", store.get("legendCollapsed", false));
   }
@@ -422,6 +442,10 @@
       { selector: "edge[relation = 'HTTP_CALLS']", style: { width: 2.6 } },
       // Relations rolled up onto collapsed containers: thicker = more underlying links.
       { selector: "edge[?rollup]", style: { width: "mapData(count, 1, 40, 1.4, 7)", opacity: 0.45, "arrow-scale": 0.9 } },
+      // Direction of the selected node's edges (only when drawing the selection's edges).
+      { selector: "edge.e-in", style: { "line-color": EDGE_IN_COLOR, "target-arrow-color": EDGE_IN_COLOR } },
+      { selector: "edge.e-out", style: { "line-color": cssVar("--accent"), "target-arrow-color": cssVar("--accent") } },
+      { selector: "edge.edge-off", style: { display: "none" } },
       // Dense graphs: edges recede until a node is selected (".hl" restores them).
       { selector: "edge.faint", style: { opacity: 0.12 } },
       { selector: "edge.hl", style: { opacity: 1, width: 2.6, label: "data(rlabel)", "z-index": 8 } },
@@ -438,6 +462,7 @@
       cy.edges().forEach((e) => e.toggleClass("conf-hidden", !state.conf.has(e.data("confidence"))));
       cy.nodes("[kind = 'unresolved']").forEach((n) => n.toggleClass("conf-hidden", !state.conf.has("unresolved")));
     });
+    applyEdgeMode();
     const anyVisible = cy.nodes(":visible").length > 0;
     $("#empty").hidden = anyVisible;
     $("#empty-body").textContent = cy.nodes().length && !anyVisible ? t("empty.filtered") : t("empty.body");
@@ -645,6 +670,7 @@
     const seq = ++layoutSeq;
     return new Promise((resolve) => {
       if (!cy.nodes().length) return resolve();
+      cy.nodes().stop(true, false);
       const leaves = cy.nodes().filter((n) => n.isChildless());
       const before = new Map(leaves.map((n) => [n.id(), { ...n.position() }]));
       const finish = () => {
@@ -675,11 +701,10 @@
         // left behind so a later layout never starts from half-moved nodes.
         setTimeout(() => {
           if (seq === layoutSeq) {
+            cy.nodes().stop(true, false);
             cy.batch(() =>
               leaves.forEach((n) => {
-                if (n.removed()) return;
-                n.stop(true);
-                n.position(after.get(n.id()));
+                if (!n.removed() && n.isChildless()) n.position(after.get(n.id()));
               })
             );
             cy.stop(true);
@@ -708,7 +733,9 @@
     const want = new Map();
     for (const e of els) if (e.group === "nodes") want.set(e.data.id, e);
     cy.batch(() => {
-      cy.elements().stop(true, true);
+      // Clear (don't jump to the end of) pending animations: a jump is applied on the next
+      // frame, after the new layout, and would drag a box that was a leaf back to its old spot.
+      cy.elements().stop(true, false);
       cy.edges().remove();
       cy.nodes()
         .filter((n) => !want.has(n.id()))
@@ -1065,6 +1092,7 @@
     if (node.length) {
       cy.elements().unselect();
       node.select();
+      setEdgeAnchor(id);
     }
   }
 
@@ -1145,15 +1173,70 @@
     focusNode(n.id(), d.label);
   });
   cy.on("tap", (ev) => {
-    if (ev.target === cy) cy.elements().removeClass("dim hl");
+    if (ev.target !== cy) return;
+    cy.elements().removeClass("dim hl");
+    setEdgeAnchor(null);
   });
 
+  /** Edges of a node, a box counting with everything inside it. */
+  function anchorEdges(node) {
+    const core = node.union(node.descendants());
+    const ids = new Set(core.map((n) => n.id()));
+    const all = core.connectedEdges();
+    return {
+      core,
+      inE: all.filter((e) => ids.has(e.target().id()) && !ids.has(e.source().id())),
+      outE: all.filter((e) => ids.has(e.source().id())),
+    };
+  }
+
+  function shownEdges(node) {
+    const { inE, outE } = anchorEdges(node);
+    return state.edgeMode === "in" ? inE : state.edgeMode === "out" ? outE : inE.union(outE);
+  }
+
+  function applyEdgeMode() {
+    const node = state.edgeAnchor ? cy.getElementById(state.edgeAnchor) : cy.collection();
+    const on = state.edgeMode !== "all";
+    cy.batch(() => {
+      cy.edges().removeClass("edge-off e-in e-out");
+      if (!on) return;
+      if (node.nonempty()) {
+        const { inE, outE } = anchorEdges(node);
+        if (state.edgeMode !== "out") inE.addClass("e-in");
+        if (state.edgeMode !== "in") outE.addClass("e-out");
+      }
+      cy.edges().difference(node.nonempty() ? shownEdges(node) : cy.collection()).addClass("edge-off");
+    });
+    $("#edge-hint").hidden = !on || node.nonempty() || !cy.edges().length;
+  }
+
+  function setEdgeAnchor(id) {
+    if (state.edgeAnchor === id) return;
+    state.edgeAnchor = id;
+    applyEdgeMode();
+    renderSidebar();
+    renderStageBar();
+  }
+
+  function setEdgeMode(mode) {
+    state.edgeMode = mode;
+    store.set("edgeMode", mode);
+    applyEdgeMode();
+    renderSidebar();
+    renderStageBar();
+    renderLegend();
+    const node = state.edgeAnchor && cy.getElementById(state.edgeAnchor);
+    if (node?.nonempty()) highlightNeighbourhood(node);
+  }
+
   function highlightNeighbourhood(node) {
+    setEdgeAnchor(node.id());
     cy.batch(() => {
       cy.elements().addClass("dim").removeClass("hl");
       // A box counts with everything inside it; ancestors stay lit (their opacity cascades).
       const core = node.union(node.descendants());
-      const edges = core.connectedEdges();
+      const edges = state.edgeMode === "all" ? core.connectedEdges() : shownEdges(node);
       const nodes = core.union(edges.connectedNodes());
       nodes.union(nodes.ancestors()).union(edges).removeClass("dim");
       edges.addClass("hl");
@@ -1536,6 +1619,7 @@
       if (node.length) {
         cy.elements().unselect();
         node.select();
+        setEdgeAnchor(id);
       }
     } catch (e) {
       toast(e.message, "error");
@@ -1843,6 +1927,8 @@
       renderSidebar();
       return state.graphMode === "hierarchy" ? renderTree({ fit: false }) : loadGraph();
     }
+    const em = el.closest("[data-edgemode]");
+    if (em) return setEdgeMode(em.dataset.edgemode);
     const conf = el.closest("[data-conf]");
     if (conf) {
       const c = conf.dataset.conf;
@@ -1927,6 +2013,7 @@
       closePalette();
     } else if (!typing && palette.hidden && !ev.ctrlKey && !ev.metaKey) {
       if (ev.key === "f") cy.animate({ fit: { padding: 40 } }, { duration: 250 });
+      if (ev.key === "e") setEdgeMode(state.edgeMode === "all" ? "selection" : "all");
       if (ev.key === "Backspace" && state.history.length) $("#btn-back").click();
     }
   });

@@ -52,6 +52,10 @@
         <div class="side-title" data-i18n="nav.confidence">Confidence</div>
         <div class="filter-list" id="conf-filters"></div>
       </section>
+      <section class="side-section">
+        <div class="side-title" data-i18n="nav.edges">Edges shown</div>
+        <div class="filter-list" id="edge-modes"></div>
+      </section>
       <section class="side-section grow">
         <div class="side-title" data-i18n="nav.relations">Relations</div>
         <div class="filter-list" id="rel-filters"></div>
@@ -113,6 +117,7 @@
           <button class="legend-toggle" id="legend-toggle"><i data-icon="info" data-size="14"></i><span data-i18n="ctl.legend">Legend</span></button>
           <div class="legend-body" id="legend-body"></div>
         </div>
+        <div class="edge-hint" id="edge-hint" hidden><i data-icon="info" data-size="14"></i><span data-i18n="edges.hint">Select a node to see its edges</span></div>
         <div class="tooltip" id="tip" hidden></div>
       </div>
     </main>
