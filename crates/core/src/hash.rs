@@ -21,6 +21,31 @@ pub fn symbol_id(file: &str, kind: &str, qualified_name: &str, discriminator: u3
     format!("sym_{}", &hex[..16])
 }
 
+/// Largest content-addressed row id (2^53 - 1: stays exact in JSON / JavaScript numbers).
+pub const MAX_ROWID: i64 = (1 << 53) - 1;
+
+/// Content-addressed SQLite row id in `1..=MAX_ROWID`. Rows keyed this way are stored (and
+/// scanned, and tie-broken) in the same order however and in whatever order they were inserted.
+pub fn stable_rowid(parts: &[&[u8]]) -> i64 {
+    let mut h = blake3::Hasher::new();
+    for p in parts {
+        h.update(&(p.len() as u64).to_le_bytes());
+        h.update(p);
+    }
+    let b = h.finalize();
+    let v = i64::from_le_bytes(b.as_bytes()[..8].try_into().unwrap()) & MAX_ROWID;
+    v.max(1)
+}
+
+/// Next probe slot after a (vanishingly rare) row id collision.
+pub fn next_rowid(id: i64) -> i64 {
+    if id >= MAX_ROWID {
+        1
+    } else {
+        id + 1
+    }
+}
+
 pub fn short_hash(text: &str) -> String {
     blake3::hash(text.as_bytes()).to_hex()[..16].to_string()
 }

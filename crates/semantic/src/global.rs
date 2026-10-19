@@ -17,7 +17,9 @@ use crate::{file_name, relation, Confidence, Edge};
 
 pub fn di_edges(index: &SymbolIndex) -> Vec<Edge> {
     let mut out = Vec::new();
-    for entries in index.di.values() {
+    let mut keys: Vec<&(String, String)> = index.di.keys().collect();
+    keys.sort();
+    for entries in keys.into_iter().map(|k| &index.di[k]) {
         for e in entries {
             let reg = &e.reg;
             let file = &e.file;
@@ -252,6 +254,8 @@ pub fn http_edges(index: &SymbolIndex, routes: &[ResolvedRoute], calls: &[HttpCa
                 );
             }
             n => {
+                let mut cands = cands;
+                cands.sort_by_key(|r| (r.file.clone(), r.line, r.http_method.clone(), r.path.clone(), r.handler_id.clone()));
                 let mut m = meta(None);
                 m["candidates"] =
                     json!(cands.iter().map(|r| format!("{} {} {}:{}", r.http_method, r.path, r.file, r.line)).collect::<Vec<_>>());
@@ -413,6 +417,7 @@ fn production_module_for_test(index: &SymbolIndex, test_file: &str) -> Option<us
                 2
             },
             f.len(),
+            f.clone(),
         )
     });
     let first = *cands.first()?;

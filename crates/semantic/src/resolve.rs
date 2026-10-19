@@ -333,6 +333,10 @@ impl<'a> FileResolver<'a> {
 
     fn emit_unresolved_call(&mut self, r: &Reference, symbol: &str, evidence: String, candidates: &[usize]) {
         let mut meta = Self::call_meta(r);
+        // Canonical order before truncating, so the kept candidates never depend on load order.
+        let mut candidates = candidates.to_vec();
+        self.index.sort_canonical(&mut candidates);
+        candidates.dedup();
         let cands: Vec<String> =
             candidates.iter().take(8).map(|c| format!("{} {}", self.index.syms[*c].sym.qualified_name, self.index.coords(*c))).collect();
         meta["candidates"] = json!(cands);
@@ -673,11 +677,20 @@ impl<'a> FileResolver<'a> {
                     }
                 } else {
                     let prefix = segs[..k].join(".");
-                    let hit = self.index.syms.iter().position(|s| {
-                        s.sym.kind.is_type() && (s.sym.qualified_name == prefix || s.sym.qualified_name.ends_with(&format!(".{prefix}")))
-                    });
-                    if let Some(t) = hit {
-                        found = Some((t, Confidence::Exact, k));
+                    let suffix = format!(".{prefix}");
+                    let hits: Vec<usize> = (0..self.index.syms.len())
+                        .filter(|i| {
+                            let s = &self.index.syms[*i].sym;
+                            s.kind.is_type() && (s.qualified_name == prefix || s.qualified_name.ends_with(&suffix))
+                        })
+                        .collect();
+                    // An exact qualified name beats suffix matches; a unique hit is exact, otherwise
+                    // take the canonical first candidate and only claim an inferred link.
+                    let exact: Vec<usize> = hits.iter().copied().filter(|i| self.index.syms[*i].sym.qualified_name == prefix).collect();
+                    let pool = if exact.is_empty() { hits } else { exact };
+                    if let Some(t) = self.index.canonical_first(&pool) {
+                        let conf = if pool.len() == 1 { Confidence::Exact } else { Confidence::Inferred };
+                        found = Some((t, conf, k));
                         break;
                     }
                 }

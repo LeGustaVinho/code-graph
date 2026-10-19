@@ -111,12 +111,26 @@ pub fn edge_from_row(r: &Row) -> rusqlite::Result<EdgeRow> {
     })
 }
 
+/// Row id derived from the node id, probing past slots held by a different node.
+fn node_rowid(tx: &Transaction, id: &str) -> rusqlite::Result<i64> {
+    let mut probe = tx.prepare_cached("SELECT id FROM node WHERE rid = ?1")?;
+    let mut rid = codegraph_core::hash::stable_rowid(&[id.as_bytes()]);
+    while let Some(other) = probe.query_row([rid], |r| r.get::<_, String>(0)).optional()? {
+        if other == id {
+            break;
+        }
+        rid = codegraph_core::hash::next_rowid(rid);
+    }
+    Ok(rid)
+}
+
 pub fn insert_node(tx: &Transaction, file: &str, lang: &str, s: &Symbol, derived: bool) -> rusqlite::Result<()> {
+    let rid = node_rowid(tx, &s.id)?;
     let mut stmt = tx.prepare_cached(
         "INSERT OR REPLACE INTO node (id, file_path, kind, orig_kind, name, qualified_name, signature, start_line, end_line, language, \
          capabilities, cyclomatic_complexity, is_entrypoint, entry_kind, is_test, parent_id, visibility, is_exported, is_static, \
-         is_async, is_abstract, docstring, attrs, bases, type_ref, value_text, params, body_hash, namespace, derived) \
-         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+         is_async, is_abstract, docstring, attrs, bases, type_ref, value_text, params, body_hash, namespace, derived, rid) \
+         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
     )?;
     let caps = serde_json::to_string(&s.capabilities.iter().collect::<Vec<_>>()).unwrap_or_default();
     let attrs = if s.attrs.is_empty() { None } else { serde_json::to_string(&s.attrs).ok() };
@@ -152,16 +166,47 @@ pub fn insert_node(tx: &Transaction, file: &str, lang: &str, s: &Symbol, derived
         s.body_hash,
         s.namespace,
         derived,
+        rid,
     ])?;
     Ok(())
 }
 
+/// Content-addressed edge id: an incremental update and a full rebuild assign the same ids,
+/// so edges sharing every ORDER BY key still come back in the same order.
+fn edge_rowid(tx: &Transaction, e: &Edge, meta: Option<&str>) -> rusqlite::Result<i64> {
+    let line = e.line.to_le_bytes();
+    fn opt(s: Option<&str>) -> &[u8] {
+        s.map(|s| s.as_bytes()).unwrap_or(b"\0null")
+    }
+    let mut id = codegraph_core::hash::stable_rowid(&[
+        e.source_id.as_bytes(),
+        opt(e.target_id.as_deref()),
+        opt(e.unresolved_symbol.as_deref()),
+        e.relation.as_bytes(),
+        e.confidence.as_str().as_bytes(),
+        e.evidence.as_bytes(),
+        e.resolver.as_bytes(),
+        &line,
+        opt(meta),
+        e.source_file.as_bytes(),
+        opt(e.target_file.as_deref()),
+        if e.derived { b"1" } else { b"0" },
+    ]);
+    // Identical duplicates (and true hash collisions) take the next free slot.
+    let mut probe = tx.prepare_cached("SELECT 1 FROM edge WHERE id = ?1")?;
+    while probe.exists([id])? {
+        id = codegraph_core::hash::next_rowid(id);
+    }
+    Ok(id)
+}
+
 pub fn insert_edge(tx: &Transaction, e: &Edge) -> rusqlite::Result<()> {
     let mut stmt = tx.prepare_cached(
-        "INSERT INTO edge (source_id, target_id, unresolved_symbol, relation, confidence, evidence, resolver, line_number, metadata, source_file, target_file, derived) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO edge (source_id, target_id, unresolved_symbol, relation, confidence, evidence, resolver, line_number, metadata, source_file, target_file, derived, id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
     )?;
     let meta = e.metadata.as_ref().filter(|m| m.as_object().map(|o| !o.is_empty()).unwrap_or(true)).map(|m| m.to_string());
+    let id = edge_rowid(tx, e, meta.as_deref())?;
     stmt.execute(params![
         e.source_id,
         e.target_id,
@@ -175,6 +220,7 @@ pub fn insert_edge(tx: &Transaction, e: &Edge) -> rusqlite::Result<()> {
         e.source_file,
         e.target_file,
         e.derived,
+        id,
     ])?;
     Ok(())
 }

@@ -28,13 +28,13 @@ pub fn nodes_by_ids(conn: &Connection, ids: &[String]) -> Result<HashMap<String,
 
 pub fn nodes_in_file(conn: &Connection, file: &str) -> Result<Vec<Node>> {
     let mut st =
-        conn.prepare(&format!("SELECT {NODE_COLS} FROM node WHERE file_path = ?1 AND derived = 0 ORDER BY start_line, end_line DESC"))?;
+        conn.prepare(&format!("SELECT {NODE_COLS} FROM node WHERE file_path = ?1 AND derived = 0 ORDER BY start_line, end_line DESC, id"))?;
     let rows = st.query_map([file], node_from_row)?;
     Ok(rows.flatten().collect())
 }
 
 pub fn children(conn: &Connection, parent: &str) -> Result<Vec<Node>> {
-    let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM node WHERE parent_id = ?1 ORDER BY start_line"))?;
+    let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM node WHERE parent_id = ?1 ORDER BY start_line, file_path, id"))?;
     let rows = st.query_map([parent], node_from_row)?;
     Ok(rows.flatten().collect())
 }
@@ -46,7 +46,7 @@ pub fn resolve_file(conn: &Connection, input: &str) -> Result<Vec<String>> {
     if let Some(e) = exact {
         return Ok(vec![e]);
     }
-    let mut st = conn.prepare("SELECT file_path FROM file_meta WHERE file_path LIKE ?1 ORDER BY length(file_path) LIMIT 20")?;
+    let mut st = conn.prepare("SELECT file_path FROM file_meta WHERE file_path LIKE ?1 ORDER BY length(file_path), file_path LIMIT 20")?;
     let rows = st.query_map([format!("%{norm}")], |r| r.get::<_, String>(0))?;
     let v: Vec<String> =
         rows.flatten().filter(|p| p.ends_with(&norm) && (p.len() == norm.len() || p[..p.len() - norm.len()].ends_with('/'))).collect();
@@ -68,7 +68,7 @@ pub fn find_nodes(conn: &Connection, query: &str, limit: usize) -> Result<Vec<No
             let files = resolve_file(conn, f)?;
             if let Some(file) = files.first() {
                 let mut st = conn.prepare(&format!(
-                    "SELECT {NODE_COLS} FROM node WHERE file_path = ?1 AND derived = 0 AND start_line <= ?2 AND end_line >= ?2 AND kind <> 'module' ORDER BY (end_line - start_line) LIMIT 1"
+                    "SELECT {NODE_COLS} FROM node WHERE file_path = ?1 AND derived = 0 AND start_line <= ?2 AND end_line >= ?2 AND kind <> 'module' ORDER BY (end_line - start_line), start_line DESC, id LIMIT 1"
                 ))?;
                 let hit = st.query_row(params![file, line], node_from_row).optional()?;
                 if let Some(h) = hit {
@@ -86,11 +86,12 @@ pub fn find_nodes(conn: &Connection, query: &str, limit: usize) -> Result<Vec<No
             }
         }
     };
-    let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM node WHERE qualified_name = ?1 LIMIT ?2"))?;
+    let mut st = conn
+        .prepare(&format!("SELECT {NODE_COLS} FROM node WHERE qualified_name = ?1 ORDER BY derived, file_path, start_line, id LIMIT ?2"))?;
     push_all(st.query_map(params![q, limit as i64], node_from_row)?.flatten().collect(), &mut out);
     if out.is_empty() {
         let mut st = conn.prepare(&format!(
-            "SELECT {NODE_COLS} FROM node WHERE qualified_name LIKE ?1 AND kind <> 'literal' ORDER BY length(qualified_name) LIMIT ?2"
+            "SELECT {NODE_COLS} FROM node WHERE qualified_name LIKE ?1 AND kind <> 'literal' ORDER BY length(qualified_name), qualified_name, file_path, start_line, id LIMIT ?2"
         ))?;
         let rows: Vec<Node> = st
             .query_map(params![format!("%.{q}"), limit as i64], node_from_row)?
@@ -101,13 +102,13 @@ pub fn find_nodes(conn: &Connection, query: &str, limit: usize) -> Result<Vec<No
     }
     if out.is_empty() {
         let mut st = conn.prepare(&format!(
-            "SELECT {NODE_COLS} FROM node WHERE name = ?1 AND kind NOT IN ('module', 'literal') ORDER BY derived, kind LIMIT ?2"
+            "SELECT {NODE_COLS} FROM node WHERE name = ?1 AND kind NOT IN ('module', 'literal') ORDER BY derived, kind, file_path, start_line, id LIMIT ?2"
         ))?;
         push_all(st.query_map(params![q, limit as i64], node_from_row)?.flatten().collect(), &mut out);
     }
     if out.is_empty() {
         let mut st =
-            conn.prepare(&format!("SELECT {NODE_COLS} FROM node WHERE name = ?1 COLLATE NOCASE AND kind <> 'literal' LIMIT ?2"))?;
+            conn.prepare(&format!("SELECT {NODE_COLS} FROM node WHERE name = ?1 COLLATE NOCASE AND kind <> 'literal' ORDER BY derived, kind, file_path, start_line, id LIMIT ?2"))?;
         push_all(st.query_map(params![q, limit as i64], node_from_row)?.flatten().collect(), &mut out);
     }
     Ok(out)
@@ -143,13 +144,13 @@ pub fn search(conn: &Connection, q: &str, kind: Option<&str>, limit: usize, incl
         }
     };
     // 1. Exact name.
-    let sql = format!("SELECT {NODE_COLS} FROM node WHERE name = ?1 COLLATE NOCASE{filters} ORDER BY derived, {KIND_RANK}, length(qualified_name) LIMIT ?3");
+    let sql = format!("SELECT {NODE_COLS} FROM node WHERE name = ?1 COLLATE NOCASE{filters} ORDER BY derived, {KIND_RANK}, length(qualified_name), qualified_name, file_path, start_line, id LIMIT ?3");
     let mut st = conn.prepare_cached(&sql)?;
     push(st.query_map(params![q, kind_arg, limit as i64], node_from_row)?.flatten().collect(), &mut out);
     // 2. Name prefix (uses the NOCASE index through the LIKE optimization).
     if out.len() < limit {
         let prefix = format!("{}%", q.replace('!', "!!").replace('%', "!%").replace('_', "!_"));
-        let sql = format!("SELECT {NODE_COLS} FROM node WHERE name LIKE ?1 ESCAPE '!'{filters} ORDER BY derived, {KIND_RANK}, length(name), length(qualified_name) LIMIT ?3");
+        let sql = format!("SELECT {NODE_COLS} FROM node WHERE name LIKE ?1 ESCAPE '!'{filters} ORDER BY derived, {KIND_RANK}, length(name), length(qualified_name), qualified_name, file_path, start_line, id LIMIT ?3");
         let mut st = conn.prepare_cached(&sql)?;
         push(st.query_map(params![prefix, kind_arg, (limit * 2) as i64], node_from_row)?.flatten().collect(), &mut out);
     }
@@ -160,14 +161,14 @@ pub fn search(conn: &Connection, q: &str, kind: Option<&str>, limit: usize, incl
             let fts_q = format!("\"{}\"", q.replace('"', "\"\""));
             let cols = NODE_COLS.split(", ").map(|c| format!("n.{c}")).collect::<Vec<_>>().join(", ");
             let sql = format!(
-                "SELECT {cols} FROM (SELECT rowid, rank FROM node_fts WHERE node_fts MATCH ?1 ORDER BY rank LIMIT ?3) f JOIN node n ON n.rid = f.rowid WHERE 1 = 1{} ORDER BY n.derived, f.rank",
+                "SELECT {cols} FROM (SELECT rowid, rank FROM node_fts WHERE node_fts MATCH ?1 ORDER BY rank, rowid LIMIT ?3) f JOIN node n ON n.rid = f.rowid WHERE 1 = 1{} ORDER BY n.derived, f.rank, n.qualified_name, n.file_path, n.start_line, n.id",
                 filters.replace(" kind", " n.kind")
             );
             let mut st = conn.prepare_cached(&sql)?;
             push(st.query_map(params![fts_q, kind_arg, (limit * 4).max(60) as i64], node_from_row)?.flatten().collect(), &mut out);
         } else {
             let sub = format!("%{}%", q.replace('!', "!!").replace('%', "!%").replace('_', "!_"));
-            let sql = format!("SELECT {NODE_COLS} FROM node WHERE (name LIKE ?1 ESCAPE '!' OR qualified_name LIKE ?1 ESCAPE '!'){filters} ORDER BY derived, {KIND_RANK}, length(name) LIMIT ?3");
+            let sql = format!("SELECT {NODE_COLS} FROM node WHERE (name LIKE ?1 ESCAPE '!' OR qualified_name LIKE ?1 ESCAPE '!'){filters} ORDER BY derived, {KIND_RANK}, length(name), qualified_name, file_path, start_line, id LIMIT ?3");
             let mut st = conn.prepare_cached(&sql)?;
             push(st.query_map(params![sub, kind_arg, (limit * 2) as i64], node_from_row)?.flatten().collect(), &mut out);
         }
@@ -200,7 +201,7 @@ fn edges_dir(conn: &Connection, col: &str, id: &str, relations: &[&str]) -> Resu
         let ph = (0..relations.len()).map(|i| format!("?{}", i + 2)).collect::<Vec<_>>().join(",");
         (format!(" AND relation IN ({ph})"), std::iter::once(id.to_string()).chain(relations.iter().map(|r| r.to_string())).collect())
     };
-    let sql = format!("SELECT {EDGE_COLS} FROM edge WHERE {col} = ?1{rel_clause} ORDER BY line_number");
+    let sql = format!("SELECT {EDGE_COLS} FROM edge WHERE {col} = ?1{rel_clause} ORDER BY line_number, source_id, relation, target_id, unresolved_symbol, id");
     let mut st = conn.prepare(&sql)?;
     let rows = st.query_map(params_from_iter(args.drain(..)), edge_from_row)?;
     Ok(rows.flatten().collect())
@@ -223,7 +224,7 @@ pub fn stats(conn: &Connection) -> Result<GraphStats> {
     let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
     let mut langs = Vec::new();
     {
-        let mut st = conn.prepare("SELECT language, COUNT(*) FROM file_meta GROUP BY language ORDER BY 2 DESC")?;
+        let mut st = conn.prepare("SELECT language, COUNT(*) FROM file_meta GROUP BY language ORDER BY 2 DESC, 1")?;
         let rows = st.query_map([], |r| Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, i64>(1)?)))?;
         langs.extend(rows.flatten());
     }

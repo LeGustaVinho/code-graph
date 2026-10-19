@@ -403,7 +403,8 @@ struct ApiRoute {
 }
 
 fn api_routes(conn: &Connection) -> anyhow::Result<Vec<ApiRoute>> {
-    let mut st = conn.prepare("SELECT handler_id, http_method, path, normalized, framework FROM api_route")?;
+    let mut st =
+        conn.prepare("SELECT handler_id, http_method, path, normalized, framework FROM api_route ORDER BY file_path, line_number, id")?;
     let rows = st.query_map([], |r| {
         Ok(ApiRoute {
             handler_id: r.get(0)?,
@@ -485,7 +486,8 @@ pub fn trace_fullstack_flow(ctx: &Ctx, p: FullstackParams) -> ToolResult {
     if handlers.is_empty() && frontend_only.is_empty() {
         out.h(format!("No backend route or HTTP call matches '{input}'"));
         // Show unlinked frontend calls with a similar URL to help the user.
-        let mut st = ctx.conn.prepare("SELECT file_path, http_method, url, line_number FROM http_call")?;
+        let mut st =
+            ctx.conn.prepare("SELECT file_path, http_method, url, line_number FROM http_call ORDER BY file_path, line_number, id")?;
         let calls: Vec<(String, String, String, u32)> = st
             .query_map([], |r| {
                 Ok((
@@ -619,7 +621,9 @@ pub fn resolve_dependency_injection(ctx: &Ctx, p: DiParams) -> ToolResult {
     }
     // Inject tokens in signatures (NestJS @Inject('TOKEN')).
     if raw != key || raw.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
-        let mut st = ctx.conn.prepare(&format!("SELECT {NODE_COLS} FROM node WHERE signature LIKE ?1 LIMIT 20"))?;
+        let mut st = ctx
+            .conn
+            .prepare(&format!("SELECT {NODE_COLS} FROM node WHERE signature LIKE ?1 ORDER BY file_path, start_line, id LIMIT 20"))?;
         for c in st.query_map([format!("%@Inject(%{raw}%")], node_from_row)?.flatten() {
             out.item(format!("INJECTED via @Inject('{raw}') in {}", node_line(&c)));
         }

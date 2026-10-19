@@ -336,7 +336,7 @@ fn select_strings(tx: &Transaction, sql_prefix: &str, values: &[String]) -> Resu
 pub fn load_index(conn: &Connection) -> Result<SymbolIndex> {
     let mut syms = Vec::new();
     {
-        let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM node WHERE derived = 0"))?;
+        let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM node WHERE derived = 0 ORDER BY file_path, start_line, id"))?;
         let rows = st.query_map([], node_from_row)?;
         for r in rows.flatten() {
             let lang = Language::from_path(Path::new(&r.file_path)).unwrap_or(Language::Config);
@@ -350,7 +350,7 @@ pub fn load_index(conn: &Connection) -> Result<SymbolIndex> {
     }
     let mut imports: HashMap<String, Vec<Import>> = HashMap::new();
     {
-        let mut st = conn.prepare("SELECT file_path, module, imported, local, kind, line_number FROM import")?;
+        let mut st = conn.prepare("SELECT file_path, module, imported, local, kind, line_number FROM import ORDER BY file_path, id")?;
         let rows = st.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -370,7 +370,7 @@ pub fn load_index(conn: &Connection) -> Result<SymbolIndex> {
     let mut di = Vec::new();
     {
         let mut st = conn.prepare(
-            "SELECT file_path, service, implementation, lifetime, framework, line_number, enclosing_node_id FROM di_registration",
+            "SELECT file_path, service, implementation, lifetime, framework, line_number, enclosing_node_id FROM di_registration ORDER BY file_path, id",
         )?;
         let rows = st.query_map([], |r| {
             Ok((
@@ -391,7 +391,10 @@ pub fn load_index(conn: &Connection) -> Result<SymbolIndex> {
 }
 
 fn load_call_rows(tx: &Transaction) -> Result<Vec<CallRow>> {
-    let mut st = tx.prepare("SELECT source_id, target_id, confidence, line_number, metadata, source_file FROM edge WHERE relation = 'CALLS' AND target_id IS NOT NULL")?;
+    let mut st = tx.prepare(
+        "SELECT source_id, target_id, confidence, line_number, metadata, source_file FROM edge WHERE relation = 'CALLS' AND target_id IS NOT NULL \
+         ORDER BY source_file, line_number, source_id, target_id, confidence, metadata",
+    )?;
     let rows = st.query_map([], |r| {
         let meta: Option<String> = r.get(4)?;
         let try_types: Vec<String> = meta
@@ -429,7 +432,8 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex) -> Result<()> {
 
     // Fullstack routes.
     let routes: Vec<RouteRow> = {
-        let mut st = tx.prepare("SELECT file_path, handler, http_method, path, framework, line_number FROM route")?;
+        let mut st =
+            tx.prepare("SELECT file_path, handler, http_method, path, framework, line_number FROM route ORDER BY file_path, id")?;
         let rows = st.query_map([], |r| {
             Ok(RouteRow {
                 file: r.get(0)?,
@@ -445,7 +449,7 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex) -> Result<()> {
         rows.flatten().collect()
     };
     let prefixes: Vec<(String, String)> = {
-        let mut st = tx.prepare("SELECT file_path, prefix FROM route_prefix")?;
+        let mut st = tx.prepare("SELECT file_path, prefix FROM route_prefix ORDER BY file_path, prefix")?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.flatten().collect()
     };
@@ -457,7 +461,8 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex) -> Result<()> {
         }
     }
     let calls: Vec<HttpCallRow> = {
-        let mut st = tx.prepare("SELECT file_path, enclosing_node_id, http_method, url, client, line_number FROM http_call")?;
+        let mut st =
+            tx.prepare("SELECT file_path, enclosing_node_id, http_method, url, client, line_number FROM http_call ORDER BY file_path, id")?;
         let rows = st.query_map([], |r| {
             Ok(HttpCallRow {
                 file: r.get(0)?,
@@ -484,7 +489,8 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex) -> Result<()> {
     let throws: Vec<ThrowRow> = {
         let mut st = tx.prepare(
             "SELECT e.source_id, e.source_file, COALESCE(n.name, e.unresolved_symbol), e.line_number, e.metadata \
-             FROM edge e LEFT JOIN node n ON n.id = e.target_id WHERE e.relation = 'THROWS'",
+             FROM edge e LEFT JOIN node n ON n.id = e.target_id WHERE e.relation = 'THROWS' \
+             ORDER BY e.source_file, e.line_number, e.source_id, 3, e.metadata",
         )?;
         let rows = st.query_map([], |r| {
             let meta: Option<String> = r.get(4)?;
@@ -503,7 +509,8 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex) -> Result<()> {
         rows.flatten().collect()
     };
     let handlers: Vec<HandlerRow> = {
-        let mut st = tx.prepare("SELECT file_path, handler, exception, framework, line_number FROM global_handler")?;
+        let mut st =
+            tx.prepare("SELECT file_path, handler, exception, framework, line_number FROM global_handler ORDER BY file_path, id")?;
         let rows = st.query_map([], |r| {
             Ok(HandlerRow {
                 file: r.get(0)?,
@@ -523,7 +530,7 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex) -> Result<()> {
 
     // Shared literals.
     let lits: Vec<LiteralRow> = {
-        let mut st = tx.prepare("SELECT literal_value, file_path, line_number, enclosing_node_id FROM literal_occurrence WHERE literal_type IN ('string', 'template')")?;
+        let mut st = tx.prepare("SELECT literal_value, file_path, line_number, enclosing_node_id FROM literal_occurrence WHERE literal_type IN ('string', 'template') ORDER BY file_path, id")?;
         let rows = st.query_map([], |r| {
             Ok(LiteralRow {
                 value: r.get(0)?,

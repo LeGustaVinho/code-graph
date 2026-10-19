@@ -5,7 +5,7 @@
 
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 const TABLES: &[&str] = &[
     "file_meta",

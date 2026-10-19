@@ -325,7 +325,7 @@ async fn node_detail(State(engine): State<AppState>, Path(id): Path<String>) -> 
             .flatten()
             .collect();
         let framework: Option<String> = conn.query_row("SELECT framework FROM data_model WHERE model_node_id = ?1", [&id], |r| r.get(0)).ok();
-        let mut st = conn.prepare("SELECT http_method, path, framework FROM api_route WHERE handler_id = ?1")?;
+        let mut st = conn.prepare("SELECT http_method, path, framework FROM api_route WHERE handler_id = ?1 ORDER BY file_path, line_number, id")?;
         let routes: Vec<Value> = st.query_map([&id], |r| Ok(json!({ "method": r.get::<_, String>(0)?, "path": r.get::<_, String>(1)?, "framework": r.get::<_, String>(2)? })))?.flatten().collect();
         let mut st = conn.prepare("SELECT target_state, mutation_type, line_number FROM state_mutation WHERE method_node_id = ?1 ORDER BY line_number")?;
         let mutations: Vec<Value> = st.query_map([&id], |r| Ok(json!({ "target": r.get::<_, String>(0)?, "type": r.get::<_, String>(1)?, "line": r.get::<_, u32>(2)? })))?.flatten().collect();
@@ -379,8 +379,8 @@ async fn overview(State(engine): State<AppState>) -> Result<Json<Value>, ApiErro
             let rows = st.query_map([], |r| Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, i64>(1)?)))?;
             Ok(rows.flatten().collect())
         };
-        let kinds = pairs("SELECT kind, COUNT(*) FROM node WHERE kind NOT IN ('module') GROUP BY kind ORDER BY 2 DESC")?;
-        let relations = pairs("SELECT relation, COUNT(*) FROM edge GROUP BY relation ORDER BY 2 DESC")?;
+        let kinds = pairs("SELECT kind, COUNT(*) FROM node WHERE kind NOT IN ('module') GROUP BY kind ORDER BY 2 DESC, 1")?;
+        let relations = pairs("SELECT relation, COUNT(*) FROM edge GROUP BY relation ORDER BY 2 DESC, 1")?;
         let rel_conf = {
             let mut st = conn.prepare("SELECT relation, confidence, COUNT(*) FROM edge GROUP BY 1, 2")?;
             let rows: Vec<Value> = st
@@ -395,13 +395,13 @@ async fn overview(State(engine): State<AppState>) -> Result<Json<Value>, ApiErro
             Ok(rows.iter().map(|n| node_json(n, None)).collect())
         };
         let cols = codegraph_graph::store::NODE_COLS;
-        let entrypoints = node_list(&format!("SELECT {cols} FROM node WHERE is_entrypoint = 1 ORDER BY entry_kind, file_path LIMIT 200"))?;
+        let entrypoints = node_list(&format!("SELECT {cols} FROM node WHERE is_entrypoint = 1 ORDER BY entry_kind, file_path, start_line, id LIMIT 200"))?;
         let hotspots = node_list(&format!(
-            "SELECT {cols} FROM node WHERE kind IN ('function','method','constructor') AND cyclomatic_complexity > 1 ORDER BY cyclomatic_complexity DESC, file_path LIMIT 50"
+            "SELECT {cols} FROM node WHERE kind IN ('function','method','constructor') AND cyclomatic_complexity > 1 ORDER BY cyclomatic_complexity DESC, file_path, start_line, id LIMIT 50"
         ))?;
         let models = {
             let mut st = conn.prepare(&format!(
-                "SELECT {}, d.framework, (SELECT COUNT(*) FROM data_model_field f WHERE f.model_node_id = n.id) FROM data_model d JOIN node n ON n.id = d.model_node_id ORDER BY n.name",
+                "SELECT {}, d.framework, (SELECT COUNT(*) FROM data_model_field f WHERE f.model_node_id = n.id) FROM data_model d JOIN node n ON n.id = d.model_node_id ORDER BY n.name, n.file_path, n.id",
                 cols.split(", ").map(|c| format!("n.{c}")).collect::<Vec<_>>().join(", ")
             ))?;
             let rows: Vec<Value> = st
@@ -417,7 +417,7 @@ async fn overview(State(engine): State<AppState>) -> Result<Json<Value>, ApiErro
             rows
         };
         let unresolved = {
-            let mut st = conn.prepare(&format!("SELECT {EDGE_COLS} FROM edge WHERE confidence = 'unresolved' AND relation IN ('CALLS', 'HTTP_CALLS', 'RESOLVES_DI') ORDER BY source_file, line_number LIMIT 200"))?;
+            let mut st = conn.prepare(&format!("SELECT {EDGE_COLS} FROM edge WHERE confidence = 'unresolved' AND relation IN ('CALLS', 'HTTP_CALLS', 'RESOLVES_DI') ORDER BY source_file, line_number, source_id, unresolved_symbol, id LIMIT 200"))?;
             let edges: Vec<EdgeRow> = st.query_map([], edge_from_row)?.flatten().collect();
             let ids: Vec<String> = edges.iter().map(|e| e.source_id.clone()).collect();
             let nodes = query::nodes_by_ids(&conn, &ids)?;

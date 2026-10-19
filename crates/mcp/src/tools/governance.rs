@@ -32,7 +32,7 @@ pub fn get_complexity_hotspots(ctx: &Ctx, p: HotspotParams) -> ToolResult {
     let sql = format!(
         "SELECT {}, (SELECT COUNT(*) FROM edge e WHERE e.target_id = n.id AND e.relation IN ('CALLS', 'HTTP_CALLS')) AS fan_in \
          FROM node n WHERE n.derived = 0 AND n.kind IN ('function', 'method', 'constructor', 'test') AND n.cyclomatic_complexity >= ?1 \
-         AND (?2 IS NULL OR n.file_path LIKE '%' || ?2 || '%') ORDER BY n.cyclomatic_complexity DESC LIMIT 500",
+         AND (?2 IS NULL OR n.file_path LIKE '%' || ?2 || '%') ORDER BY n.cyclomatic_complexity DESC, n.file_path, n.start_line, n.id LIMIT 500",
         NODE_COLS.split(", ").map(|c| format!("n.{c}")).collect::<Vec<_>>().join(", ")
     );
     let mut st = ctx.conn.prepare(&sql)?;
@@ -40,7 +40,11 @@ pub fn get_complexity_hotspots(ctx: &Ctx, p: HotspotParams) -> ToolResult {
         st.query_map(params![min, p.module], |r| Ok((node_from_row(r)?, r.get::<_, i64>(28)?)))?.flatten().collect();
     let risk = |n: &Node, fan_in: i64| n.sym.complexity as f64 * (1.0 + (1.0 + fan_in as f64).ln());
     rows.sort_by(|a, b| {
-        b.0.sym.complexity.cmp(&a.0.sym.complexity).then(risk(&b.0, b.1).partial_cmp(&risk(&a.0, a.1)).unwrap_or(std::cmp::Ordering::Equal))
+        b.0.sym
+            .complexity
+            .cmp(&a.0.sym.complexity)
+            .then(risk(&b.0, b.1).partial_cmp(&risk(&a.0, a.1)).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| (&a.0.file_path, a.0.sym.start_line, &a.0.sym.id).cmp(&(&b.0.file_path, b.0.sym.start_line, &b.0.sym.id)))
     });
     let mut out = Out::new();
     out.h(format!("{} function(s) with complexity ≥ {min} (risk = cc × (1 + ln(1 + fan-in)))", rows.len()));

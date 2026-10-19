@@ -365,7 +365,7 @@ pub fn extract_models(index: &SymbolIndex) -> (Vec<DataModel>, Vec<ModelField>) 
             if let Some(stem) = stem.filter(|s| !s.is_empty()) {
                 if let Some(t) = navs.get(&(r.model.clone(), stem.clone())) {
                     r.fk_target = Some(t.clone());
-                } else if let Some(m) = by_name.keys().find(|k| k.to_ascii_lowercase() == stem) {
+                } else if let Some(m) = by_name.keys().filter(|k| k.to_ascii_lowercase() == stem).min() {
                     r.fk_target = Some(m.clone());
                 }
             }

@@ -143,7 +143,7 @@ pub fn trace_error_flow(ctx: &Ctx, p: ErrorFlowParams) -> ToolResult {
         out.item(format!("CATCH ({exc}) at {f}:{l} in {}", cn.get(&enc).map(display).unwrap_or_default()));
     }
     let mut st = ctx.conn.prepare(&format!(
-        "SELECT file_path, handler, exception, framework, line_number FROM global_handler WHERE exception IN ({ph}) OR exception = '*'"
+        "SELECT file_path, handler, exception, framework, line_number FROM global_handler WHERE exception IN ({ph}) OR exception = '*' ORDER BY file_path, line_number, id"
     ))?;
     let handlers: Vec<(String, String, String, String, u32)> = st
         .query_map(rusqlite::params_from_iter(names.iter()), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?

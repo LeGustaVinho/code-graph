@@ -85,7 +85,15 @@ pub fn normalize_path(path: &str) -> String {
 }
 
 impl SymbolIndex {
-    pub fn build(syms: Vec<IndexedSymbol>, imports: HashMap<String, Vec<Import>>, di: Vec<(String, DiRegistration)>) -> SymbolIndex {
+    /// Builds the index. Symbols and DI registrations are put in a canonical order first, so
+    /// every "first match" below is independent of how (or in which row order) they were loaded.
+    pub fn build(
+        mut syms: Vec<IndexedSymbol>,
+        imports: HashMap<String, Vec<Import>>,
+        mut di: Vec<(String, DiRegistration)>,
+    ) -> SymbolIndex {
+        syms.sort_by(|a, b| (&a.file, a.sym.start_line, &a.sym.id).cmp(&(&b.file, b.sym.start_line, &b.sym.id)));
+        di.sort_by(|a, b| (&a.0, a.1.line).cmp(&(&b.0, b.1.line)));
         let mut idx = SymbolIndex {
             syms,
             by_id: HashMap::new(),
@@ -154,6 +162,16 @@ impl SymbolIndex {
             idx.bases.insert(id, resolved);
         }
         idx
+    }
+
+    /// Sorts symbol indices canonically (file, start line, id): `syms` is kept in that order.
+    pub fn sort_canonical(&self, v: &mut [usize]) {
+        v.sort_unstable();
+    }
+
+    /// Canonical first of several candidate symbols.
+    pub fn canonical_first(&self, v: &[usize]) -> Option<usize> {
+        v.iter().copied().min()
     }
 
     pub fn get(&self, id: &str) -> Option<&IndexedSymbol> {
@@ -313,8 +331,13 @@ impl SymbolIndex {
             0 => None,
             1 => Some((hits[0].1.clone(), Confidence::Exact)),
             _ => {
-                // Prefer the candidate sharing the longest directory prefix with the importer.
-                let best = hits.iter().max_by_key(|(_, f)| common_prefix_len(f, from_file)).map(|(_, f)| (*f).clone())?;
+                // Prefer the candidate sharing the longest prefix with the importer; ties go to
+                // the lexicographically smallest path (never to HashMap iteration order).
+                let best = hits
+                    .iter()
+                    .map(|(_, f)| *f)
+                    .min_by(|a, b| common_prefix_len(b, from_file).cmp(&common_prefix_len(a, from_file)).then_with(|| a.cmp(b)))
+                    .cloned()?;
                 Some((best, Confidence::Inferred))
             }
         }
