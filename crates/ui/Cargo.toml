@@ -1,0 +1,21 @@
+[package]
+name = "codegraph-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CodeGraph local web UI: Axum server with embedded Cytoscape.js graph explorer"
+
+[dependencies]
+codegraph-core.workspace = true
+codegraph-graph.workspace = true
+codegraph-semantic.workspace = true
+codegraph-mcp.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+axum.workspace = true
+rust-embed.workspace = true
+mime_guess.workspace = true
+tracing.workspace = true

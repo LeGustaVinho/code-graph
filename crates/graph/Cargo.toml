@@ -1,0 +1,19 @@
+[package]
+name = "codegraph-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CodeGraph storage: versioned SQLite (WAL + FTS5 trigram) and the incremental indexer"
+
+[dependencies]
+codegraph-core.workspace = true
+codegraph-semantic.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+rusqlite.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

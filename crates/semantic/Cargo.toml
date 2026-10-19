@@ -1,0 +1,14 @@
+[package]
+name = "codegraph-semantic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CodeGraph semantic engine: cross-file resolution with exact / inferred / unresolved confidence and evidence"
+
+[dependencies]
+codegraph-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+globset.workspace = true
+toml.workspace = true

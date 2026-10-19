@@ -1,0 +1,18 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Customer {
+  id       String    @id @default(uuid())
+  email    String    @unique
+  invoices Invoice[]
+}
+
+model Invoice {
+  id         String   @id @default(uuid())
+  amount     Int
+  paid       Boolean  @default(false)
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+}

@@ -1,0 +1,22 @@
+[package]
+name = "codegraph-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CodeGraph core: file discovery, Blake3 hashing, Tree-sitter parsing and syntactic fact extraction"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+rayon.workspace = true
+ignore.workspace = true
+tree-sitter.workspace = true
+tree-sitter-c-sharp.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-python.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

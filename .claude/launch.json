@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "codegraph-ui-fixtures",
+      "runtimeExecutable": "target/debug/codegraph.exe",
+      "runtimeArgs": ["ui", "fixtures/fullstack", "--no-open", "--port", "4321"],
+      "port": 4321
+    }
+  ]
+}

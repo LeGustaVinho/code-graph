@@ -1,0 +1,579 @@
+//! Incremental indexer: mtime/size pre-filter → parallel Blake3 hashing → parallel
+//! Tree-sitter extraction of changed files → cascade invalidation → semantic
+//! resolution of affected files → project-wide derived relations.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::Path;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::Result;
+use codegraph_core::walk::{discover, mtime_of, SourceFile};
+use codegraph_core::{extract_file, DiRegistration, FileFacts, GlobalHandler, HttpCall, Import, ImportKind, Language, RouteDecl};
+use codegraph_semantic::global::{self, CallRow, HandlerRow, HttpCallRow, LiteralRow, RouteRow, ThrowRow};
+use codegraph_semantic::index::{IndexedSymbol, SymbolIndex};
+use codegraph_semantic::{models, resolve, Confidence, Edge};
+use rayon::prelude::*;
+use rusqlite::{params, params_from_iter, Connection, Transaction};
+use serde::Serialize;
+
+use crate::store::{self, node_from_row, StoredFacts, NODE_COLS};
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct IndexStats {
+    pub files_total: usize,
+    pub files_scanned: usize,
+    pub files_hashed: usize,
+    pub files_parsed: usize,
+    pub files_unchanged: usize,
+    pub files_removed: usize,
+    pub parse_errors: usize,
+    pub affected_files: usize,
+    pub full_resolution: bool,
+    pub nodes: i64,
+    pub edges: i64,
+    pub duration_ms: u128,
+    pub parsed_paths: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IndexOptions {
+    /// Re-parse every file even when its content hash is unchanged.
+    pub rebuild: bool,
+}
+
+pub fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+/// Indexes the whole project incrementally.
+pub fn index_project(root: &Path, conn: &mut Connection, opts: IndexOptions) -> Result<IndexStats> {
+    let files = discover(root);
+    let on_disk: HashSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
+    let known: Vec<String> = {
+        let mut st = conn.prepare("SELECT file_path FROM file_meta")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let removed: Vec<String> = known.into_iter().filter(|k| !on_disk.contains(k)).collect();
+    // A different extractor build invalidates every cached fact.
+    let mut opts = opts;
+    if crate::store::get_meta(conn, "extractor_version").as_deref() != Some(codegraph_core::EXTRACTOR_VERSION) {
+        opts.rebuild = true;
+    }
+    let stats = run(root, conn, files, removed, opts)?;
+    crate::store::set_meta(conn, "extractor_version", codegraph_core::EXTRACTOR_VERSION)?;
+    Ok(stats)
+}
+
+/// Re-indexes only the given relative paths (freshness micro-reindex).
+pub fn index_paths(root: &Path, conn: &mut Connection, rel_paths: &[String]) -> Result<IndexStats> {
+    let mut candidates = Vec::new();
+    let mut removed = Vec::new();
+    for rel in rel_paths {
+        let abs = root.join(rel);
+        match std::fs::metadata(&abs) {
+            Ok(meta) if meta.is_file() => {
+                if let Some(language) = Language::from_path(&abs) {
+                    if codegraph_core::walk::is_ignored_rel_path(rel) {
+                        continue;
+                    }
+                    candidates.push(SourceFile {
+                        abs_path: abs,
+                        rel_path: rel.clone(),
+                        language,
+                        mtime: mtime_of(&meta),
+                        size: meta.len(),
+                    });
+                }
+            }
+            _ => removed.push(rel.clone()),
+        }
+    }
+    run(root, conn, candidates, removed, IndexOptions::default())
+}
+
+/// Files whose mtime/size differ from the index (no hashing), plus deleted files.
+pub fn stale_files(root: &Path, conn: &Connection, only: Option<&[String]>) -> Result<Vec<String>> {
+    let mut meta: HashMap<String, (i64, i64)> = HashMap::new();
+    {
+        let mut st = conn.prepare("SELECT file_path, last_mtime, size FROM file_meta")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))))?;
+        for r in rows.flatten() {
+            meta.insert(r.0, r.1);
+        }
+    }
+    let mut stale = Vec::new();
+    match only {
+        Some(paths) => {
+            for p in paths {
+                let abs = root.join(p);
+                match (std::fs::metadata(&abs), meta.get(p)) {
+                    (Ok(m), Some((mt, sz))) => {
+                        if mtime_of(&m) != *mt || m.len() as i64 != *sz {
+                            stale.push(p.clone());
+                        }
+                    }
+                    (Ok(m), None) => {
+                        if m.is_file() && Language::from_path(&abs).is_some() {
+                            stale.push(p.clone());
+                        }
+                    }
+                    (Err(_), Some(_)) => stale.push(p.clone()),
+                    (Err(_), None) => {}
+                }
+            }
+        }
+        None => {
+            let files = discover(root);
+            let mut seen = HashSet::new();
+            for f in files {
+                seen.insert(f.rel_path.clone());
+                match meta.get(&f.rel_path) {
+                    Some((mt, sz)) if *mt == f.mtime && *sz == f.size as i64 => {}
+                    _ => stale.push(f.rel_path.clone()),
+                }
+            }
+            for k in meta.keys() {
+                if !seen.contains(k) {
+                    stale.push(k.clone());
+                }
+            }
+        }
+    }
+    stale.sort();
+    Ok(stale)
+}
+
+struct Parsed {
+    file: SourceFile,
+    hash: String,
+    facts: std::result::Result<FileFacts, String>,
+}
+
+fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed: Vec<String>, opts: IndexOptions) -> Result<IndexStats> {
+    let t0 = Instant::now();
+    let _ = root;
+    let mut stats = IndexStats { files_scanned: candidates.len(), files_removed: removed.len(), ..Default::default() };
+    let mut meta: HashMap<String, (String, i64, i64)> = HashMap::new();
+    {
+        let mut st = conn.prepare("SELECT file_path, content_hash, last_mtime, size FROM file_meta")?;
+        let rows =
+            st.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))))?;
+        for r in rows.flatten() {
+            meta.insert(r.0, r.1);
+        }
+    }
+    let first_index = meta.is_empty();
+
+    // 1. mtime / size pre-filter (cache hit without reading the file).
+    let to_hash: Vec<SourceFile> = candidates
+        .into_iter()
+        .filter(|f| opts.rebuild || meta.get(&f.rel_path).map(|(_, m, s)| *m != f.mtime || *s != f.size as i64).unwrap_or(true))
+        .collect();
+    stats.files_hashed = to_hash.len();
+    stats.files_unchanged = stats.files_scanned - to_hash.len();
+
+    // 2. Parallel Blake3 hashing + 3. parallel parsing of modified files.
+    let results: Vec<(SourceFile, String, Option<Vec<u8>>)> = to_hash
+        .into_par_iter()
+        .filter_map(|f| {
+            let bytes = std::fs::read(&f.abs_path).ok()?;
+            let hash = codegraph_core::hash::content_hash(&bytes);
+            Some((f, hash, Some(bytes)))
+        })
+        .collect();
+    let mut touched = Vec::new();
+    let mut to_parse = Vec::new();
+    for (f, hash, bytes) in results {
+        match meta.get(&f.rel_path) {
+            Some((h, _, _)) if *h == hash && !opts.rebuild => touched.push((f, hash)),
+            _ => to_parse.push((f, hash, bytes.unwrap_or_default())),
+        }
+    }
+    stats.files_unchanged += touched.len();
+    let parsed: Vec<Parsed> = to_parse
+        .into_par_iter()
+        .map(|(f, hash, bytes)| {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let rel = f.rel_path.clone();
+            let lang = f.language;
+            let facts = catch_unwind(AssertUnwindSafe(|| extract_file(&rel, lang, &text))).map_err(|_| "extractor panicked".to_string());
+            Parsed { file: f, hash, facts }
+        })
+        .collect();
+    stats.files_parsed = parsed.len();
+    stats.parsed_paths = parsed.iter().map(|p| p.file.rel_path.clone()).collect();
+
+    tracing::debug!("hash+parse: {} ms", t0.elapsed().as_millis());
+    let now = now_ms();
+    let tx = conn.transaction()?;
+    for (f, _) in &touched {
+        tx.execute("UPDATE file_meta SET last_mtime = ?1, size = ?2 WHERE file_path = ?3", params![f.mtime, f.size as i64, f.rel_path])?;
+    }
+    if parsed.is_empty() && removed.is_empty() {
+        tx.commit()?;
+        finish_stats(conn, &mut stats, t0)?;
+        return Ok(stats);
+    }
+
+    // 4. Cascade invalidation.
+    let changed: Vec<String> = parsed.iter().map(|p| p.file.rel_path.clone()).chain(removed.iter().cloned()).collect();
+    let old_names: BTreeSet<String> = select_strings(&tx, "SELECT DISTINCT name FROM node WHERE derived = 0 AND file_path IN", &changed)?;
+    let had_di = !select_strings(&tx, "SELECT DISTINCT file_path FROM di_registration WHERE file_path IN", &changed)?.is_empty();
+    let dependents = select_strings(&tx, "SELECT DISTINCT source_file FROM edge WHERE derived = 0 AND target_file IN", &changed)?;
+
+    let tp = Instant::now();
+    for f in &changed {
+        store::delete_file_rows(&tx, f)?;
+    }
+    tracing::debug!("delete: {} ms", tp.elapsed().as_millis());
+    let tp = Instant::now();
+    for f in &removed {
+        tx.execute("DELETE FROM file_meta WHERE file_path = ?1", [f])?;
+    }
+    let mut new_names: BTreeSet<String> = BTreeSet::new();
+    let mut has_di = false;
+    for p in &parsed {
+        match &p.facts {
+            Ok(facts) => {
+                store::insert_file_facts(&tx, facts, &p.hash, p.file.mtime, p.file.size, now)?;
+                new_names.extend(facts.symbols.iter().map(|s| s.name.clone()));
+                has_di |= !facts.di.is_empty();
+            }
+            Err(e) => {
+                stats.parse_errors += 1;
+                tx.execute(
+                    "INSERT OR REPLACE INTO file_meta (file_path, content_hash, last_mtime, size, last_indexed_at, status, language, line_count, error, facts) VALUES (?1, ?2, ?3, ?4, ?5, 'error', ?6, 0, ?7, NULL)",
+                    params![p.file.rel_path, p.hash, p.file.mtime, p.file.size as i64, now, p.file.language.as_str(), e],
+                )?;
+            }
+        }
+    }
+    tracing::debug!("insert: {} ms", tp.elapsed().as_millis());
+    let tp = Instant::now();
+    let names: Vec<String> = old_names.union(&new_names).cloned().collect();
+    let by_name = select_strings(&tx, "SELECT DISTINCT file_path FROM ref_name WHERE name IN", &names)?;
+    let total_files: i64 = tx.query_row("SELECT COUNT(*) FROM file_meta", [], |r| r.get(0))?;
+    let removed_set: HashSet<&String> = removed.iter().collect();
+    let mut affected: BTreeSet<String> = BTreeSet::new();
+    affected.extend(parsed.iter().filter(|p| p.facts.is_ok()).map(|p| p.file.rel_path.clone()));
+    affected.extend(dependents.into_iter());
+    affected.extend(by_name.into_iter());
+    affected.retain(|f| !removed_set.contains(f));
+    let full_resolution = first_index || had_di || has_di || (affected.len() as i64) * 2 > total_files;
+    if full_resolution {
+        tx.execute("DELETE FROM edge WHERE derived = 0", [])?;
+        affected = select_strings(&tx, "SELECT file_path FROM file_meta WHERE status = 'indexed' AND file_path NOT IN", &["".to_string()])?;
+    } else {
+        for f in &affected {
+            tx.execute("DELETE FROM edge WHERE source_file = ?1 AND derived = 0", [f])?;
+        }
+    }
+    stats.affected_files = affected.len();
+    stats.full_resolution = full_resolution;
+
+    tracing::debug!("cascade: {} ms ({} affected)", tp.elapsed().as_millis(), affected.len());
+    // 5. Semantic resolution of affected files.
+    let tp = Instant::now();
+    let index = load_index(&tx)?;
+    tracing::debug!("load_index: {} ms", tp.elapsed().as_millis());
+    let tp = Instant::now();
+    let mut facts: Vec<(String, StoredFacts)> = Vec::new();
+    {
+        let mut st = tx.prepare("SELECT facts FROM file_meta WHERE file_path = ?1")?;
+        for f in &affected {
+            let json: Option<String> = st.query_row([f], |r| r.get(0)).ok().flatten();
+            let sf: StoredFacts = json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
+            facts.push((f.clone(), sf));
+        }
+    }
+    let edges: Vec<Edge> = facts.par_iter().flat_map_iter(|(f, sf)| resolve::resolve_file(&index, f, &sf.refs)).collect();
+    for e in &edges {
+        store::insert_edge(&tx, e)?;
+    }
+
+    tracing::debug!("resolve+insert {} edges: {} ms", edges.len(), tp.elapsed().as_millis());
+    // 6. Project-wide derived relations.
+    let tp = Instant::now();
+    recompute_global(&tx, &index)?;
+    tracing::debug!("global: {} ms", tp.elapsed().as_millis());
+    let tp = Instant::now();
+    store::set_meta(&tx, "last_indexed_at", &now.to_string())?;
+    tx.commit()?;
+    tracing::debug!("commit: {} ms", tp.elapsed().as_millis());
+    finish_stats(conn, &mut stats, t0)?;
+    Ok(stats)
+}
+
+fn finish_stats(conn: &Connection, stats: &mut IndexStats, t0: Instant) -> Result<()> {
+    stats.files_total = conn.query_row("SELECT COUNT(*) FROM file_meta", [], |r| r.get::<_, i64>(0))? as usize;
+    stats.nodes = conn.query_row("SELECT COUNT(*) FROM node", [], |r| r.get(0))?;
+    stats.edges = conn.query_row("SELECT COUNT(*) FROM edge", [], |r| r.get(0))?;
+    stats.duration_ms = t0.elapsed().as_millis();
+    Ok(())
+}
+
+/// Runs `sql IN (...)` in chunks (SQLite parameter limits) and collects the first column.
+fn select_strings(tx: &Transaction, sql_prefix: &str, values: &[String]) -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    if values.is_empty() {
+        return Ok(out);
+    }
+    for chunk in values.chunks(500) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!("{sql_prefix} ({placeholders})");
+        let mut st = tx.prepare(&sql)?;
+        let rows = st.query_map(params_from_iter(chunk.iter()), |r| r.get::<_, String>(0))?;
+        for r in rows.flatten() {
+            out.insert(r);
+        }
+    }
+    Ok(out)
+}
+
+/// Loads the symbol index (all non-derived nodes, imports and DI registrations).
+pub fn load_index(conn: &Connection) -> Result<SymbolIndex> {
+    let mut syms = Vec::new();
+    {
+        let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM node WHERE derived = 0"))?;
+        let rows = st.query_map([], node_from_row)?;
+        for r in rows.flatten() {
+            let lang = Language::from_path(Path::new(&r.file_path)).unwrap_or(Language::Config);
+            let mut sym = r.sym;
+            // Data-model promotion is a derived property; resolve against the declared kind.
+            if sym.kind == codegraph_core::SymbolKind::DataModel && !sym.attrs.iter().any(|a| a.starts_with("prisma:")) {
+                sym.kind = codegraph_core::SymbolKind::Class;
+            }
+            syms.push(IndexedSymbol { file: r.file_path, lang, sym });
+        }
+    }
+    let mut imports: HashMap<String, Vec<Import>> = HashMap::new();
+    {
+        let mut st = conn.prepare("SELECT file_path, module, imported, local, kind, line_number FROM import")?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<u32>>(5)?,
+            ))
+        })?;
+        for (file, module, imported, local, kind, line) in rows.flatten() {
+            let kind: ImportKind =
+                kind.and_then(|k| serde_json::from_value(serde_json::Value::String(k)).ok()).unwrap_or(ImportKind::Named);
+            imports.entry(file).or_default().push(Import { module, imported, local, kind, line: line.unwrap_or(0) });
+        }
+    }
+    let mut di = Vec::new();
+    {
+        let mut st = conn.prepare(
+            "SELECT file_path, service, implementation, lifetime, framework, line_number, enclosing_node_id FROM di_registration",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                DiRegistration {
+                    service: r.get(1)?,
+                    implementation: r.get(2)?,
+                    lifetime: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    framework: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    line: r.get::<_, Option<u32>>(5)?.unwrap_or(0),
+                    enclosing: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                },
+            ))
+        })?;
+        di.extend(rows.flatten());
+    }
+    Ok(SymbolIndex::build(syms, imports, di))
+}
+
+fn load_call_rows(tx: &Transaction) -> Result<Vec<CallRow>> {
+    let mut st = tx.prepare("SELECT source_id, target_id, confidence, line_number, metadata, source_file FROM edge WHERE relation = 'CALLS' AND target_id IS NOT NULL")?;
+    let rows = st.query_map([], |r| {
+        let meta: Option<String> = r.get(4)?;
+        let try_types: Vec<String> = meta
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+            .and_then(|v| v.get("try").and_then(|t| serde_json::from_value(t.clone()).ok()))
+            .unwrap_or_default();
+        Ok(CallRow {
+            source_id: r.get(0)?,
+            target_id: r.get(1)?,
+            confidence: Confidence::parse(&r.get::<_, String>(2)?),
+            line: r.get::<_, Option<u32>>(3)?.unwrap_or(0),
+            try_types,
+            source_file: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+        })
+    })?;
+    Ok(rows.flatten().collect())
+}
+
+fn recompute_global(tx: &Transaction, index: &SymbolIndex) -> Result<()> {
+    tx.execute_batch(
+        "DELETE FROM edge WHERE derived = 1;
+         DELETE FROM node WHERE derived = 1;
+         DELETE FROM api_route;
+         DELETE FROM data_model;
+         DELETE FROM data_model_field;
+         UPDATE node SET kind = orig_kind WHERE kind <> orig_kind;",
+    )?;
+    let mut edges: Vec<Edge> = Vec::new();
+
+    let tg = Instant::now();
+    // Dependency injection.
+    edges.extend(global::di_edges(index));
+    tracing::debug!("  di: {} ms", tg.elapsed().as_millis());
+    let tg = Instant::now();
+
+    // Fullstack routes.
+    let routes: Vec<RouteRow> = {
+        let mut st = tx.prepare("SELECT file_path, handler, http_method, path, framework, line_number FROM route")?;
+        let rows = st.query_map([], |r| {
+            Ok(RouteRow {
+                file: r.get(0)?,
+                decl: RouteDecl {
+                    handler: r.get(1)?,
+                    http_method: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    path: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    framework: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    line: r.get::<_, Option<u32>>(5)?.unwrap_or(0),
+                },
+            })
+        })?;
+        rows.flatten().collect()
+    };
+    let prefixes: Vec<(String, String)> = {
+        let mut st = tx.prepare("SELECT file_path, prefix FROM route_prefix")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.flatten().collect()
+    };
+    let resolved = global::resolve_routes(index, &routes, &prefixes);
+    {
+        let mut st = tx.prepare_cached("INSERT INTO api_route (handler_id, http_method, path, normalized, framework, file_path, line_number) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+        for r in &resolved {
+            st.execute(params![r.handler_id, r.http_method, r.path, r.normalized, r.framework, r.file, r.line])?;
+        }
+    }
+    let calls: Vec<HttpCallRow> = {
+        let mut st = tx.prepare("SELECT file_path, enclosing_node_id, http_method, url, client, line_number FROM http_call")?;
+        let rows = st.query_map([], |r| {
+            Ok(HttpCallRow {
+                file: r.get(0)?,
+                call: HttpCall {
+                    enclosing: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    http_method: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    url: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    client: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    line: r.get::<_, Option<u32>>(5)?.unwrap_or(0),
+                },
+            })
+        })?;
+        rows.flatten().collect()
+    };
+    edges.extend(global::http_edges(index, &resolved, &calls));
+    tracing::debug!("  http: {} ms", tg.elapsed().as_millis());
+    let tg = Instant::now();
+
+    // Tests and error flow (both derived from the per-file CALLS / THROWS edges).
+    let call_rows = load_call_rows(tx)?;
+    edges.extend(global::test_edges(index, &call_rows));
+    tracing::debug!("  tests: {} ms", tg.elapsed().as_millis());
+    let tg = Instant::now();
+    let throws: Vec<ThrowRow> = {
+        let mut st = tx.prepare(
+            "SELECT e.source_id, e.source_file, COALESCE(n.name, e.unresolved_symbol), e.line_number, e.metadata \
+             FROM edge e LEFT JOIN node n ON n.id = e.target_id WHERE e.relation = 'THROWS'",
+        )?;
+        let rows = st.query_map([], |r| {
+            let meta: Option<String> = r.get(4)?;
+            let try_types: Vec<String> = meta
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+                .and_then(|v| v.get("try").and_then(|t| serde_json::from_value(t.clone()).ok()))
+                .unwrap_or_default();
+            Ok(ThrowRow {
+                source_id: r.get(0)?,
+                source_file: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                exception: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                line: r.get::<_, Option<u32>>(3)?.unwrap_or(0),
+                try_types,
+            })
+        })?;
+        rows.flatten().collect()
+    };
+    let handlers: Vec<HandlerRow> = {
+        let mut st = tx.prepare("SELECT file_path, handler, exception, framework, line_number FROM global_handler")?;
+        let rows = st.query_map([], |r| {
+            Ok(HandlerRow {
+                file: r.get(0)?,
+                handler: GlobalHandler {
+                    handler: r.get(1)?,
+                    exception: r.get::<_, Option<String>>(2)?.unwrap_or_else(|| "*".into()),
+                    framework: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    line: r.get::<_, Option<u32>>(4)?.unwrap_or(0),
+                },
+            })
+        })?;
+        rows.flatten().collect()
+    };
+    edges.extend(global::caught_by_edges(index, &throws, &call_rows, &handlers));
+    tracing::debug!("  caught_by: {} ms", tg.elapsed().as_millis());
+    let tg = Instant::now();
+
+    // Shared literals.
+    let lits: Vec<LiteralRow> = {
+        let mut st = tx.prepare("SELECT literal_value, file_path, line_number, enclosing_node_id FROM literal_occurrence WHERE literal_type IN ('string', 'template')")?;
+        let rows = st.query_map([], |r| {
+            Ok(LiteralRow {
+                value: r.get(0)?,
+                file: r.get(1)?,
+                line: r.get::<_, Option<u32>>(2)?.unwrap_or(0),
+                enclosing: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            })
+        })?;
+        rows.flatten().collect()
+    };
+    let (lit_nodes, lit_edges) = global::literal_graph(&lits, 2000);
+    for (file, sym) in &lit_nodes {
+        store::insert_node(tx, file, "literal", sym, true)?;
+    }
+    edges.extend(lit_edges);
+    tracing::debug!("  literals: {} ms", tg.elapsed().as_millis());
+    let tg = Instant::now();
+
+    for e in &edges {
+        store::insert_edge(tx, e)?;
+    }
+
+    tracing::debug!("  insert {} derived edges: {} ms", edges.len(), tg.elapsed().as_millis());
+    let tg = Instant::now();
+    // Data models / ERD.
+    let (models, fields) = models::extract_models(index);
+    tracing::debug!("  models: {} ms", tg.elapsed().as_millis());
+    {
+        let mut st =
+            tx.prepare_cached("INSERT OR REPLACE INTO data_model (model_node_id, name, framework, table_name) VALUES (?1, ?2, ?3, ?4)")?;
+        let mut up = tx.prepare_cached("UPDATE node SET kind = 'data_model' WHERE id = ?1")?;
+        for m in &models {
+            st.execute(params![m.id, m.name, m.framework, m.table])?;
+            up.execute([&m.id])?;
+        }
+        let mut st = tx.prepare_cached(
+            "INSERT INTO data_model_field (model_node_id, field_name, field_type, is_primary_key, is_foreign_key, target_model, relation_cardinality, line_number) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for f in &fields {
+            st.execute(params![
+                f.model_id,
+                f.field_name,
+                f.field_type,
+                f.is_primary_key,
+                f.is_foreign_key,
+                f.target_model,
+                f.cardinality,
+                f.line
+            ])?;
+        }
+    }
+    Ok(())
+}
