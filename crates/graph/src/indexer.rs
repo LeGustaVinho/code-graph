@@ -18,6 +18,7 @@ use rusqlite::{params, params_from_iter, Connection, Transaction};
 use serde::Serialize;
 
 use crate::progress::{Progress, Stage};
+use crate::schema;
 use crate::store::{self, node_from_row, StoredFacts, NODE_COLS};
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -58,6 +59,7 @@ pub fn index_project(root: &Path, conn: &mut Connection, opts: IndexOptions) -> 
 /// [`index_project`], reporting each stage to `progress` (read from other threads).
 pub fn index_project_with(root: &Path, conn: &mut Connection, opts: IndexOptions, progress: &Progress) -> Result<IndexStats> {
     progress.begin(Stage::Discover, 0);
+    let td = Instant::now();
     let files = {
         let found = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|s| {
@@ -70,6 +72,7 @@ pub fn index_project_with(root: &Path, conn: &mut Connection, opts: IndexOptions
         })
     };
     progress.set_done(files.len());
+    tracing::debug!("discover: {} files in {} ms", files.len(), td.elapsed().as_millis());
     let on_disk: HashSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
     let known: Vec<String> = {
         let mut st = conn.prepare("SELECT file_path FROM file_meta")?;
@@ -182,6 +185,10 @@ struct Parsed {
     file: SourceFile,
     hash: String,
     facts: std::result::Result<FileFacts, String>,
+    /// References kept for resolution, and their JSON for `file_meta.facts` (both built
+    /// on the parsing threads; resolution reuses them instead of reading them back).
+    stored: StoredFacts,
+    facts_json: String,
 }
 
 fn run(
@@ -235,56 +242,129 @@ fn run(
     }
     stats.files_unchanged += touched.len();
     progress.begin(Stage::Parse, to_parse.len());
-    let parsed: Vec<Parsed> = extraction_pool().install(|| {
+    // Largest files first (they take longest), one file per task, so no thread is left
+    // finishing a big file at the end; results go back to discovery order afterwards
+    // (row ids depend on insertion order).
+    let mut to_parse: Vec<(usize, _)> = to_parse.into_iter().enumerate().collect();
+    to_parse.sort_by_key(|(i, (_, _, bytes))| (std::cmp::Reverse(bytes.len()), *i));
+    let mut parsed: Vec<(usize, Parsed)> = extraction_pool().install(|| {
         to_parse
             .into_par_iter()
-            .map(|(f, hash, bytes)| {
+            .with_max_len(1)
+            .map(|(i, (f, hash, bytes))| {
                 let text = String::from_utf8_lossy(&bytes).into_owned();
                 let rel = f.rel_path.clone();
                 let lang = f.language;
                 let facts =
                     catch_unwind(AssertUnwindSafe(|| extract_file(&rel, lang, &text))).map_err(|_| "extractor panicked".to_string());
+                let stored = facts.as_ref().map(StoredFacts::of).unwrap_or_default();
+                let facts_json = if facts.is_ok() { serde_json::to_string(&stored).unwrap_or_default() } else { String::new() };
                 progress.tick();
-                Parsed { file: f, hash, facts }
+                (i, Parsed { file: f, hash, facts, stored, facts_json })
             })
             .collect()
     });
+    parsed.sort_by_key(|(i, _)| *i);
+    let parsed: Vec<Parsed> = parsed.into_iter().map(|(_, p)| p).collect();
     stats.files_parsed = parsed.len();
     stats.parsed_paths = parsed.iter().map(|p| p.file.rel_path.clone()).collect();
 
     tracing::debug!("hash+parse: {} ms", t0.elapsed().as_millis());
     let now = now_ms();
-    // Deleting the old rows of already indexed files costs about as much as inserting
-    // (a `--rebuild` deletes everything); a first index has nothing to delete.
-    let indexed_before = parsed.iter().filter(|p| meta.contains_key(&p.file.rel_path)).count() + removed.len();
+    // Bulk load (first index, `--rebuild`, extractor upgrade): every file is (re)written, so
+    // the tables are emptied at once and indexes are rebuilt after loading instead of
+    // being maintained row by row.
+    let bulk = first_index || opts.rebuild;
+    // Deleting the old rows of already indexed files costs about as much as inserting;
+    // bulk mode empties the tables in one statement each.
+    let indexed_before = if bulk { 0 } else { parsed.iter().filter(|p| meta.contains_key(&p.file.rel_path)).count() + removed.len() };
     progress.begin(Stage::Store, indexed_before + parsed.len() + removed.len());
+    if bulk {
+        conn.execute_batch(&format!("PRAGMA cache_size = {BULK_CACHE_KIB};"))?;
+    }
+    // A first index fills an empty file: in rollback-journal mode new pages are written
+    // once (WAL writes them to the log, then copies them again at checkpoint) and still
+    // roll back on failure, since pages past the original end need no journal. Only
+    // possible while no other connection is open; otherwise it quietly stays in WAL.
+    let rollback_journal = first_index
+        && conn
+            .query_row("PRAGMA journal_mode = DELETE", [], |r| r.get::<_, String>(0))
+            .map(|m| m.eq_ignore_ascii_case("delete"))
+            .unwrap_or(false);
+    // Bulk load: the full-text indexes are built on other threads meanwhile.
+    let (ids, fts) = if bulk {
+        let files: Vec<&FileFacts> = parsed.iter().filter_map(|p| p.facts.as_ref().ok()).collect();
+        let (ids, fts) = crate::ftsbuild::start(&root.join(crate::DB_DIR), &files);
+        (Some(ids), Some(fts))
+    } else {
+        (None, None)
+    };
+    let res =
+        write_and_resolve(root, conn, &mut stats, Work { parsed, touched, removed, meta, first_index, bulk, now, ids, fts }, progress);
+    if rollback_journal {
+        conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0))?;
+    }
+    if bulk {
+        conn.execute_batch(&format!("PRAGMA cache_size = {WRITER_CACHE_KIB};"))?;
+    }
+    res?;
+    finish_stats(conn, &mut stats, t0)?;
+    Ok(stats)
+}
+
+/// Writer page cache during a bulk load (KiB, negative = size in SQLite's convention).
+const BULK_CACHE_KIB: i64 = -512 * 1024;
+/// Writer page cache otherwise (matches `schema::apply_pragmas`).
+const WRITER_CACHE_KIB: i64 = -4000;
+
+struct Work {
+    parsed: Vec<Parsed>,
+    touched: Vec<(SourceFile, String)>,
+    removed: Vec<String>,
+    meta: HashMap<String, (String, i64, i64)>,
+    first_index: bool,
+    bulk: bool,
+    now: i64,
+    ids: Option<crate::ftsbuild::BulkIds>,
+    fts: Option<crate::ftsbuild::Builder>,
+}
+
+/// Steps 4–6 in one transaction: store facts, cascade, resolve, project-wide relations.
+fn write_and_resolve(root: &Path, conn: &mut Connection, stats: &mut IndexStats, w: Work, progress: &Progress) -> Result<()> {
+    let Work { parsed, touched, removed, meta, first_index, bulk, now, ids, fts } = w;
     let tx = conn.transaction()?;
     for (f, _) in &touched {
         tx.execute("UPDATE file_meta SET last_mtime = ?1, size = ?2 WHERE file_path = ?3", params![f.mtime, f.size as i64, f.rel_path])?;
     }
     if parsed.is_empty() && removed.is_empty() {
         tx.commit()?;
-        finish_stats(conn, &mut stats, t0)?;
-        return Ok(stats);
+        return Ok(());
     }
 
-    // 4. Cascade invalidation.
+    // 4. Cascade invalidation (a bulk load re-resolves everything).
     let changed: Vec<String> = parsed.iter().map(|p| p.file.rel_path.clone()).chain(removed.iter().cloned()).collect();
-    let old_names: BTreeSet<String> = select_strings(&tx, "SELECT DISTINCT name FROM node WHERE derived = 0 AND file_path IN", &changed)?;
-    let had_di = !select_strings(&tx, "SELECT DISTINCT file_path FROM di_registration WHERE file_path IN", &changed)?.is_empty();
-    let dependents = select_strings(&tx, "SELECT DISTINCT source_file FROM edge WHERE derived = 0 AND target_file IN", &changed)?;
-
     let tp = Instant::now();
-    for f in &changed {
-        store::delete_file_rows(&tx, f)?;
-        if meta.contains_key(f) {
-            progress.tick();
+    let (old_names, had_di, dependents) = if bulk {
+        schema::begin_bulk(&tx)?;
+        (BTreeSet::new(), false, BTreeSet::new())
+    } else {
+        let old_names = select_strings(&tx, "SELECT DISTINCT name FROM node WHERE derived = 0 AND file_path IN", &changed)?;
+        let had_di = !select_strings(&tx, "SELECT DISTINCT file_path FROM di_registration WHERE file_path IN", &changed)?.is_empty();
+        let dependents = select_strings(&tx, "SELECT DISTINCT source_file FROM edge WHERE derived = 0 AND target_file IN", &changed)?;
+        for f in &changed {
+            store::delete_file_rows(&tx, f)?;
+            if meta.contains_key(f) {
+                progress.tick();
+            }
         }
-    }
+        (old_names, had_di, dependents)
+    };
     tracing::debug!("delete: {} ms", tp.elapsed().as_millis());
     let tp = Instant::now();
     for f in &removed {
-        tx.execute("DELETE FROM file_meta WHERE file_path = ?1", [f])?;
+        if !bulk {
+            tx.execute("DELETE FROM file_meta WHERE file_path = ?1", [f])?;
+        }
         progress.tick();
     }
     let mut new_names: BTreeSet<String> = BTreeSet::new();
@@ -295,7 +375,7 @@ fn run(
                 if facts.syntax_errors > 0 {
                     stats.syntax_errors += 1;
                 }
-                store::insert_file_facts(&tx, facts, &p.hash, p.file.mtime, p.file.size, now)?;
+                store::insert_file_facts(&tx, facts, &p.facts_json, &p.hash, p.file.mtime, p.file.size, now, ids.as_ref())?;
                 new_names.extend(facts.symbols.iter().map(|s| s.name.clone()));
                 has_di |= !facts.di.is_empty();
                 progress.tick();
@@ -328,8 +408,12 @@ fn run(
     }
     tracing::debug!("insert: {} ms", tp.elapsed().as_millis());
     let tp = Instant::now();
-    let names: Vec<String> = old_names.union(&new_names).cloned().collect();
-    let by_name = select_strings(&tx, "SELECT DISTINCT file_path FROM ref_name WHERE name IN", &names)?;
+    let by_name = if bulk {
+        BTreeSet::new()
+    } else {
+        let names: Vec<String> = old_names.union(&new_names).cloned().collect();
+        select_strings(&tx, "SELECT DISTINCT file_path FROM ref_name WHERE name IN", &names)?
+    };
     let total_files: i64 = tx.query_row("SELECT COUNT(*) FROM file_meta", [], |r| r.get(0))?;
     let removed_set: HashSet<&String> = removed.iter().collect();
     let mut affected: BTreeSet<String> = BTreeSet::new();
@@ -371,15 +455,22 @@ fn run(
     }
     tracing::debug!("load_index: {} ms", tp.elapsed().as_millis());
     let tp = Instant::now();
-    let mut facts: Vec<(String, StoredFacts)> = Vec::new();
-    {
+    // References of files parsed in this run are still in memory; the others (dependents
+    // re-resolved by the cascade) come back from `file_meta.facts`, decoded in parallel.
+    let fresh: HashMap<&str, &StoredFacts> =
+        parsed.iter().filter(|p| p.facts.is_ok()).map(|p| (p.file.rel_path.as_str(), &p.stored)).collect();
+    let loaded: HashMap<String, StoredFacts> = {
         let mut st = tx.prepare("SELECT facts FROM file_meta WHERE file_path = ?1")?;
-        for f in &affected {
+        let mut raw = Vec::new();
+        for f in affected.iter().filter(|f| !fresh.contains_key(f.as_str())) {
             let json: Option<String> = st.query_row([f], |r| r.get(0)).ok().flatten();
-            let sf: StoredFacts = json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default();
-            facts.push((f.clone(), sf));
+            raw.push((f.clone(), json));
         }
-    }
+        raw.into_par_iter().map(|(f, json)| (f, json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default())).collect()
+    };
+    let none = StoredFacts::default();
+    let facts: Vec<(&String, &StoredFacts)> =
+        affected.iter().map(|f| (f, fresh.get(f.as_str()).copied().or_else(|| loaded.get(f)).unwrap_or(&none))).collect();
     let edges: Vec<Edge> = facts
         .par_iter()
         .flat_map_iter(|(f, sf)| {
@@ -388,23 +479,28 @@ fn run(
             e
         })
         .collect();
-    for e in &edges {
-        store::insert_edge(&tx, e)?;
-    }
-
-    tracing::debug!("resolve+insert {} edges: {} ms", edges.len(), tp.elapsed().as_millis());
+    tracing::debug!("resolve {} edges: {} ms", edges.len(), tp.elapsed().as_millis());
+    let tp = Instant::now();
+    store::insert_edges(&tx, &edges, bulk)?;
+    tracing::debug!("insert edges: {} ms", tp.elapsed().as_millis());
     // 6. Project-wide derived relations.
     let tp = Instant::now();
     progress.begin(Stage::Link, GLOBAL_STEPS);
     recompute_global(&tx, &index, progress)?;
     tracing::debug!("global: {} ms", tp.elapsed().as_millis());
     let tp = Instant::now();
-    progress.begin(Stage::Save, 0);
+    // Steps: indexes, full-text (bulk only), commit.
+    progress.begin(Stage::Save, if bulk { 3 } else { 1 });
+    if bulk {
+        schema::end_bulk(&tx, fts, progress)?;
+        tracing::debug!("rebuild indexes: {} ms", tp.elapsed().as_millis());
+    }
+    let tp = Instant::now();
     store::set_meta(&tx, "last_indexed_at", &now.to_string())?;
     tx.commit()?;
+    progress.tick();
     tracing::debug!("commit: {} ms", tp.elapsed().as_millis());
-    finish_stats(conn, &mut stats, t0)?;
-    Ok(stats)
+    Ok(())
 }
 
 /// Extraction runs on a dedicated pool with large stacks: extractors recurse over the

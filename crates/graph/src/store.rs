@@ -129,7 +129,15 @@ fn node_rowid(tx: &Transaction, id: &str) -> rusqlite::Result<i64> {
 }
 
 pub fn insert_node(tx: &Transaction, file: &str, lang: &str, s: &Symbol, derived: bool) -> rusqlite::Result<()> {
-    let rid = node_rowid(tx, &s.id)?;
+    insert_node_at(tx, file, lang, s, derived, None)
+}
+
+/// [`insert_node`] at a row id chosen up front (bulk load), or probed when `None`.
+pub fn insert_node_at(tx: &Transaction, file: &str, lang: &str, s: &Symbol, derived: bool, rid: Option<i64>) -> rusqlite::Result<()> {
+    let rid = match rid {
+        Some(r) => r,
+        None => node_rowid(tx, &s.id)?,
+    };
     let mut stmt = tx.prepare_cached(
         "INSERT OR REPLACE INTO node (id, file_path, kind, orig_kind, name, qualified_name, signature, start_line, end_line, language, \
          capabilities, cyclomatic_complexity, is_entrypoint, entry_kind, is_test, parent_id, visibility, is_exported, is_static, \
@@ -180,11 +188,25 @@ pub fn insert_node(tx: &Transaction, file: &str, lang: &str, s: &Symbol, derived
 /// Content-addressed edge id: an incremental update and a full rebuild assign the same ids,
 /// so edges sharing every ORDER BY key still come back in the same order.
 fn edge_rowid(tx: &Transaction, e: &Edge, meta: Option<&str>) -> rusqlite::Result<i64> {
+    let mut id = edge_hash(e, meta);
+    // Identical duplicates (and true hash collisions) take the next free slot.
+    let mut probe = tx.prepare_cached("SELECT 1 FROM edge WHERE id = ?1")?;
+    while probe.exists([id])? {
+        id = codegraph_core::hash::next_rowid(id);
+    }
+    Ok(id)
+}
+
+fn edge_meta(e: &Edge) -> Option<String> {
+    e.metadata.as_ref().filter(|m| m.as_object().map(|o| !o.is_empty()).unwrap_or(true)).map(|m| m.to_string())
+}
+
+fn edge_hash(e: &Edge, meta: Option<&str>) -> i64 {
     let line = e.line.to_le_bytes();
     fn opt(s: Option<&str>) -> &[u8] {
         s.map(|s| s.as_bytes()).unwrap_or(b"\0null")
     }
-    let mut id = codegraph_core::hash::stable_rowid(&[
+    codegraph_core::hash::stable_rowid(&[
         e.source_id.as_bytes(),
         opt(e.target_id.as_deref()),
         opt(e.unresolved_symbol.as_deref()),
@@ -197,22 +219,50 @@ fn edge_rowid(tx: &Transaction, e: &Edge, meta: Option<&str>) -> rusqlite::Resul
         e.source_file.as_bytes(),
         opt(e.target_file.as_deref()),
         if e.derived { b"1" } else { b"0" },
-    ]);
-    // Identical duplicates (and true hash collisions) take the next free slot.
-    let mut probe = tx.prepare_cached("SELECT 1 FROM edge WHERE id = ?1")?;
-    while probe.exists([id])? {
-        id = codegraph_core::hash::next_rowid(id);
-    }
-    Ok(id)
+    ])
 }
 
 pub fn insert_edge(tx: &Transaction, e: &Edge) -> rusqlite::Result<()> {
+    let meta = edge_meta(e);
+    let id = edge_rowid(tx, e, meta.as_deref())?;
+    write_edge(tx, e, meta, id)
+}
+
+/// Inserts `edges` in order, hashing their ids on all cores. With `empty_table` (bulk
+/// load: no edge rows yet) duplicates are settled in memory instead of probing the table;
+/// the ids are the same either way.
+pub fn insert_edges(tx: &Transaction, edges: &[Edge], empty_table: bool) -> rusqlite::Result<()> {
+    use rayon::prelude::*;
+    let hashed: Vec<(Option<String>, i64)> = edges
+        .par_iter()
+        .map(|e| {
+            let meta = edge_meta(e);
+            let id = edge_hash(e, meta.as_deref());
+            (meta, id)
+        })
+        .collect();
+    let mut taken: std::collections::HashSet<i64> = std::collections::HashSet::with_capacity(if empty_table { edges.len() } else { 0 });
+    let mut probe = tx.prepare_cached("SELECT 1 FROM edge WHERE id = ?1")?;
+    for (e, (meta, mut id)) in edges.iter().zip(hashed) {
+        if empty_table {
+            while !taken.insert(id) {
+                id = codegraph_core::hash::next_rowid(id);
+            }
+        } else {
+            while probe.exists([id])? {
+                id = codegraph_core::hash::next_rowid(id);
+            }
+        }
+        write_edge(tx, e, meta, id)?;
+    }
+    Ok(())
+}
+
+fn write_edge(tx: &Transaction, e: &Edge, meta: Option<String>, id: i64) -> rusqlite::Result<()> {
     let mut stmt = tx.prepare_cached(
         "INSERT INTO edge (source_id, target_id, unresolved_symbol, relation, confidence, evidence, resolver, line_number, metadata, source_file, target_file, derived, id) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
     )?;
-    let meta = e.metadata.as_ref().filter(|m| m.as_object().map(|o| !o.is_empty()).unwrap_or(true)).map(|m| m.to_string());
-    let id = edge_rowid(tx, e, meta.as_deref())?;
     stmt.execute(params![
         e.source_id,
         e.target_id,
@@ -235,6 +285,13 @@ pub fn insert_edge(tx: &Transaction, e: &Edge) -> rusqlite::Result<()> {
 #[derive(Serialize, Deserialize, Default)]
 pub struct StoredFacts {
     pub refs: Vec<codegraph_core::Reference>,
+}
+
+impl StoredFacts {
+    /// The references kept for re-resolution (catch sites live in their own table).
+    pub fn of(f: &FileFacts) -> StoredFacts {
+        StoredFacts { refs: f.refs.iter().filter(|r| r.kind != codegraph_core::RefKind::Catch).cloned().collect() }
+    }
 }
 
 pub const PER_FILE_TABLES: &[&str] = &[
@@ -261,15 +318,29 @@ pub fn delete_file_rows(tx: &Transaction, file: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn insert_file_facts(tx: &Transaction, f: &FileFacts, hash: &str, mtime: i64, size: u64, now: i64) -> rusqlite::Result<()> {
+/// Writes a parsed file. `facts_json` is its serialized [`StoredFacts`] (prepared on the
+/// parsing threads, off the single writer).
+#[allow(clippy::too_many_arguments)]
+pub fn insert_file_facts(
+    tx: &Transaction,
+    f: &FileFacts,
+    facts_json: &str,
+    hash: &str,
+    mtime: i64,
+    size: u64,
+    now: i64,
+    bulk: Option<&crate::ftsbuild::BulkIds>,
+) -> rusqlite::Result<()> {
     let lang = f.language.map(|l| l.as_str()).unwrap_or("");
     for s in &f.symbols {
-        insert_node(tx, &f.path, lang, s, false)?;
+        let rid = bulk.and_then(|b| b.node_rid.get(&s.id).copied());
+        insert_node_at(tx, &f.path, lang, s, false, rid)?;
     }
     {
-        let mut st = tx.prepare_cached("INSERT INTO literal_occurrence (literal_value, literal_type, file_path, line_number, column_number, enclosing_node_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
-        for l in &f.literals {
-            st.execute(params![l.value, l.literal_type, f.path, l.line, l.column, l.enclosing])?;
+        let mut st = tx.prepare_cached("INSERT INTO literal_occurrence (literal_value, literal_type, file_path, line_number, column_number, enclosing_node_id, id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+        let start = bulk.and_then(|b| b.literal_start.get(&f.path).copied());
+        for (i, l) in f.literals.iter().enumerate() {
+            st.execute(params![l.value, l.literal_type, f.path, l.line, l.column, l.enclosing, start.map(|s| s + i as i64)])?;
         }
     }
     {
@@ -360,8 +431,6 @@ pub fn insert_file_facts(tx: &Transaction, f: &FileFacts, hash: &str, mtime: i64
             st.execute(params![f.path, codegraph_core::extract::clean_type(n)])?;
         }
     }
-    let stored = StoredFacts { refs: f.refs.iter().filter(|r| r.kind != codegraph_core::RefKind::Catch).cloned().collect() };
-    let facts_json = serde_json::to_string(&stored).unwrap_or_default();
     tx.execute(
         "INSERT OR REPLACE INTO file_meta (file_path, content_hash, last_mtime, size, last_indexed_at, status, language, line_count, error, facts) \
          VALUES (?1, ?2, ?3, ?4, ?5, 'indexed', ?6, ?7, NULL, ?8)",

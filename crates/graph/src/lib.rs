@@ -1,6 +1,7 @@
 //! CodeGraph storage layer: an embedded SQLite graph (`.codegraph/graph.db`) in WAL
 //! mode with FTS5 trigram indexes, plus the incremental indexer.
 
+mod ftsbuild;
 pub mod indexer;
 pub mod progress;
 pub mod query;

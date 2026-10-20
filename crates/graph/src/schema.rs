@@ -30,6 +30,10 @@ const TABLES: &[&str] = &[
     "meta",
 ];
 
+/// Full-text tables, exactly as declared in [`DDL`] (also used to build them elsewhere).
+pub const NODE_FTS_DDL: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS node_fts USING fts5(name, qualified_name, signature, file_path, content='node', content_rowid='rid', tokenize='trigram');";
+pub const LITERAL_FTS_DDL: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS literal_fts USING fts5(literal_value, content='literal_occurrence', content_rowid='id', tokenize='trigram');";
+
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -92,10 +96,7 @@ CREATE INDEX IF NOT EXISTS node_parent ON node(parent_id);
 CREATE INDEX IF NOT EXISTS node_kind   ON node(kind);
 CREATE INDEX IF NOT EXISTS node_entry  ON node(is_entrypoint) WHERE is_entrypoint = 1;
 
-CREATE VIRTUAL TABLE IF NOT EXISTS node_fts USING fts5(
-    name, qualified_name, signature, file_path,
-    content='node', content_rowid='rid', tokenize='trigram'
-);
+CREATE VIRTUAL TABLE IF NOT EXISTS node_fts USING fts5(name, qualified_name, signature, file_path, content='node', content_rowid='rid', tokenize='trigram');
 CREATE TRIGGER IF NOT EXISTS node_ai AFTER INSERT ON node BEGIN
     INSERT INTO node_fts(rowid, name, qualified_name, signature, file_path)
     VALUES (new.rid, new.name, new.qualified_name, new.signature, new.file_path);
@@ -143,9 +144,7 @@ CREATE TABLE IF NOT EXISTS literal_occurrence (
 );
 CREATE INDEX IF NOT EXISTS literal_file  ON literal_occurrence(file_path);
 CREATE INDEX IF NOT EXISTS literal_value ON literal_occurrence(literal_value);
-CREATE VIRTUAL TABLE IF NOT EXISTS literal_fts USING fts5(
-    literal_value, content='literal_occurrence', content_rowid='id', tokenize='trigram'
-);
+CREATE VIRTUAL TABLE IF NOT EXISTS literal_fts USING fts5(literal_value, content='literal_occurrence', content_rowid='id', tokenize='trigram');
 CREATE TRIGGER IF NOT EXISTS literal_ai AFTER INSERT ON literal_occurrence BEGIN
     INSERT INTO literal_fts(rowid, literal_value) VALUES (new.id, new.literal_value);
 END;
@@ -296,6 +295,68 @@ pub fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
          PRAGMA cache_size = -4000;
          PRAGMA busy_timeout = 5000;",
     )
+}
+
+/// Names of the secondary indexes and the full-text triggers declared in [`DDL`].
+fn bulk_objects() -> (Vec<&'static str>, Vec<&'static str>) {
+    let name_after = |line: &'static str, prefix: &str| line.trim().strip_prefix(prefix).and_then(|r| r.split_whitespace().next());
+    let mut indexes = Vec::new();
+    let mut triggers = Vec::new();
+    for line in DDL.lines() {
+        if let Some(n) = name_after(line, "CREATE INDEX IF NOT EXISTS ") {
+            indexes.push(n);
+        } else if let Some(n) = name_after(line, "CREATE TRIGGER IF NOT EXISTS ") {
+            triggers.push(n);
+        }
+    }
+    (indexes, triggers)
+}
+
+/// Bulk load (first index, full rebuild): empties every indexed table and drops the
+/// secondary indexes and full-text triggers, so rows go in without per-row index and
+/// trigram upkeep. [`end_bulk`] rebuilds them in one pass each. Both run inside the
+/// indexing transaction, so a failed run leaves the schema untouched.
+pub fn begin_bulk(conn: &Connection) -> rusqlite::Result<()> {
+    let (indexes, triggers) = bulk_objects();
+    for t in triggers {
+        conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {t};"))?;
+    }
+    for i in indexes {
+        conn.execute_batch(&format!("DROP INDEX IF EXISTS {i};"))?;
+    }
+    // The full-text tables are left alone: [`end_bulk`] replaces their contents wholesale.
+    // (FTS5 caches its index structure per transaction, so touching them here would go
+    // stale once their shadow tables are overwritten.)
+    for t in TABLES {
+        if !matches!(*t, "meta" | "node_fts" | "literal_fts") {
+            conn.execute_batch(&format!("DELETE FROM \"{t}\";"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Recreates what [`begin_bulk`] dropped. Index builds sort with SQLite's worker threads.
+/// The full-text indexes come from `fts` (built in parallel during the load) or, without
+/// it, are rebuilt from their tables here.
+pub fn end_bulk(conn: &Connection, fts: Option<crate::ftsbuild::Builder>, progress: &crate::Progress) -> anyhow::Result<()> {
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+    conn.execute_batch(&format!("PRAGMA threads = {threads};"))?;
+    let t = std::time::Instant::now();
+    conn.execute_batch(DDL)?;
+    tracing::debug!("  indexes: {} ms", t.elapsed().as_millis());
+    progress.tick();
+    let t = std::time::Instant::now();
+    match fts {
+        Some(built) => built.finish_into(conn)?,
+        None => conn.execute_batch(
+            "INSERT INTO node_fts(node_fts) VALUES ('rebuild');
+             INSERT INTO literal_fts(literal_fts) VALUES ('rebuild');",
+        )?,
+    }
+    tracing::debug!("  full-text: {} ms", t.elapsed().as_millis());
+    progress.tick();
+    conn.execute_batch("PRAGMA threads = 0;")?;
+    Ok(())
 }
 
 /// Creates (or migrates) the schema. Returns true when the database was (re)created.
