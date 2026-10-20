@@ -58,6 +58,8 @@ pub struct SymbolIndex {
     pub global_usings: Vec<String>,
     /// Extension method name → (method index, extended type name).
     pub extensions: HashMap<String, Vec<(usize, String)>>,
+    /// tsconfig / jsconfig paths and workspace packages (set by the indexer, which reads them).
+    pub js: crate::jsconfig::JsProject,
 }
 
 const JS_EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"];
@@ -120,6 +122,7 @@ impl SymbolIndex {
             parts: HashMap::new(),
             global_usings: Vec::new(),
             extensions: HashMap::new(),
+            js: Default::default(),
         };
         for (i, s) in idx.syms.iter().enumerate() {
             idx.by_id.insert(s.sym.id.clone(), i);
@@ -344,6 +347,40 @@ impl SymbolIndex {
             let base = format!("{}/{}", dirname(from_file), spec);
             return try_base(&base).map(|f| (f, Confidence::Exact));
         }
+        // tsconfig / jsconfig `paths` and `baseUrl` of the config governing this file.
+        if let Some(cfg) = self.js.nearest(from_file) {
+            for (pattern, targets) in &cfg.paths {
+                if let Some(star) = crate::jsconfig::match_pattern(pattern, spec) {
+                    for t in targets {
+                        if let Some(f) = try_base(&t.replacen('*', star, 1)) {
+                            return Some((f, Confidence::Exact));
+                        }
+                    }
+                }
+            }
+            if let Some(base) = &cfg.base_url {
+                let cand = if base.is_empty() { spec.to_string() } else { format!("{base}/{spec}") };
+                if let Some(f) = try_base(&cand) {
+                    return Some((f, Confidence::Exact));
+                }
+            }
+        }
+        // Workspace packages importing each other by name (`@acme/shared`, `@acme/shared/x`).
+        for pkg in &self.js.packages {
+            let rest = if spec == pkg.name { Some("") } else { spec.strip_prefix(&format!("{}/", pkg.name)) };
+            let Some(rest) = rest else { continue };
+            let join = |p: &str| if pkg.dir.is_empty() { p.to_string() } else { format!("{}/{p}", pkg.dir) };
+            let cands: Vec<String> = if rest.is_empty() {
+                pkg.entries.iter().map(|e| join(e)).chain([join("src/index"), join("index")]).collect()
+            } else {
+                vec![join(rest), join(&format!("src/{rest}"))]
+            };
+            for c in cands {
+                if let Some(f) = try_base(&c) {
+                    return Some((f, Confidence::Exact));
+                }
+            }
+        }
         if let Some(rest) = spec.strip_prefix("@/").or_else(|| spec.strip_prefix("~/")) {
             // Common tsconfig alias: "@/x" → "<project>/src/x"
             let mut dir = dirname(from_file).to_string();
@@ -430,10 +467,23 @@ impl SymbolIndex {
             if let Some(k) = kids.iter().find(|k| self.syms[**k].sym.name == name) {
                 return Some(*k);
             }
+            // `export { a as b }` / `exports.b = a`.
+            let alias = format!("export-as:{name}");
+            if let Some(k) = kids.iter().find(|k| self.syms[**k].sym.modifiers.contains(&alias)) {
+                return Some(*k);
+            }
         }
         if depth < 4 {
             if let Some(imps) = self.imports.get(file) {
                 for imp in imps {
+                    // `export * as ns from './x'`: `ns` is the module itself.
+                    if imp.kind == ImportKind::Namespace && imp.local.as_deref() == Some(name) && imp.imported.is_none() {
+                        if let Some((f, _)) = self.resolve_module(file, &imp.module) {
+                            if let Some(m) = self.module_of_file.get(&f) {
+                                return Some(*m);
+                            }
+                        }
+                    }
                     let binds = imp.local.as_deref() == Some(name) || (imp.kind == ImportKind::Namespace && imp.local.is_none());
                     if binds {
                         if let Some((f, _)) = self.resolve_module(file, &imp.module) {

@@ -584,6 +584,27 @@ impl<'a> FileResolver<'a> {
             Some(m) => (m, true),
             None => (member, false),
         };
+        // `@fn`: the declared return type of a free function visible from here.
+        if owner_raw == "@fn" {
+            let f = match self.index.resolve_value(member, self.file, &r.enclosing) {
+                Resolved::One(f, _, _) => f,
+                _ => return TypeOf::Unknown,
+            };
+            let fs = &self.index.syms[f];
+            let mut ty = fs.sym.type_ref.clone().unwrap_or_default();
+            if awaited && matches!(clean_type(&ty).as_str(), "Promise" | "Task") {
+                ty = codegraph_core::extract::generic_args(&ty).into_iter().next().unwrap_or_default();
+            }
+            if ty.is_empty() {
+                return TypeOf::Unknown;
+            }
+            let file = fs.file.clone();
+            return match self.index.resolve_type(&ty, &file) {
+                Resolved::One(t, c, _) => TypeOf::Project(t, c, format!("return type of {member}()")),
+                Resolved::None => TypeOf::External,
+                Resolved::Many(_) => TypeOf::Unknown,
+            };
+        }
         let owner = if owner_raw.is_empty() {
             match self.enclosing_type(&r.enclosing) {
                 Some(t) => t,
@@ -818,10 +839,51 @@ impl<'a> FileResolver<'a> {
                                     }
                                 } else if sym.kind.is_type() {
                                     self.call_on_type(r, m, c, format!("static member via {ev}"), None);
+                                } else if matches!(sym.kind, SymbolKind::Variable | SymbolKind::Const) {
+                                    // `import { api } from './api'; api.list()`: a method of the object.
+                                    self.call_on_type(r, m, c, format!("member of imported object '{head}' ({ev})"), None);
                                 }
                             }
                             None => {} // external package: not part of the graph
                         }
+                        return;
+                    }
+                }
+                // A module-level object literal: `const api = { list() {} }; api.list()`.
+                if !recv_l.contains('.') && !recv_l.contains('(') {
+                    if let Resolved::One(v, c, _) = self.index.resolve_value(recv_l, file, &r.enclosing) {
+                        let vs = &self.index.syms[v].sym;
+                        if matches!(vs.kind, SymbolKind::Variable | SymbolKind::Const) && self.index.children.contains_key(&vs.id) {
+                            let ev = format!("method of object '{recv_l}'");
+                            if self.call_on_type(r, v, c, ev, None) {
+                                return;
+                            }
+                        }
+                    }
+                }
+                // Namespace-qualified calls: `Util.Inner.f()`, `Shop.Util.Clamp()`.
+                if recv_l.contains('.') && !recv_l.contains('(') {
+                    let q = format!("{recv_l}.{}", r.name);
+                    let suffix = format!(".{q}");
+                    let family = self.family;
+                    let hits: Vec<usize> = self
+                        .index
+                        .by_name
+                        .get(&r.name)
+                        .map(|v| {
+                            v.iter()
+                                .copied()
+                                .filter(|i| {
+                                    let s = &self.index.syms[*i];
+                                    s.lang.family() == family
+                                        && s.sym.kind.is_callable()
+                                        && (s.sym.qualified_name == q || s.sym.qualified_name.ends_with(&suffix))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if hits.len() == 1 {
+                        self.emit_call(r, hits[0], Confidence::Exact, format!("qualified name {q}"), "call-resolver");
                         return;
                     }
                 }
@@ -1125,6 +1187,22 @@ impl<'a> FileResolver<'a> {
         let found: Option<(usize, Confidence, String)> = match r.receiver.as_deref() {
             None => match self.index.resolve_value(&r.name, file, &r.enclosing) {
                 Resolved::One(t, c, ev) if is_var(self.index, t) => Some((t, c, ev)),
+                // A class / enum / interface used as a value (`providers: [Svc]`,
+                // `x instanceof Foo`, `@UseGuards(JwtGuard)`).
+                Resolved::One(t, c, ev) if r.kind == RefKind::Read && self.index.syms[t].sym.kind.is_type() => {
+                    let e = Edge::new(
+                        &r.enclosing,
+                        file,
+                        Some(self.target(t)),
+                        relation::USES_TYPE,
+                        c,
+                        format!("{} used as a value ({ev})", r.name),
+                        "type-use",
+                        r.line,
+                    );
+                    self.push(e);
+                    None
+                }
                 _ => None,
             },
             Some("this") | Some("self") | Some("cls") => self.enclosing_type(&r.enclosing).and_then(|t| {

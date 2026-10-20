@@ -41,6 +41,56 @@ const BUILTIN_IDENTS: &[&str] = &[
     "false",
 ];
 
+/// Library / language types never worth a USES_TYPE lookup.
+const TS_BUILTIN_TYPES: &[&str] = &[
+    "string",
+    "number",
+    "boolean",
+    "any",
+    "unknown",
+    "never",
+    "void",
+    "object",
+    "bigint",
+    "symbol",
+    "Promise",
+    "Array",
+    "ReadonlyArray",
+    "Record",
+    "Partial",
+    "Readonly",
+    "Required",
+    "Pick",
+    "Omit",
+    "Exclude",
+    "Extract",
+    "NonNullable",
+    "ReturnType",
+    "Parameters",
+    "InstanceType",
+    "Awaited",
+    "Map",
+    "Set",
+    "WeakMap",
+    "WeakSet",
+    "Date",
+    "Error",
+    "Function",
+    "RegExp",
+    "Iterable",
+    "AsyncIterable",
+    "Iterator",
+    "Generator",
+    "JSX",
+    "React",
+    "Element",
+    "HTMLElement",
+    "Event",
+];
+
+/// Component wrappers whose first argument is the component itself.
+const COMPONENT_WRAPPERS: &[&str] = &["memo", "forwardRef", "observer", "styled", "withStyles"];
+
 #[derive(Default)]
 struct State {
     server_file: bool,
@@ -94,15 +144,69 @@ pub(crate) fn extract(ctx: &mut Ctx, root: Node) {
     }
 }
 
-/// Records string literals inside a decorator expression (`@Get(':id')`, `@Controller('x')`).
-fn literal_strings(ctx: &mut Ctx, n: Node) {
-    if let Some(v) = string_like(n, ctx.src) {
-        let t = if n.kind() == "template_string" { "template" } else { "string" };
-        ctx.push_literal(&v, t, n);
-        return;
+/// `<T extends Base, U>` → { T: Some(Base), U: None }.
+fn ts_type_params(ctx: &Ctx, node: Node) -> HashMap<String, Option<String>> {
+    let mut map = HashMap::new();
+    if let Some(tp) = node.child_by_field_name("type_parameters") {
+        for p in named_children(tp).into_iter().filter(|p| p.kind() == "type_parameter") {
+            let Some(n) = p.child_by_field_name("name") else { continue };
+            let bound = p.child_by_field_name("constraint").and_then(|c| c.named_child(0)).map(|t| ctx.text(t).to_string());
+            map.insert(ctx.text(n).to_string(), bound);
+        }
     }
-    for ch in named_children(n) {
-        literal_strings(ctx, ch);
+    map
+}
+
+fn subst_t(map: &HashMap<String, Option<String>>, ty: Option<String>) -> Option<String> {
+    let t = ty?;
+    match map.get(&clean_type(&t)) {
+        Some(bound) => bound.clone(),
+        None => Some(t),
+    }
+}
+
+/// Records every named type inside an annotation as a type use of the current scope.
+fn type_uses(ctx: &mut Ctx, node: Option<Node>) {
+    let Some(node) = node else { return };
+    let mut stack = vec![node];
+    let mut seen: Vec<String> = Vec::new();
+    while let Some(n) = stack.pop() {
+        let name = match n.kind() {
+            "type_identifier" => Some(ctx.text(n).to_string()),
+            "nested_type_identifier" => Some(last_segment(ctx.text(n)).to_string()),
+            _ => None,
+        };
+        match name {
+            Some(t) => {
+                if !TS_BUILTIN_TYPES.contains(&t.as_str()) && !seen.contains(&t) {
+                    ctx.push_ref(RefKind::TypeUse, &t, None, None, None, line_of(n), Some("type annotation".into()));
+                    seen.push(t);
+                }
+            }
+            None => stack.extend(named_children(n)),
+        }
+    }
+}
+
+/// Decorators reference the decorator function and any classes passed to it
+/// (`@UseGuards(JwtGuard)`, `@Inject(TOKEN)`), under the current scope.
+fn walk_decorator(ctx: &mut Ctx, st: &mut State, d: Node) {
+    let Some(expr) = d.named_child(0) else { return };
+    match expr.kind() {
+        "call_expression" => {
+            let f = expr.child_by_field_name("function");
+            let name = f.map(|f| last_segment(ctx.text(f)).to_string()).unwrap_or_default();
+            let args = expr.child_by_field_name("arguments");
+            ctx.push_ref(RefKind::Call, &name, None, None, args.map(count_args), line_of(d), Some("decorator".into()));
+            if let Some(a) = args {
+                walk(ctx, st, a);
+            }
+        }
+        "identifier" => {
+            let name = ctx.text(expr).to_string();
+            ctx.push_ref(RefKind::Call, &name, None, None, Some(0), line_of(d), Some("decorator".into()));
+        }
+        _ => walk(ctx, st, expr),
     }
 }
 
@@ -118,8 +222,11 @@ fn dec_first_string(d: &str) -> Option<String> {
     let open = d.find('(')?;
     let rest = &d[open + 1..];
     let q = rest.find(['"', '\'', '`'])?;
-    // Only when the string is the first argument.
-    if !rest[..q].trim().is_empty() {
+    // Only when the string is the first argument (or the first entry of an array argument,
+    // or the `path` of an options object: `@Get(['a', 'b'])`, `@Controller({ path: 'x' })`).
+    let before = rest[..q].trim();
+    let ok = before.is_empty() || before == "[" || (before.starts_with('{') && before.trim_end_matches(':').trim().ends_with("path"));
+    if !ok {
         return None;
     }
     let quote = rest.as_bytes()[q] as char;
@@ -136,8 +243,8 @@ fn visit_top(ctx: &mut Ctx, st: &mut State, node: Node, exported: bool, is_defau
             let mut default = false;
             for ch in children(node) {
                 if ch.kind() == "decorator" {
+                    // Walked (refs + literals) by `visit_class`, inside the class scope.
                     decs.push(decorator_text(ctx, ch));
-                    literal_strings(ctx, ch);
                 }
                 if ch.kind() == "default" {
                     default = true;
@@ -146,10 +253,21 @@ fn visit_top(ctx: &mut Ctx, st: &mut State, node: Node, exported: bool, is_defau
             if let Some(decl) = node.child_by_field_name("declaration") {
                 visit_top(ctx, st, decl, true, default, decs);
             } else if let Some(src) = node.child_by_field_name("source") {
-                // export { a, b as c } from './x'  /  export * from './x'
+                // export { a, b as c } from './x'  /  export * from './x'  /  export * as ns from './x'
                 let module = string_value(src, ctx.src);
                 let mut any = false;
                 for ch in named_children(node) {
+                    if ch.kind() == "namespace_export" {
+                        let local = named_children(ch).into_iter().find(|c| c.kind() == "identifier").map(|c| ctx.text(c).to_string());
+                        ctx.facts.imports.push(Import {
+                            module: module.clone(),
+                            imported: None,
+                            local,
+                            kind: ImportKind::Namespace,
+                            line: line_of(node),
+                        });
+                        any = true;
+                    }
                     if ch.kind() == "export_clause" {
                         for spec in named_children(ch) {
                             if spec.kind() == "export_specifier" {
@@ -189,20 +307,39 @@ fn visit_top(ctx: &mut Ctx, st: &mut State, node: Node, exported: bool, is_defau
                                 if let Some(n) = spec.child_by_field_name("name") {
                                     let name = ctx.text(n).to_string();
                                     mark_exported(ctx, &name, false);
+                                    // `export { a as b }`: importers ask for `b`.
+                                    if let Some(alias) = spec.child_by_field_name("alias") {
+                                        let alias = ctx.text(alias).to_string();
+                                        export_alias(ctx, &name, &alias);
+                                    }
                                 }
                             }
                         }
-                        "arrow_function" | "function_expression" | "function" | "class" => {
+                        "class" => visit_class(ctx, st, ch, true, true, Vec::new(), None),
+                        "arrow_function" | "function_expression" | "function" => {
                             visit_function_like(ctx, st, "default", ch, ch, true, true, Vec::new());
+                        }
+                        // `export default withRouter(Page)` / `connect(…)(Page)`: the wrapped component.
+                        "call_expression" if default => {
+                            let mut wrapped = Vec::new();
+                            wrapped_components(ctx, ch, &mut wrapped);
+                            for w in wrapped {
+                                mark_exported(ctx, &w, true);
+                            }
+                            walk(ctx, st, ch);
                         }
                         _ => walk(ctx, st, ch),
                     }
                 }
             }
         }
-        "class_declaration" | "abstract_class_declaration" | "class" => visit_class(ctx, st, node, exported, is_default, decorators),
+        "class_declaration" | "abstract_class_declaration" | "class" => visit_class(ctx, st, node, exported, is_default, decorators, None),
         "function_declaration" | "generator_function_declaration" | "function_signature" => {
             let name = node.child_by_field_name("name").map(|n| ctx.text(n).to_string()).unwrap_or_else(|| "default".into());
+            // `function f(a: string): void;` overload signatures belong to the implementation.
+            if node.kind() == "function_signature" && has_implementation(ctx, node, &name) {
+                return;
+            }
             visit_function_like(ctx, st, &name, node, node, exported, is_default, decorators);
         }
         "lexical_declaration" | "variable_declaration" => var_decl_top(ctx, st, node, exported),
@@ -216,7 +353,15 @@ fn visit_top(ctx: &mut Ctx, st: &mut State, node: Node, exported: bool, is_defau
                 s.visibility = vis_for_export(st, exported);
                 s.docstring = doc_comment(node, ctx.src);
                 s.body_hash = token_hash(node, ctx.src);
-                ctx.add_symbol(s);
+                let id = ctx.add_symbol(s);
+                ctx.push_scope(Scope {
+                    symbol_id: id,
+                    kind: Some(SymbolKind::TypeAlias),
+                    qname: ctx.child_qname(&name),
+                    ..Default::default()
+                });
+                type_uses(ctx, node.child_by_field_name("value"));
+                ctx.pop_scope();
             }
         }
         "enum_declaration" => {
@@ -248,22 +393,23 @@ fn visit_top(ctx: &mut Ctx, st: &mut State, node: Node, exported: bool, is_defau
                 ctx.pop_scope();
             }
         }
-        "internal_module" | "module" => {
-            if let Some(body) = node.child_by_field_name("body") {
-                for ch in named_children(body) {
-                    visit_top(ctx, st, ch, exported, false, Vec::new());
-                }
+        "internal_module" | "module" => visit_namespace(ctx, st, node),
+        "expression_statement" => {
+            match node.named_child(0) {
+                // `namespace A.B { … }` parses as an expression statement.
+                Some(m) if m.kind() == "internal_module" => visit_namespace(ctx, st, m),
+                // module.exports = … / exports.x = …
+                Some(a) if a.kind() == "assignment_expression" && commonjs_export(ctx, st, a) => {}
+                _ => walk(ctx, st, node),
             }
         }
-        "expression_statement" => {
-            // module.exports = ... / exports.x = ...
-            walk(ctx, st, node);
-        }
-        "ambient_declaration" => {
+        "ambient_declaration" | "statement_block" => {
+            // `declare global { … }`, `declare module "x" { … }`, `declare function f(): void;`
             for ch in named_children(node) {
                 visit_top(ctx, st, ch, exported, false, Vec::new());
             }
         }
+        "import_alias" => {}
         "comment" => {}
         _ => walk(ctx, st, node),
     }
@@ -275,6 +421,127 @@ fn vis_for_export(st: &State, exported: bool) -> String {
     } else {
         "private".into()
     }
+}
+
+/// `namespace A.B { … }` / `declare module "x" { … }`: members get `A.B.` qualified names.
+fn visit_namespace(ctx: &mut Ctx, st: &mut State, node: Node) {
+    let name = node.child_by_field_name("name").filter(|n| n.kind() != "string").map(|n| ctx.text(n).to_string()).unwrap_or_default();
+    let Some(body) = node.child_by_field_name("body") else { return };
+    let pushed = !name.is_empty();
+    if pushed {
+        let enclosing = ctx.enclosing();
+        ctx.push_scope(Scope { symbol_id: enclosing, qname: ctx.child_qname(&name), ..Default::default() });
+    }
+    for ch in named_children(body) {
+        visit_top(ctx, st, ch, false, false, Vec::new());
+    }
+    if pushed {
+        ctx.pop_scope();
+    }
+}
+
+/// `module.exports = …`, `module.exports.x = …`, `exports.x = …`.
+fn commonjs_export(ctx: &mut Ctx, st: &mut State, assign: Node) -> bool {
+    let (Some(left), Some(right)) = (assign.child_by_field_name("left"), assign.child_by_field_name("right")) else { return false };
+    let lt = ctx.text(left).to_string();
+    let target = if lt == "module.exports" {
+        None
+    } else if let Some(n) = lt.strip_prefix("module.exports.").or_else(|| lt.strip_prefix("exports.")) {
+        Some(n.to_string())
+    } else {
+        return false;
+    };
+    st.has_exports = true;
+    match (target, right.kind()) {
+        (Some(name), _) if is_function_value(right) => visit_function_like(ctx, st, &name, right, assign, true, false, Vec::new()),
+        (Some(name), "class") => visit_class(ctx, st, right, true, false, Vec::new(), Some(&name)),
+        (Some(name), "identifier") => {
+            let local = ctx.text(right).to_string();
+            mark_exported(ctx, &local, false);
+            if local != name {
+                export_alias(ctx, &local, &name);
+            }
+        }
+        (None, "identifier") => {
+            let local = ctx.text(right).to_string();
+            mark_exported(ctx, &local, true);
+        }
+        (None, _) if is_function_value(right) => visit_function_like(ctx, st, "default", right, assign, true, true, Vec::new()),
+        (None, "class") => visit_class(ctx, st, right, true, true, Vec::new(), None),
+        (None, "object") => {
+            for p in named_children(right) {
+                match p.kind() {
+                    "shorthand_property_identifier" => {
+                        let n = ctx.text(p).to_string();
+                        mark_exported(ctx, &n, false);
+                    }
+                    "pair" => {
+                        let key = p.child_by_field_name("key").map(|k| ctx.text(k).trim_matches(['"', '\'']).to_string());
+                        let value = p.child_by_field_name("value");
+                        match (key, value) {
+                            (Some(k), Some(v)) if is_function_value(v) => visit_function_like(ctx, st, &k, v, p, true, false, Vec::new()),
+                            (Some(k), Some(v)) if v.kind() == "identifier" => {
+                                let local = ctx.text(v).to_string();
+                                mark_exported(ctx, &local, false);
+                                if local != k {
+                                    export_alias(ctx, &local, &k);
+                                }
+                            }
+                            (_, Some(v)) => walk(ctx, st, v),
+                            _ => {}
+                        }
+                    }
+                    "method_definition" => visit_method(ctx, st, p, &ClassInfo::default(), Vec::new()),
+                    _ => walk(ctx, st, p),
+                }
+            }
+        }
+        _ => {
+            walk(ctx, st, right);
+        }
+    }
+    true
+}
+
+/// Top-level `name` symbol also exported as `alias` (`export { a as b }`).
+fn export_alias(ctx: &mut Ctx, name: &str, alias: &str) {
+    let module_id = ctx.module_id();
+    for s in ctx.facts.symbols.iter_mut() {
+        if s.name == name && s.parent_id.as_deref() == Some(module_id.as_str()) {
+            let m = format!("export-as:{alias}");
+            if !s.modifiers.contains(&m) {
+                s.modifiers.push(m);
+            }
+        }
+    }
+}
+
+/// Upper-case identifiers passed to (possibly curried) wrapper calls: `withRouter(Page)`.
+fn wrapped_components(ctx: &Ctx, call: Node, out: &mut Vec<String>) {
+    if let Some(f) = call.child_by_field_name("function") {
+        if f.kind() == "call_expression" {
+            wrapped_components(ctx, f, out);
+        }
+    }
+    if let Some(args) = call.child_by_field_name("arguments") {
+        for a in named_children(args) {
+            match a.kind() {
+                "identifier" if is_upper_ident(ctx.text(a)) => out.push(ctx.text(a).to_string()),
+                "call_expression" => wrapped_components(ctx, a, out),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A `function_signature` followed by a declaration of the same function (overloads).
+fn has_implementation(ctx: &Ctx, sig: Node, name: &str) -> bool {
+    let Some(parent) = sig.parent() else { return false };
+    let container = if parent.kind() == "export_statement" { parent.parent().unwrap_or(parent) } else { parent };
+    named_children(container).into_iter().any(|c| {
+        let decl = if c.kind() == "export_statement" { c.child_by_field_name("declaration").unwrap_or(c) } else { c };
+        decl.kind() == "function_declaration" && decl.child_by_field_name("name").map(|n| ctx.text(n) == name).unwrap_or(false)
+    })
 }
 
 fn mark_exported(ctx: &mut Ctx, name: &str, default: bool) {
@@ -291,6 +558,15 @@ fn mark_exported(ctx: &mut Ctx, name: &str, default: bool) {
 }
 
 fn import_stmt(ctx: &mut Ctx, node: Node) {
+    // `import fs = require('./fsx');`
+    if let Some(req) = named_children(node).into_iter().find(|c| c.kind() == "import_require_clause") {
+        let local = named_children(req).into_iter().find(|c| c.kind() == "identifier").map(|c| ctx.text(c).to_string());
+        if let Some(src) = req.child_by_field_name("source") {
+            let module = string_value(src, ctx.src);
+            ctx.facts.imports.push(Import { module, imported: None, local, kind: ImportKind::Namespace, line: line_of(node) });
+        }
+        return;
+    }
     let Some(src) = node.child_by_field_name("source") else { return };
     let module = string_value(src, ctx.src);
     let line = line_of(node);
@@ -338,10 +614,37 @@ fn type_annotation_text(ctx: &Ctx, node: Option<Node>) -> Option<String> {
 }
 
 fn infer_value_type(ctx: &Ctx, value: Node) -> Option<String> {
+    infer_ts_type(ctx, value, false)
+}
+
+/// Static type of an expression from syntax; calls and member accesses become deferred
+/// markers resolved later against the declared return / property types.
+fn infer_ts_type(ctx: &Ctx, value: Node, awaited: bool) -> Option<String> {
     match value.kind() {
         "new_expression" => value.child_by_field_name("constructor").map(|c| ctx.text(c).to_string()),
-        "await_expression" => value.named_child(0).and_then(|v| infer_value_type(ctx, v)),
+        "await_expression" => value.named_child(0).and_then(|v| infer_ts_type(ctx, v, true)),
         "as_expression" | "satisfies_expression" => value.named_child(1).map(|t| ctx.text(t).to_string()),
+        "parenthesized_expression" | "non_null_expression" => value.named_child(0).and_then(|v| infer_ts_type(ctx, v, awaited)),
+        "this" => ctx.class_name(),
+        "identifier" => ctx.var_type(ctx.text(value)),
+        "call_expression" => {
+            let f = value.child_by_field_name("function")?;
+            match f.kind() {
+                // `getSvc()`: a function's declared return type.
+                "identifier" => Some(member_type_marker(Some("@fn"), ctx.text(f), awaited)),
+                "member_expression" => {
+                    let name = f.child_by_field_name("property").map(|p| ctx.text(p).to_string())?;
+                    let owner = infer_ts_type(ctx, f.child_by_field_name("object")?, false)?;
+                    Some(member_type_marker(Some(&owner), &name, awaited))
+                }
+                _ => None,
+            }
+        }
+        "member_expression" => {
+            let name = value.child_by_field_name("property").map(|p| ctx.text(p).to_string())?;
+            let owner = infer_ts_type(ctx, value.child_by_field_name("object")?, false)?;
+            Some(member_type_marker(Some(&owner), &name, awaited))
+        }
         _ => None,
     }
 }
@@ -412,9 +715,19 @@ fn var_decl_top(ctx: &mut Ctx, st: &mut State, node: Node, exported: bool) {
                 visit_function_like(ctx, st, &name, v, node, exported, false, Vec::new());
                 continue;
             }
+            // `const Foo = class { … }` is named by its declarator.
             if v.kind() == "class" {
-                visit_class(ctx, st, v, exported, false, Vec::new());
+                visit_class(ctx, st, v, exported, false, Vec::new(), Some(&name));
                 continue;
+            }
+            // `const Row = memo((props) => …)`: a component, not a plain variable.
+            if v.kind() == "call_expression" {
+                let wrapper = v.child_by_field_name("function").map(|f| last_segment(ctx.text(f)).to_string()).unwrap_or_default();
+                let inner = v.child_by_field_name("arguments").and_then(|a| named_children(a).into_iter().next());
+                if let (true, Some(inner)) = (COMPONENT_WRAPPERS.contains(&wrapper.as_str()), inner.filter(|i| is_function_value(*i))) {
+                    visit_function_like(ctx, st, &name, inner, node, exported, false, vec![format!("{wrapper}(…)")]);
+                    continue;
+                }
             }
         }
         let inferred = ty.clone().or_else(|| value.and_then(|v| infer_value_type(ctx, v)));
@@ -438,10 +751,38 @@ fn var_decl_top(ctx: &mut Ctx, st: &mut State, node: Node, exported: bool) {
         s.docstring = doc_comment(node, ctx.src);
         s.body_hash = token_hash(d, ctx.src);
         let id = ctx.add_symbol(s);
+        ctx.push_scope(Scope { symbol_id: id, qname: ctx.child_qname(&name), ..Default::default() });
+        type_uses(ctx, d.child_by_field_name("type"));
         if let Some(v) = value {
-            ctx.push_scope(Scope { symbol_id: id, qname: ctx.child_qname(&name), ..Default::default() });
-            walk(ctx, st, v);
-            ctx.pop_scope();
+            if v.kind() == "object" {
+                // `export const api = { list() {…}, get: () => … }`: members are methods of `api`.
+                object_members(ctx, st, v);
+            } else {
+                walk(ctx, st, v);
+            }
+        }
+        ctx.pop_scope();
+    }
+}
+
+fn object_members(ctx: &mut Ctx, st: &mut State, obj: Node) {
+    for p in named_children(obj) {
+        match p.kind() {
+            "method_definition" => visit_method(ctx, st, p, &ClassInfo::default(), Vec::new()),
+            "pair" => {
+                let key = p.child_by_field_name("key").filter(|k| k.kind() != "computed_property_name");
+                match (key, p.child_by_field_name("value")) {
+                    (Some(k), Some(v)) if is_function_value(v) => {
+                        let name = string_like(k, ctx.src).unwrap_or_else(|| ctx.text(k).to_string());
+                        visit_function_like(ctx, st, &name, v, p, false, false, Vec::new());
+                        if let Some(last) = ctx.facts.symbols.iter_mut().rev().find(|s| s.name == name && s.kind == SymbolKind::Function) {
+                            last.kind = SymbolKind::Method;
+                        }
+                    }
+                    _ => walk(ctx, st, p),
+                }
+            }
+            _ => walk(ctx, st, p),
         }
     }
 }
@@ -571,6 +912,7 @@ fn visit_function_like(
     let (params, ptext, locals, _) = parse_params(ctx, params_node);
     let ret = type_annotation_text(ctx, func.child_by_field_name("return_type"));
     let is_async = children(func).iter().any(|c| c.kind() == "async");
+    let tparams = ts_type_params(ctx, func);
     let mut s = NewSymbol::new(SymbolKind::Function, name, ctx.child_qname(name), line_of(range), end_line_of(range));
     s.signature = match &ret {
         Some(r) => format!("{name}({ptext}): {r}"),
@@ -605,6 +947,12 @@ fn visit_function_like(
     if let Some((m, p)) = &route {
         s.is_entrypoint = true;
         s.entry_kind = Some(format!("route {m} {p}"));
+    } else if is_default {
+        // Next.js `app/**/page.tsx`, `layout.tsx`, `pages/**`: rendered by the framework.
+        if let Some(p) = nextjs_page(ctx.path) {
+            s.is_entrypoint = true;
+            s.entry_kind = Some(format!("next {p}"));
+        }
     }
     let line = line_of(range);
     let id = ctx.add_symbol(s);
@@ -614,9 +962,12 @@ fn visit_function_like(
     let mut scope =
         Scope { symbol_id: id, kind: Some(SymbolKind::Function), qname: ctx.child_qname(name), is_function: true, ..Default::default() };
     for (n, t) in locals {
-        scope.locals.insert(n, t);
+        scope.locals.insert(n, subst_t(&tparams, t));
     }
+    scope.tparams = tparams;
     ctx.push_scope(scope);
+    type_uses(ctx, params_node);
+    type_uses(ctx, func.child_by_field_name("return_type"));
     if let Some(p) = params_node {
         walk_param_defaults(ctx, st, p);
     }
@@ -639,29 +990,75 @@ fn walk_param_defaults(ctx: &mut Ctx, st: &mut State, params: Node) {
     }
 }
 
+/// Path segments after the Next.js `app` / `pages` directory: the directory must sit at the
+/// project root or right under `src/` (so `frontend-app/src/app/…` is the app router, while an
+/// unrelated `…/app/…` folder deeper in the tree is not).
+fn nextjs_tail<'p>(segs: &[&'p str], dir: &str) -> Option<Vec<&'p str>> {
+    let idx = segs.iter().enumerate().rev().find(|(i, s)| **s == dir && (*i == 0 || segs[*i - 1] == "src" || *i <= 2)).map(|(i, _)| i)?;
+    Some(segs[idx + 1..].to_vec())
+}
+
+fn route_of(dirs: &[&str]) -> String {
+    let segs: Vec<&str> = dirs.iter().copied().filter(|s| !s.is_empty() && !(s.starts_with('(') && s.ends_with(')'))).collect();
+    format!("/{}", segs.join("/"))
+}
+
 /// Route path for Next.js `app/**/route.ts` and `pages/api/**` files.
 fn nextjs_route(path: &str) -> Option<String> {
     let p = path.replace('\\', "/");
-    if let Some(idx) = p.find("app/") {
-        let rest = &p[idx + 4..];
-        let file = rest.rsplit('/').next()?;
+    let segs: Vec<&str> = p.split('/').collect();
+    if let Some(tail) = nextjs_tail(&segs, "app") {
+        let (file, dirs) = tail.split_last()?;
         if file.starts_with("route.") {
-            let dir = rest.trim_end_matches(file).trim_end_matches('/');
-            let segs: Vec<&str> = dir.split('/').filter(|s| !s.is_empty() && !(s.starts_with('(') && s.ends_with(')'))).collect();
-            return Some(format!("/{}", segs.join("/")));
+            return Some(route_of(dirs));
         }
     }
-    if let Some(idx) = p.find("pages/api/") {
-        let rest = &p[idx + 6..];
-        let no_ext = rest.rsplit_once('.').map(|(a, _)| a).unwrap_or(rest);
-        let no_index = no_ext.trim_end_matches("/index");
-        return Some(format!("/{no_index}"));
+    if let Some(tail) = nextjs_tail(&segs, "pages") {
+        if tail.first() == Some(&"api") {
+            let joined = tail.join("/");
+            let no_ext = joined.rsplit_once('.').map(|(a, _)| a).unwrap_or(&joined).to_string();
+            let no_index = no_ext.trim_end_matches("/index").to_string();
+            return Some(format!("/{no_index}"));
+        }
     }
     None
 }
 
-fn visit_class(ctx: &mut Ctx, st: &mut State, node: Node, exported: bool, is_default: bool, decorators: Vec<String>) {
-    let name = node.child_by_field_name("name").map(|n| ctx.text(n).to_string()).unwrap_or_else(|| "default".into());
+/// Next.js pages / layouts rendered by the framework (`app/**/page.tsx`, `pages/**`).
+fn nextjs_page(path: &str) -> Option<String> {
+    let p = path.replace('\\', "/");
+    let segs: Vec<&str> = p.split('/').collect();
+    if let Some(tail) = nextjs_tail(&segs, "app") {
+        let (file, dirs) = tail.split_last()?;
+        let stem = file.split('.').next().unwrap_or("");
+        if matches!(stem, "page" | "layout" | "template" | "loading" | "error" | "not-found" | "default") {
+            return Some(format!("{stem} {}", route_of(dirs)));
+        }
+    }
+    if let Some(tail) = nextjs_tail(&segs, "pages") {
+        if tail.first() != Some(&"api") && !tail.is_empty() {
+            let joined = tail.join("/");
+            let no_ext = joined.rsplit_once('.').map(|(a, _)| a).unwrap_or(&joined).to_string();
+            return Some(format!("page /{}", no_ext.trim_end_matches("index").trim_end_matches('/')));
+        }
+    }
+    None
+}
+
+fn visit_class(
+    ctx: &mut Ctx,
+    st: &mut State,
+    node: Node,
+    exported: bool,
+    is_default: bool,
+    decorators: Vec<String>,
+    name_hint: Option<&str>,
+) {
+    let name = node
+        .child_by_field_name("name")
+        .map(|n| ctx.text(n).to_string())
+        .or_else(|| name_hint.map(|s| s.to_string()))
+        .unwrap_or_else(|| "default".into());
     let mut bases = Vec::new();
     let mut heritage_text = String::new();
     for ch in named_children(node) {
@@ -682,11 +1079,16 @@ fn visit_class(ctx: &mut Ctx, st: &mut State, node: Node, exported: bool, is_def
         }
     }
     let mut decorators = decorators;
+    let mut decorator_nodes: Vec<Node> = Vec::new();
     for ch in children(node) {
         if ch.kind() == "decorator" {
             decorators.push(decorator_text(ctx, ch));
-            literal_strings(ctx, ch);
+            decorator_nodes.push(ch);
         }
+    }
+    // `@Injectable() export class X` puts the decorators on the export statement.
+    if let Some(p) = node.parent().filter(|p| p.kind() == "export_statement") {
+        decorator_nodes.extend(children(p).into_iter().filter(|c| c.kind() == "decorator"));
     }
     let is_abstract = node.kind() == "abstract_class_declaration";
     let mut s = NewSymbol::new(SymbolKind::Class, &name, ctx.child_qname(&name), line_of(node), end_line_of(node));
@@ -734,7 +1136,7 @@ fn visit_class(ctx: &mut Ctx, st: &mut State, node: Node, exported: bool, is_def
                     if let Some(n) = n {
                         let ty = type_annotation_text(ctx, m.child_by_field_name("type"))
                             .or_else(|| m.child_by_field_name("value").and_then(|v| infer_value_type(ctx, v)));
-                        fields.insert(ctx.text(n).trim_start_matches('#').to_string(), ty);
+                        fields.insert(ctx.text(n).to_string(), ty);
                     }
                 }
                 "method_definition" => {
@@ -751,7 +1153,32 @@ fn visit_class(ctx: &mut Ctx, st: &mut State, node: Node, exported: bool, is_def
         }
     }
     let qname = ctx.child_qname(&name);
+    // Constructor parameter properties (`constructor(private users: UsersService)`) are fields.
+    let mut param_props: Vec<(String, Option<String>, Node)> = Vec::new();
+    if let Some(body) = body {
+        for m in named_children(body).into_iter().filter(|m| m.kind() == "method_definition") {
+            if m.child_by_field_name("name").map(|n| ctx.text(n)) == Some("constructor") {
+                let (_, _, _, props) = parse_params(ctx, m.child_by_field_name("parameters"));
+                param_props.extend(props.into_iter().map(|(n, t)| (n, t, m)));
+            }
+        }
+    }
     ctx.push_scope(Scope { symbol_id: id.clone(), kind: Some(SymbolKind::Class), qname, fields, ..Default::default() });
+    for d in decorator_nodes {
+        walk_decorator(ctx, st, d);
+    }
+    for (pname, ty, ctor) in param_props {
+        let mut f = NewSymbol::new(SymbolKind::Field, &pname, ctx.child_qname(&pname), line_of(ctor), line_of(ctor));
+        f.signature = match &ty {
+            Some(t) => format!("{pname}: {t}"),
+            None => pname.clone(),
+        };
+        f.type_ref = ty;
+        f.visibility = "private".into();
+        f.modifiers.push("parameter-property".into());
+        f.body_hash = token_hash(ctor, ctx.src);
+        ctx.add_symbol(f);
+    }
     if let Some(d) = &catch_dec {
         let inner = d.trim_start_matches("Catch").trim().trim_start_matches('(').trim_end_matches(')');
         let types: Vec<String> = inner.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
@@ -766,15 +1193,34 @@ fn visit_class(ctx: &mut Ctx, st: &mut State, node: Node, exported: bool, is_def
     let info = ClassInfo { name: name.clone(), route_prefix: route_prefix.clone(), is_controller: route_prefix.is_some() };
     if let Some(body) = body {
         let mut pending: Vec<String> = Vec::new();
+        // Overload signatures (`m(a: string): void;`) are attached to their implementation.
+        let implemented: Vec<String> =
+            named_children(body).into_iter().filter(|m| m.kind() == "method_definition").map(|m| member_name(ctx, m)).collect();
+        let mut overloads: HashMap<String, u32> = HashMap::new();
+        for m in named_children(body) {
+            if m.kind() == "method_signature" {
+                let n = member_name(ctx, m);
+                if implemented.contains(&n) {
+                    *overloads.entry(n).or_default() += 1;
+                }
+            }
+        }
         for m in named_children(body) {
             match m.kind() {
                 "decorator" => {
                     pending.push(decorator_text(ctx, m));
-                    literal_strings(ctx, m);
+                    walk_decorator(ctx, st, m);
                 }
+                "method_signature" if implemented.contains(&member_name(ctx, m)) => pending.clear(),
                 "method_definition" | "method_signature" | "abstract_method_signature" => {
                     let decs = std::mem::take(&mut pending);
+                    let before = ctx.facts.symbols.len();
                     visit_method(ctx, st, m, &info, decs);
+                    if let Some(n) = overloads.get(&member_name(ctx, m)).filter(|_| m.kind() == "method_definition") {
+                        if let Some(s) = ctx.facts.symbols.get_mut(before) {
+                            s.modifiers.push(format!("overloads:{n}"));
+                        }
+                    }
                 }
                 "public_field_definition" | "field_definition" => {
                     let decs = std::mem::take(&mut pending);
@@ -887,11 +1333,37 @@ fn visit_method(ctx: &mut Ctx, st: &mut State, m: Node, cls: &ClassInfo, decorat
     let is_async = toks.iter().any(|t| t == "async");
     let accessor = toks.iter().find(|t| *t == "get" || *t == "set").cloned();
     let access = toks.iter().find(|t| matches!(t.as_str(), "private" | "protected" | "public")).cloned();
-    let is_abstract = m.kind() != "method_definition" || toks.iter().any(|t| t == "abstract");
-    let kind = if name == "constructor" { SymbolKind::Constructor } else { SymbolKind::Method };
+    // Only `abstract` members (and interface-like signatures without body) are abstract.
+    let is_abstract = m.kind() == "abstract_method_signature" || toks.iter().any(|t| t == "abstract");
+    let kind = if name == "constructor" {
+        SymbolKind::Constructor
+    } else if accessor.is_some() {
+        SymbolKind::Property
+    } else {
+        SymbolKind::Method
+    };
     let params_node = m.child_by_field_name("parameters");
     let (params, ptext, locals, _) = parse_params(ctx, params_node);
     let ret = type_annotation_text(ctx, m.child_by_field_name("return_type"));
+    let tparams = ts_type_params(ctx, m);
+    // `get total()` / `set total(v)` are one property: the second accessor reuses it.
+    if kind == SymbolKind::Property {
+        let q = ctx.child_qname(&name);
+        if let Some(existing) =
+            ctx.facts.symbols.iter().rev().find(|s| s.kind == SymbolKind::Property && s.qualified_name == q).map(|s| s.id.clone())
+        {
+            let mut scope = Scope { symbol_id: existing, kind: Some(kind), qname: q, is_function: true, ..Default::default() };
+            for (n, t) in locals {
+                scope.locals.insert(n, subst_t(&tparams, t));
+            }
+            ctx.push_scope(scope);
+            if let Some(b) = m.child_by_field_name("body") {
+                walk(ctx, st, b);
+            }
+            ctx.pop_scope();
+            return;
+        }
+    }
     let mut s = NewSymbol::new(kind, &name, ctx.child_qname(&name), line_of(m), end_line_of(m));
     let prefix = match (&accessor, is_async, is_static) {
         (Some(a), _, _) => format!("{a} "),
@@ -910,7 +1382,9 @@ fn visit_method(ctx: &mut Ctx, st: &mut State, m: Node, cls: &ClassInfo, decorat
     s.is_abstract = is_abstract;
     s.is_exported = s.visibility == "public";
     s.type_ref = ret;
-    s.params = Some(params);
+    if kind != SymbolKind::Property {
+        s.params = Some(params);
+    }
     s.docstring = doc_comment(m, ctx.src);
     s.complexity = cyclomatic(m, ctx.src, ctx.lang);
     s.body_hash = token_hash(m, ctx.src);
@@ -944,10 +1418,13 @@ fn visit_method(ctx: &mut Ctx, st: &mut State, m: Node, cls: &ClassInfo, decorat
     }
     let mut scope = Scope { symbol_id: id, kind: Some(kind), qname: ctx.child_qname(&name), is_function: true, ..Default::default() };
     for (n, t) in locals {
-        scope.locals.insert(n, t);
+        scope.locals.insert(n, subst_t(&tparams, t));
     }
+    scope.tparams = tparams;
     ctx.push_scope(scope);
     let _ = &cls.name;
+    type_uses(ctx, params_node);
+    type_uses(ctx, m.child_by_field_name("return_type"));
     if let Some(p) = params_node {
         walk_param_defaults(ctx, st, p);
     }
@@ -960,6 +1437,12 @@ fn visit_method(ctx: &mut Ctx, st: &mut State, m: Node, cls: &ClassInfo, decorat
 fn visit_field(ctx: &mut Ctx, st: &mut State, m: Node, decorators: Vec<String>) {
     let Some(n) = m.child_by_field_name("name").or_else(|| m.child_by_field_name("property")) else { return };
     let name = ctx.text(n).to_string();
+    // Field decorators (`@Column() id`, `@ManyToOne(() => User) user`) are children of the field.
+    let mut decorators = decorators;
+    let decorator_nodes: Vec<Node> = children(m).into_iter().filter(|c| c.kind() == "decorator").collect();
+    for d in &decorator_nodes {
+        decorators.push(decorator_text(ctx, *d));
+    }
     let toks: Vec<String> =
         children(m).iter().filter(|c| !c.is_named() || c.kind() == "accessibility_modifier").map(|c| ctx.text(*c).to_string()).collect();
     let access = toks.iter().find(|t| matches!(t.as_str(), "private" | "protected" | "public")).cloned();
@@ -970,11 +1453,12 @@ fn visit_field(ctx: &mut Ctx, st: &mut State, m: Node, decorators: Vec<String>) 
         if is_function_value(v) {
             // Arrow-function class properties behave like methods.
             let id_name = name.clone();
+            let before = ctx.facts.symbols.len();
             visit_function_like(ctx, st, &id_name, v, m, true, false, decorators);
-            if let Some(last) = ctx.facts.symbols.last_mut() {
-                last.kind = SymbolKind::Method;
+            if let Some(field_fn) = ctx.facts.symbols.get_mut(before) {
+                field_fn.kind = SymbolKind::Method;
                 if name.starts_with('#') || access.as_deref() == Some("private") {
-                    last.visibility = "private".into();
+                    field_fn.visibility = "private".into();
                 }
             }
             return;
@@ -992,11 +1476,15 @@ fn visit_field(ctx: &mut Ctx, st: &mut State, m: Node, decorators: Vec<String>) 
     s.attrs = decorators;
     s.body_hash = token_hash(m, ctx.src);
     let id = ctx.add_symbol(s);
-    if let Some(v) = value {
-        ctx.push_scope(Scope { symbol_id: id, qname: ctx.child_qname(&name), ..Default::default() });
-        walk(ctx, st, v);
-        ctx.pop_scope();
+    ctx.push_scope(Scope { symbol_id: id, qname: ctx.child_qname(&name), ..Default::default() });
+    for d in decorator_nodes {
+        walk_decorator(ctx, st, d);
     }
+    type_uses(ctx, m.child_by_field_name("type"));
+    if let Some(v) = value {
+        walk(ctx, st, v);
+    }
+    ctx.pop_scope();
 }
 
 fn visit_interface(ctx: &mut Ctx, node: Node, exported: bool) {
@@ -1040,6 +1528,8 @@ fn visit_interface(ctx: &mut Ctx, node: Node, exported: bool) {
                     ms.is_abstract = true;
                     ms.body_hash = token_hash(m, ctx.src);
                     ctx.add_symbol(ms);
+                    type_uses(ctx, m.child_by_field_name("parameters"));
+                    type_uses(ctx, m.child_by_field_name("return_type"));
                 }
                 "property_signature" => {
                     let ty = type_annotation_text(ctx, m.child_by_field_name("type"));
@@ -1048,6 +1538,7 @@ fn visit_interface(ctx: &mut Ctx, node: Node, exported: bool) {
                     ps.type_ref = ty;
                     ps.body_hash = token_hash(m, ctx.src);
                     ctx.add_symbol(ps);
+                    type_uses(ctx, m.child_by_field_name("type"));
                 }
                 _ => {}
             }
@@ -1073,10 +1564,16 @@ fn walk(ctx: &mut Ctx, st: &mut State, node: Node) {
                 }
                 let value = d.child_by_field_name("value");
                 if let Some(n) = d.child_by_field_name("name") {
+                    // `const db = require('./db')` inside a function is still an import.
+                    if let Some(module) = value.and_then(|v| require_module(ctx, v)) {
+                        let local = (n.kind() == "identifier").then(|| ctx.text(n).to_string());
+                        ctx.facts.imports.push(Import { module, imported: None, local, kind: ImportKind::Namespace, line: line_of(d) });
+                    }
                     if n.kind() == "identifier" {
                         let name = ctx.text(n).to_string();
                         let ty = type_annotation_text(ctx, d.child_by_field_name("type"))
                             .or_else(|| value.and_then(|v| infer_value_type(ctx, v)));
+                        let ty = ctx.subst_tparam(ty);
                         ctx.declare_local(&name, ty);
                     } else {
                         declare_pattern(ctx, n);
@@ -1099,7 +1596,7 @@ fn walk(ctx: &mut Ctx, st: &mut State, node: Node) {
             if ctx.in_function() {
                 walk_children(ctx, st, node);
             } else {
-                visit_class(ctx, st, node, false, false, Vec::new());
+                visit_class(ctx, st, node, false, false, Vec::new(), None);
             }
         }
         "call_expression" => call(ctx, st, node),
@@ -1272,7 +1769,7 @@ fn walk(ctx: &mut Ctx, st: &mut State, node: Node) {
         | "interface_declaration"
         | "type_alias_declaration"
         | "statement_identifier" => {}
-        "decorator" => {}
+        "decorator" => walk_decorator(ctx, st, node),
         _ => walk_children(ctx, st, node),
     }
 }
@@ -1349,8 +1846,15 @@ fn member_expr(ctx: &mut Ctx, st: &mut State, node: Node) {
     }
     if obj.kind() == "this" {
         let cls = ctx.class_name();
-        ctx.push_ref(RefKind::Read, prop.trim_start_matches('#'), Some("this".into()), cls, None, line_of(node), None);
+        ctx.push_ref(RefKind::Read, &prop, Some("this".into()), cls, None, line_of(node), None);
         return;
+    }
+    // `order.total`, `Status.Active`, `Config.MAX`: a member read on a receiver.
+    if !prop.is_empty() && !matches!(obj.kind(), "call_expression" | "super") {
+        let (rtext, rtype) = receiver_info(ctx, obj);
+        if !BUILTIN_IDENTS.contains(&rtext.as_str()) {
+            ctx.push_ref(RefKind::Read, &prop, Some(rtext), rtype, None, line_of(node), None);
+        }
     }
     walk(ctx, st, obj);
 }
@@ -1364,12 +1868,12 @@ fn receiver_info(ctx: &Ctx, r: Node) -> (String, Option<String>) {
             let o = r.child_by_field_name("object");
             let p = r.child_by_field_name("property").map(|p| ctx.text(p).to_string());
             match (o, p) {
-                (Some(o), Some(p)) if o.kind() == "this" => ctx.field_type(p.trim_start_matches('#')),
-                _ => None,
+                (Some(o), Some(p)) if o.kind() == "this" => ctx.field_type(&p),
+                _ => infer_value_type(ctx, r),
             }
         }
         "new_expression" => r.child_by_field_name("constructor").map(|c| ctx.text(c).to_string()),
-        _ => None,
+        _ => infer_value_type(ctx, r),
     };
     (text, ty)
 }
@@ -1392,7 +1896,6 @@ fn write_target(ctx: &mut Ctx, st: &mut State, left: Node) {
         "member_expression" => {
             let obj = left.child_by_field_name("object");
             let prop = left.child_by_field_name("property").map(|p| ctx.text(p).to_string()).unwrap_or_default();
-            let prop = prop.trim_start_matches('#').to_string();
             match obj {
                 Some(o) if o.kind() == "this" => {
                     let cls = ctx.class_name();
@@ -1442,6 +1945,31 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
     let argc = args.map(count_args);
     let line = line_of(node);
     let type_args = node.child_by_field_name("type_arguments").map(|t| ctx.text(t).to_string());
+    // `it.each(rows)('adds %i', fn)` / `describe.each(table)(…)`.
+    if func.kind() == "call_expression" {
+        if let Some(base) = each_test_base(ctx, func) {
+            let arg_list: Vec<Node> = args.map(named_children).unwrap_or_default();
+            if test_block(ctx, st, node, &base, &arg_list) {
+                walk(ctx, st, func);
+                return;
+            }
+        }
+    }
+    // `super(…)`: the base class constructor.
+    if func.kind() == "super" {
+        ctx.push_ref(RefKind::Call, "constructor", Some("super".into()), None, argc, line, None);
+        if let Some(a) = args {
+            walk(ctx, st, a);
+        }
+        return;
+    }
+    // Calling a local (parameter, local arrow function) is not a call to a declared symbol.
+    if func.kind() == "identifier" && ctx.is_local(ctx.text(func)) {
+        if let Some(a) = args {
+            walk(ctx, st, a);
+        }
+        return;
+    }
     let (name, recv_node) = match func.kind() {
         "identifier" => (ctx.text(func).to_string(), None),
         "member_expression" => {
@@ -1449,8 +1977,9 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
         }
         "import" => {
             // dynamic import("./x")
+            // Lazy loading binds no names (never a re-export of the target's members).
             if let Some((m, _)) = args.and_then(|a| first_string_arg(a, ctx.src)) {
-                ctx.facts.imports.push(Import { module: m, imported: None, local: None, kind: ImportKind::Namespace, line });
+                ctx.facts.imports.push(Import { module: m, imported: None, local: None, kind: ImportKind::SideEffect, line });
             }
             return;
         }
@@ -1473,35 +2002,9 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
 
     // ---- Test blocks: describe("x", () => {...}) / it("y", ...) ----
     if receiver.is_none() || receiver.as_deref().map(|r| TEST_FNS.contains(&r)).unwrap_or(false) {
-        let base = if receiver.is_none() { name.as_str() } else { receiver.as_deref().unwrap() };
-        if TEST_FNS.contains(&base) && arg_list.len() >= 2 {
-            let label = string_like(arg_list[0], ctx.src);
-            let cb = arg_list.iter().rev().find(|a| is_function_value(**a)).copied();
-            if let (Some(label), Some(cb)) = (label, cb) {
-                let mut s = NewSymbol::new(SymbolKind::Test, &label, ctx.child_qname(&truncate(&label, 60)), line, end_line_of(node));
-                s.signature = format!("{base}(\"{}\")", truncate(&label, 80));
-                s.is_test = true;
-                s.complexity = cyclomatic(cb, ctx.src, ctx.lang);
-                s.body_hash = token_hash(node, ctx.src);
-                let id = ctx.add_symbol(s);
-                ctx.push_literal(&label, "string", arg_list[0]);
-                ctx.push_scope(Scope {
-                    symbol_id: id,
-                    kind: Some(SymbolKind::Test),
-                    qname: ctx.child_qname(&truncate(&label, 60)),
-                    is_function: true,
-                    ..Default::default()
-                });
-                let (_, _, locals, _) = parse_params(ctx, cb.child_by_field_name("parameters"));
-                for (n, t) in locals {
-                    ctx.declare_local(&n, t);
-                }
-                if let Some(b) = cb.child_by_field_name("body") {
-                    walk(ctx, st, b);
-                }
-                ctx.pop_scope();
-                return;
-            }
+        let base = if receiver.is_none() { name.clone() } else { receiver.clone().unwrap() };
+        if TEST_FNS.contains(&base.as_str()) && test_block(ctx, st, node, &base, &arg_list) {
+            return;
         }
     }
 
@@ -1513,15 +2016,25 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
     // ---- Server routes (express-like) ----
     let lname = name.to_ascii_lowercase();
     let is_route_verb = HTTP_VERBS.contains(&lname.as_str()) || lname == "all";
+    // `router.route('/x').get(h)`: the path comes from the `route()` call.
+    let chained_path = recv_node.filter(|r| r.kind() == "call_expression").and_then(|r| {
+        let f = r.child_by_field_name("function")?;
+        let prop = f.child_by_field_name("property").map(|p| ctx.text(p))?;
+        (prop == "route").then(|| r.child_by_field_name("arguments").and_then(|a| first_string_arg(a, ctx.src)).map(|(s, _)| s))?
+    });
     let routerish = recv_last == "app"
         || recv_last == "router"
         || recv_last == "server"
+        || recv_last == "fastify"
         || recv_last.ends_with("router")
         || recv_last == "routes"
-        || recv_last == "api" && st.server_file;
+        || recv_last == "api" && st.server_file
+        || chained_path.is_some();
+    let min_args = if chained_path.is_some() { 1 } else { 2 };
     let mut is_server_route = false;
-    if st.server_file && is_route_verb && routerish && arg_list.len() >= 2 {
-        if let Some(path) = first_str.clone().filter(|p| p.starts_with('/') || p == "*") {
+    if st.server_file && is_route_verb && routerish && arg_list.len() >= min_args {
+        let path = chained_path.clone().or_else(|| first_str.clone());
+        if let Some(path) = path.filter(|p| p.starts_with('/') || p == "*") {
             is_server_route = true;
             let method = if lname == "all" { "ANY".to_string() } else { lname.to_ascii_uppercase() };
             let handler = *arg_list.last().unwrap();
@@ -1682,6 +2195,58 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
             walk(ctx, st, a);
         }
     }
+}
+
+/// `X.each(table)` where X is a test function: returns X.
+fn each_test_base(ctx: &Ctx, inner: Node) -> Option<String> {
+    let f = inner.child_by_field_name("function")?;
+    if f.kind() != "member_expression" {
+        return None;
+    }
+    let prop = f.child_by_field_name("property").map(|p| ctx.text(p))?;
+    let obj = f.child_by_field_name("object").map(|o| ctx.text(o).to_string())?;
+    let base = obj.split('.').next().unwrap_or(&obj).to_string();
+    (prop == "each" && TEST_FNS.contains(&base.as_str())).then_some(base)
+}
+
+/// `describe("label", () => …)` / `it(Service.name, async () => …)`: a Test symbol.
+fn test_block(ctx: &mut Ctx, st: &mut State, node: Node, base: &str, arg_list: &[Node]) -> bool {
+    if arg_list.len() < 2 {
+        return false;
+    }
+    let Some(cb) = arg_list.iter().rev().find(|a| is_function_value(**a)).copied() else { return false };
+    let label = string_like(arg_list[0], ctx.src).unwrap_or_else(|| collapse_ws(ctx.text(arg_list[0])));
+    if label.is_empty() {
+        return false;
+    }
+    let line = line_of(node);
+    let mut s = NewSymbol::new(SymbolKind::Test, &label, ctx.child_qname(&truncate(&label, 60)), line, end_line_of(node));
+    s.signature = format!("{base}(\"{}\")", truncate(&label, 80));
+    s.is_test = true;
+    s.complexity = cyclomatic(cb, ctx.src, ctx.lang);
+    s.body_hash = token_hash(node, ctx.src);
+    let id = ctx.add_symbol(s);
+    if string_like(arg_list[0], ctx.src).is_some() {
+        ctx.push_literal(&label, "string", arg_list[0]);
+    } else {
+        walk(ctx, st, arg_list[0]);
+    }
+    ctx.push_scope(Scope {
+        symbol_id: id,
+        kind: Some(SymbolKind::Test),
+        qname: ctx.child_qname(&truncate(&label, 60)),
+        is_function: true,
+        ..Default::default()
+    });
+    let (_, _, locals, _) = parse_params(ctx, cb.child_by_field_name("parameters").or_else(|| cb.child_by_field_name("parameter")));
+    for (n, t) in locals {
+        ctx.declare_local(&n, t);
+    }
+    if let Some(b) = cb.child_by_field_name("body") {
+        walk(ctx, st, b);
+    }
+    ctx.pop_scope();
+    true
 }
 
 fn looks_like_url(u: &str) -> bool {

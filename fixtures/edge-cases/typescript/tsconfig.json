@@ -1,0 +1,10 @@
+{
+  // Comments and trailing commas are valid in tsconfig files.
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@app/*": ["src/app/*"],
+      "@shared": ["libs/shared/index.ts"],
+    },
+  },
+}

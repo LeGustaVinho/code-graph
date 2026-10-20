@@ -324,6 +324,9 @@ pub struct FileFacts {
     pub global_handlers: Vec<GlobalHandler>,
     /// Project-wide route prefixes declared in this file (e.g. NestJS `setGlobalPrefix`).
     pub route_prefixes: Vec<String>,
+    /// Syntax error / missing nodes Tree-sitter recovered from (0 = clean parse).
+    #[serde(default)]
+    pub syntax_errors: u32,
 }
 
 impl FileFacts {

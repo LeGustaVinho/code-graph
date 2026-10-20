@@ -28,6 +28,9 @@ pub struct IndexStats {
     pub files_unchanged: usize,
     pub files_removed: usize,
     pub parse_errors: usize,
+    /// Files that parsed with syntax errors (Tree-sitter recovered; facts may be partial).
+    #[serde(default)]
+    pub syntax_errors: usize,
     pub affected_files: usize,
     pub full_resolution: bool,
     pub nodes: i64,
@@ -192,16 +195,19 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
         }
     }
     stats.files_unchanged += touched.len();
-    let parsed: Vec<Parsed> = to_parse
-        .into_par_iter()
-        .map(|(f, hash, bytes)| {
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            let rel = f.rel_path.clone();
-            let lang = f.language;
-            let facts = catch_unwind(AssertUnwindSafe(|| extract_file(&rel, lang, &text))).map_err(|_| "extractor panicked".to_string());
-            Parsed { file: f, hash, facts }
-        })
-        .collect();
+    let parsed: Vec<Parsed> = extraction_pool().install(|| {
+        to_parse
+            .into_par_iter()
+            .map(|(f, hash, bytes)| {
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let rel = f.rel_path.clone();
+                let lang = f.language;
+                let facts =
+                    catch_unwind(AssertUnwindSafe(|| extract_file(&rel, lang, &text))).map_err(|_| "extractor panicked".to_string());
+                Parsed { file: f, hash, facts }
+            })
+            .collect()
+    });
     stats.files_parsed = parsed.len();
     stats.parsed_paths = parsed.iter().map(|p| p.file.rel_path.clone()).collect();
 
@@ -237,6 +243,9 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
     for p in &parsed {
         match &p.facts {
             Ok(facts) => {
+                if facts.syntax_errors > 0 {
+                    stats.syntax_errors += 1;
+                }
                 store::insert_file_facts(&tx, facts, &p.hash, p.file.mtime, p.file.size, now)?;
                 new_names.extend(facts.symbols.iter().map(|s| s.name.clone()));
                 has_di |= !facts.di.is_empty();
@@ -276,7 +285,11 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
     tracing::debug!("cascade: {} ms ({} affected)", tp.elapsed().as_millis(), affected.len());
     // 5. Semantic resolution of affected files.
     let tp = Instant::now();
-    let index = load_index(&tx)?;
+    let mut index = load_index(&tx)?;
+    if !index.js_paths.is_empty() {
+        // tsconfig `paths` / `baseUrl` and workspace packages drive JS/TS module resolution.
+        index.js = codegraph_semantic::jsconfig::load(root);
+    }
     tracing::debug!("load_index: {} ms", tp.elapsed().as_millis());
     let tp = Instant::now();
     let mut facts: Vec<(String, StoredFacts)> = Vec::new();
@@ -304,6 +317,16 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
     tracing::debug!("commit: {} ms", tp.elapsed().as_millis());
     finish_stats(conn, &mut stats, t0)?;
     Ok(stats)
+}
+
+/// Extraction runs on a dedicated pool with large stacks: extractors recurse over the
+/// syntax tree, and generated / minified sources nest deeply (a stack overflow aborts the
+/// process; `catch_unwind` cannot stop it).
+fn extraction_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new().stack_size(64 << 20).thread_name(|i| format!("extract-{i}")).build().expect("thread pool")
+    })
 }
 
 fn finish_stats(conn: &Connection, stats: &mut IndexStats, t0: Instant) -> Result<()> {

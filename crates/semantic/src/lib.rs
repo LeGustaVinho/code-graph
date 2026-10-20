@@ -15,6 +15,7 @@
 pub mod arch;
 pub mod global;
 pub mod index;
+pub mod jsconfig;
 pub mod models;
 pub mod resolve;
 

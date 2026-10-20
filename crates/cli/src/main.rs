@@ -125,8 +125,13 @@ fn main() -> Result<()> {
                 let g = codegraph_graph::query::stats(&conn)?;
                 println!("Indexed {} in {} ms", root.display(), stats.duration_ms);
                 println!(
-                    "  files: {} total, {} parsed, {} unchanged, {} removed, {} errors",
-                    stats.files_total, stats.files_parsed, stats.files_unchanged, stats.files_removed, stats.parse_errors
+                    "  files: {} total, {} parsed, {} unchanged, {} removed, {} errors, {} with syntax errors",
+                    stats.files_total,
+                    stats.files_parsed,
+                    stats.files_unchanged,
+                    stats.files_removed,
+                    stats.parse_errors,
+                    stats.syntax_errors
                 );
                 println!(
                     "  graph: {} nodes, {} edges (exact {}, inferred {}, unresolved {})",

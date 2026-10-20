@@ -51,7 +51,7 @@ impl Language {
         match ext.as_str() {
             "cs" => Some(Language::CSharp),
             "ts" | "mts" | "cts" => {
-                if name.ends_with(".d.ts") {
+                if name.ends_with(".d.ts") || name.ends_with(".d.mts") || name.ends_with(".d.cts") {
                     None
                 } else {
                     Some(Language::TypeScript)
