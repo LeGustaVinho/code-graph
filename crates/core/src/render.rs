@@ -24,7 +24,7 @@ fn is_public(s: &Symbol) -> bool {
 
 fn skeleton_line(s: &Symbol, lang: Language) -> String {
     match s.kind {
-        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::DataModel => {
+        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::DataModel | SymbolKind::Impl => {
             if lang == Language::Python {
                 format!("{}:", s.signature)
             } else {
@@ -99,6 +99,7 @@ pub fn kind_abbrev(kind: SymbolKind) -> &'static str {
         SymbolKind::Struct => "struct",
         SymbolKind::Enum => "enum",
         SymbolKind::TypeAlias => "type",
+        SymbolKind::Impl => "impl",
         SymbolKind::Method => "m",
         SymbolKind::Constructor => "ctor",
         SymbolKind::Function => "fn",

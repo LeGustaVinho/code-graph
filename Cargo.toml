@@ -33,6 +33,7 @@ tree-sitter-c-sharp = "0.23"
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.25"
 tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
 rusqlite = { version = "0.40", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "net", "signal"] }
 axum = "0.8"

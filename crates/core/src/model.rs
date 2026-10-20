@@ -18,6 +18,9 @@ pub enum SymbolKind {
     Struct,
     Enum,
     TypeAlias,
+    /// Rust `impl` block: members of the implemented type (the semantic index merges it
+    /// with that type, wherever it is declared).
+    Impl,
     Method,
     Constructor,
     Function,
@@ -39,6 +42,7 @@ impl SymbolKind {
             SymbolKind::Struct => "struct",
             SymbolKind::Enum => "enum",
             SymbolKind::TypeAlias => "type_alias",
+            SymbolKind::Impl => "impl",
             SymbolKind::Method => "method",
             SymbolKind::Constructor => "constructor",
             SymbolKind::Function => "function",
@@ -60,6 +64,7 @@ impl SymbolKind {
             "struct" => SymbolKind::Struct,
             "enum" => SymbolKind::Enum,
             "type_alias" => SymbolKind::TypeAlias,
+            "impl" => SymbolKind::Impl,
             "method" => SymbolKind::Method,
             "constructor" => SymbolKind::Constructor,
             "function" => SymbolKind::Function,
@@ -84,6 +89,7 @@ impl SymbolKind {
                 | SymbolKind::Enum
                 | SymbolKind::DataModel
                 | SymbolKind::TypeAlias
+                | SymbolKind::Impl
         )
     }
 

@@ -174,7 +174,7 @@ pub fn registry() -> Vec<ToolDef> {
         tool!("get_entrypoints", "All entrypoints: HTTP routes, main()/top-level programs, CLI commands, event handlers, serverless functions.", behavior::EntrypointParams, behavior::get_entrypoints),
         tool!("find_orphaned_symbols", "Dead-code candidates: symbols with no incoming references (excluding entrypoints, tests, overrides, framework-invoked members).", behavior::OrphanParams, behavior::find_orphaned_symbols),
         // 5.5 Data contracts & extraction
-        tool!("get_data_model", "Fields, types, primary/foreign keys and relationships (1:N, N:1, N:N) of a data model (EF Core, Prisma, TypeORM, SQLAlchemy, Django...). Omit model_name to list all.", data::ModelParams, data::get_data_model),
+        tool!("get_data_model", "Fields, types, primary/foreign keys and relationships (1:N, N:1, N:N) of a data model (EF Core, Prisma, TypeORM, SQLAlchemy, Django, diesel, SeaORM...). Omit model_name to list all.", data::ModelParams, data::get_data_model),
         tool!("get_config_matrix", "Every environment variable / configuration key read by the code, where it is defined, defaults, and missing definitions.", data::ConfigParams, data::get_config_matrix),
         tool!("get_type_contract", "Public contract of a type: base types and member signatures without implementations.", data::ContractParams, data::get_type_contract),
         tool!("get_symbol_body", "Exact source of one symbol with preserved line numbers (optionally without comments, capped by max_lines).", data::BodyParams, data::get_symbol_body),

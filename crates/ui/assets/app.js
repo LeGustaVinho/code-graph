@@ -47,6 +47,7 @@
     struct: { color: "#6366f1", shape: "round-rectangle" },
     enum: { color: "#ec4899", shape: "hexagon" },
     type_alias: { color: "#a855f7", shape: "round-rectangle" },
+    impl: { color: "#818cf8", shape: "round-rectangle" },
     data_model: { color: "#f97316", shape: "barrel" },
     method: { color: "#10b981", shape: "ellipse" },
     constructor: { color: "#059669", shape: "ellipse" },
@@ -76,7 +77,7 @@
   const EDGE_MODES = ["all", "selection", "in", "out"];
   const EDGE_IN_COLOR = "#f59e0b";
   const SPACING = { compact: 0.7, normal: 1, wide: 1.6 };
-  const TYPE_KINDS = new Set(["class", "interface", "struct", "enum", "type_alias", "data_model"]);
+  const TYPE_KINDS = new Set(["class", "interface", "struct", "enum", "type_alias", "data_model", "impl"]);
   const HAS_FCOSE = typeof cytoscapeFcose !== "undefined";
   /** Synthetic hierarchy containers (namespaces / folders) have no symbol behind them. */
   const isSynthetic = (id) => /^(ns|dir):/.test(id);
@@ -1359,7 +1360,7 @@
       .join("");
     const langs = st.languages.filter(([l]) => l && l !== "config");
     const langMax = Math.max(1, ...langs.map((l) => l[1]));
-    const langColors = { csharp: "#8b5cf6", typescript: "#3b82f6", javascript: "#eab308", python: "#10b981", prisma: "#14b8a6" };
+    const langColors = { csharp: "#8b5cf6", typescript: "#3b82f6", javascript: "#eab308", python: "#10b981", rust: "#f97316", prisma: "#14b8a6" };
     const langRows = langs
       .map(([l, c]) => `<div class="bar-row"><span class="bl">${esc(l)}</span><span class="bt"><span style="width:${(c / langMax) * 100}%;background:${langColors[l] || "#94a3b8"}"></span></span><span class="bv">${num(c)}</span></div>`)
       .join("");

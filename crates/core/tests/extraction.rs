@@ -161,6 +161,7 @@ fn malformed_sources_do_not_panic() {
         ("x.tsx", Language::Tsx),
         ("x.js", Language::JavaScript),
         ("x.py", Language::Python),
+        ("x.rs", Language::Rust),
     ] {
         let f = extract_file(path, lang, "class { def ( => {{ \"unterminated \n } } ]]] @@@");
         assert_eq!(f.symbols[0].kind, SymbolKind::Module);

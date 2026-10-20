@@ -635,14 +635,6 @@ fn decorator_literals(ctx: &mut Ctx, range: Node) {
     }
 }
 
-fn first_quoted(s: &str) -> Option<String> {
-    let q = s.find(['"', '\''])?;
-    let quote = s.as_bytes()[q] as char;
-    let rest = &s[q + 1..];
-    let end = rest.find(quote)?;
-    Some(rest[..end].to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Statement / expression walker
 // ---------------------------------------------------------------------------

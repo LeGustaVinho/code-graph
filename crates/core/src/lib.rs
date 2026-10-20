@@ -1,5 +1,5 @@
 //! CodeGraph core: file discovery, Blake3 hashing, Tree-sitter parsing and purely
-//! syntactic fact extraction for C#, TypeScript/TSX, JavaScript, Python, Prisma
+//! syntactic fact extraction for C#, TypeScript/TSX, JavaScript, Python, Rust, Prisma
 //! schemas and configuration files.
 
 pub mod diff;

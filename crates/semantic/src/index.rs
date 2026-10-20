@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use codegraph_core::extract::clean_type;
+use codegraph_core::extract::{clean_type, is_upper_ident};
 use codegraph_core::{DiRegistration, Import, ImportKind, Language, Symbol, SymbolKind};
 
 use crate::Confidence;
@@ -42,6 +42,10 @@ pub struct SymbolIndex {
     pub py_modules: HashMap<String, String>,
     /// JS/TS file path without extension → file.
     pub js_paths: HashMap<String, String>,
+    /// Rust `crate key|a::b` module → file (see [`crate::rustcrate::module_path`]).
+    pub rust_modules: HashMap<String, String>,
+    /// Rust crate name (`shop_api`) → crate key (read from `Cargo.toml` by the indexer).
+    pub rust_crates: HashMap<String, String>,
     pub imports: HashMap<String, Vec<Import>>,
     /// Every namespace declared in a file (a file may hold several namespace blocks).
     pub file_namespace: HashMap<String, Vec<String>>,
@@ -115,6 +119,7 @@ impl SymbolIndex {
         imports: HashMap<String, Vec<Import>>,
         mut di: Vec<(String, DiRegistration)>,
         assembly_of: &dyn Fn(&str) -> String,
+        rust_crates: HashMap<String, String>,
     ) -> SymbolIndex {
         syms.sort_by(|a, b| (&a.file, a.sym.start_line, &a.sym.id).cmp(&(&b.file, b.sym.start_line, &b.sym.id)));
         di.sort_by(|a, b| (&a.0, a.1.line).cmp(&(&b.0, b.1.line)));
@@ -128,6 +133,8 @@ impl SymbolIndex {
             file_lang: HashMap::new(),
             py_modules: HashMap::new(),
             js_paths: HashMap::new(),
+            rust_modules: HashMap::new(),
+            rust_crates,
             imports,
             file_namespace: HashMap::new(),
             bases: HashMap::new(),
@@ -156,7 +163,22 @@ impl SymbolIndex {
                     Language::TypeScript | Language::Tsx | Language::JavaScript => {
                         idx.js_paths.insert(strip_js_ext(&s.file).to_string(), s.file.clone());
                     }
+                    Language::Rust if !crate::rustcrate::is_shared_root(&s.file) => {
+                        let key = rust_key(&crate::rustcrate::module_path(&s.file));
+                        // `src/lib.rs` is the crate root other crates (and `main.rs`) import.
+                        let lib = s.file.ends_with("/lib.rs") || s.file == "lib.rs";
+                        if lib || !idx.rust_modules.contains_key(&key) {
+                            idx.rust_modules.insert(key, s.file.clone());
+                        }
+                    }
                     _ => {}
+                }
+                continue;
+            }
+            if s.sym.kind == SymbolKind::Impl {
+                // An `impl` block is reached through the type it implements, never by name.
+                if let Some(p) = &s.sym.parent_id {
+                    idx.children.entry(p.clone()).or_default().push(i);
                 }
                 continue;
             }
@@ -221,28 +243,83 @@ impl SymbolIndex {
             let key = (fam.to_string(), clean_type(&reg.service));
             idx.di.entry(key).or_default().push(DiEntry { file, family: fam, reg });
         }
-        // Inheritance: resolve every declared base.
-        let type_ids: Vec<usize> = (0..idx.syms.len()).filter(|i| idx.syms[*i].sym.kind.is_type()).collect();
+        if !idx.rust_modules.is_empty() {
+            idx.link_rust_impls();
+        }
+        idx.link_bases();
+        idx
+    }
+
+    /// Inheritance: resolves every declared base (and the reverse implementation map).
+    fn link_bases(&mut self) {
+        self.bases.clear();
+        self.impls.clear();
+        let type_ids: Vec<usize> = (0..self.syms.len()).filter(|i| self.syms[*i].sym.kind.is_type()).collect();
         for i in type_ids {
-            let s = &idx.syms[i];
+            let s = &self.syms[i];
             let file = s.file.clone();
             let id = s.sym.id.clone();
             let bases = s.sym.bases.clone();
             let mut resolved = Vec::new();
             for b in bases {
-                if let Resolved::One(t, c, _) = idx.resolve_type(&b, &file) {
-                    let tid = idx.syms[t].sym.id.clone();
+                if let Resolved::One(t, c, _) = self.resolve_type(&b, &file) {
+                    let tid = self.syms[t].sym.id.clone();
                     if tid != id {
                         resolved.push((tid, c));
                     }
                 }
             }
             for (tid, _) in &resolved {
-                idx.impls.entry(tid.clone()).or_default().push(id.clone());
+                self.impls.entry(tid.clone()).or_default().push(id.clone());
             }
-            idx.bases.insert(id, resolved);
+            self.bases.insert(id, resolved);
         }
-        idx
+    }
+
+    /// Rust `impl` blocks are parts of the type they implement (in any file of the project);
+    /// methods of an `impl` for a type outside the project (`impl Ext for String`) are
+    /// extension methods of that type.
+    fn link_rust_impls(&mut self) {
+        let rust_types: Vec<usize> =
+            (0..self.syms.len()).filter(|i| self.syms[*i].lang == Language::Rust && self.syms[*i].sym.kind.is_type()).collect();
+        for i in &rust_types {
+            self.parts.remove(i);
+            self.part_rep.remove(i);
+        }
+        let syms = &self.syms;
+        for v in self.extensions.values_mut() {
+            v.retain(|(i, _)| syms[*i].lang != Language::Rust);
+        }
+        let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+        let mut ext: Vec<(String, usize, String)> = Vec::new();
+        for i in rust_types.into_iter().filter(|i| self.syms[*i].sym.kind == SymbolKind::Impl) {
+            let s = &self.syms[i];
+            let target = s.sym.type_ref.clone().unwrap_or_default();
+            match self.resolve_type(&target, &s.file) {
+                Resolved::One(t, _, _) if self.syms[t].sym.kind != SymbolKind::Impl => groups.entry(t).or_default().push(i),
+                Resolved::One(..) | Resolved::Many(_) => {}
+                Resolved::None => {
+                    let tn = clean_type(&target);
+                    let tn = tn.rsplit("::").next().unwrap_or(&tn).to_string();
+                    for k in self.children.get(&s.sym.id).cloned().unwrap_or_default() {
+                        if self.syms[k].sym.kind.is_callable() {
+                            ext.push((self.syms[k].sym.name.clone(), k, tn.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        for (t, impls) in groups {
+            let mut g = vec![t];
+            g.extend(impls);
+            for p in &g {
+                self.parts.insert(*p, g.clone());
+                self.part_rep.insert(*p, t);
+            }
+        }
+        for (name, k, tn) in ext {
+            self.extensions.entry(name).or_default().push((k, tn));
+        }
     }
 
     /// Sorts symbol indices canonically (file, start line, id): `syms` is kept in that order.
@@ -505,8 +582,116 @@ impl SymbolIndex {
         match self.file_lang.get(from_file) {
             Some(Language::Python) => self.resolve_py_module(from_file, spec),
             Some(Language::TypeScript) | Some(Language::Tsx) | Some(Language::JavaScript) => self.resolve_js_module(from_file, spec),
+            Some(Language::Rust) => self.resolve_rust_module(from_file, spec),
             _ => None,
         }
+    }
+
+    /// Resolves a Rust module path (`crate::models`, `self::repo`, `super::x`, `shared_kit`,
+    /// or a child module named directly) to the file declaring that module.
+    pub fn resolve_rust_module(&self, from_file: &str, spec: &str) -> Option<(String, Confidence)> {
+        let (ck, cur) = crate::rustcrate::module_path(from_file);
+        let segs: Vec<String> = spec.split("::").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let first = segs.first()?.as_str();
+        let mut cands: Vec<(String, Vec<String>)> = Vec::new();
+        match first {
+            "crate" => cands.push((ck.clone(), segs[1..].to_vec())),
+            "self" => cands.push((ck.clone(), cur.iter().cloned().chain(segs[1..].iter().cloned()).collect())),
+            "super" => {
+                let ups = segs.iter().take_while(|s| *s == "super").count();
+                let base = cur.len().checked_sub(ups)?;
+                cands.push((ck.clone(), cur[..base].iter().cloned().chain(segs[ups..].iter().cloned()).collect()));
+            }
+            name => {
+                // 2018 uniform paths: a child module in scope, then a crate root module, then
+                // another crate of the workspace.
+                cands.push((ck.clone(), cur.iter().cloned().chain(segs.iter().cloned()).collect()));
+                cands.push((ck.clone(), segs.clone()));
+                if let Some(other) = self.rust_crates.get(name) {
+                    cands.push((other.clone(), segs[1..].to_vec()));
+                }
+            }
+        }
+        cands.into_iter().find_map(|c| {
+            // A crate root names itself: `crate::` in `main.rs` (next to a `lib.rs`) or in a
+            // `tests/*.rs` file is that file, not the library / a sibling test.
+            if matches!(first, "crate" | "self") && c.0 == ck && c.1.is_empty() && cur.is_empty() {
+                return Some((from_file.to_string(), Confidence::Exact));
+            }
+            self.rust_modules.get(&rust_key(&c)).map(|f| (f.clone(), Confidence::Exact))
+        })
+    }
+
+    /// Resolves a Rust path (`Foo`, `models::Order`, `crate::repo::MemoryRepo`,
+    /// `Status::Paid`) to a module, item or member, as seen from `from_file`.
+    pub fn resolve_rust_path(&self, from_file: &str, path: &str) -> Option<(usize, Confidence, String)> {
+        let mut segs: Vec<String> = path.split("::").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let first = segs.first()?.clone();
+        // A `use` / `mod` binding of the head: continue from the path it names.
+        if !matches!(first.as_str(), "crate" | "self" | "super") {
+            if let Some(imp) = self.import_binding(from_file, &first) {
+                let mut full: Vec<String> = imp.module.split("::").map(|s| s.to_string()).collect();
+                if let Some(i) = &imp.imported {
+                    full.push(i.clone());
+                }
+                full.extend(segs.drain(1..));
+                segs = full;
+            }
+        }
+        // Longest module prefix, then items / members.
+        for k in (1..=segs.len()).rev() {
+            let Some((file, conf)) = self.resolve_rust_module(from_file, &segs[..k].join("::")) else { continue };
+            let module = *self.module_of_file.get(&file)?;
+            let mut cur = module;
+            let mut rest = &segs[k..];
+            while let Some(seg) = rest.first() {
+                match self.rust_member(cur, seg) {
+                    Some(m) => {
+                        cur = m;
+                        rest = &rest[1..];
+                    }
+                    // Items of inline modules (`mod outer { pub fn f() }`) live in the file's
+                    // module, qualified by the inline module names (`outer.f`).
+                    None if cur == module && rest.len() > 1 => {
+                        let (q, kind_ok) = (rest.join("."), |s: &IndexedSymbol| s.sym.kind != SymbolKind::Impl);
+                        let hit = self.by_file.get(&file)?.iter().copied().find(|i| self.syms[*i].sym.qualified_name == q && kind_ok(&self.syms[*i]))?;
+                        return Some((hit, conf, format!("path {path}")));
+                    }
+                    None => return None,
+                }
+            }
+            return Some((cur, conf, format!("path {path}")));
+        }
+        // An inline module of this file: `util::shout()` next to `mod util { … }`.
+        if segs.len() > 1 {
+            let q = segs.join(".");
+            if let Some(hit) = self.by_file.get(from_file).and_then(|v| {
+                v.iter().copied().find(|i| self.syms[*i].sym.qualified_name == q && self.syms[*i].sym.kind != SymbolKind::Impl)
+            }) {
+                return Some((hit, Confidence::Exact, format!("inline module path {path}")));
+            }
+        }
+        // A type in scope: `Foo::new`, `Status::Paid`.
+        let head = segs.first()?;
+        if let Resolved::One(mut cur, conf, ev) = self.resolve_type(head, from_file) {
+            for seg in &segs[1..] {
+                cur = self.rust_member(cur, seg)?;
+            }
+            return Some((cur, conf, ev));
+        }
+        None
+    }
+
+    /// Item `name` of a Rust module, or member `name` of a type.
+    fn rust_member(&self, owner: usize, name: &str) -> Option<usize> {
+        let s = &self.syms[owner];
+        if s.sym.kind == SymbolKind::Module {
+            return self.exported_symbol(&s.file, name, 0);
+        }
+        if s.sym.kind.is_type() {
+            return self.members_named(owner, name).into_iter().min();
+        }
+        None
     }
 
     /// Top-level symbol exported by `file` under `name` (follows re-exports).
@@ -519,7 +704,7 @@ impl SymbolIndex {
                     return Some(*k);
                 }
             }
-            if let Some(k) = kids.iter().find(|k| self.syms[**k].sym.name == name) {
+            if let Some(k) = kids.iter().find(|k| self.syms[**k].sym.name == name && self.syms[**k].sym.kind != SymbolKind::Impl) {
                 return Some(*k);
             }
             // `export { a as b }` / `exports.b = a`.
@@ -599,6 +784,25 @@ impl SymbolIndex {
             return Resolved::None;
         }
         let family = self.family_of_file(from_file);
+        // Rust paths: `models::Order`, `crate::repo::OrderRepo`.
+        if family == "rust" && cleaned.contains("::") {
+            if let Some((t, c, ev)) = self.resolve_rust_path(from_file, &cleaned) {
+                if self.syms[t].sym.kind.is_type() {
+                    return Resolved::One(self.representative(t), c, ev);
+                }
+            }
+            // `reqwest::Client`, `std::fmt::Display`: a path into another (external) crate.
+            let head = cleaned.split("::").next().unwrap_or("");
+            let project_head = matches!(head, "crate" | "self" | "super")
+                || is_upper_ident(head)
+                || self.resolve_rust_module(from_file, head).is_some()
+                || self.import_binding(from_file, head).map(|i| self.resolve_module(from_file, &i.module).is_some()).unwrap_or(false);
+            if !project_head {
+                return Resolved::None;
+            }
+            let last = cleaned.rsplit("::").next().unwrap_or(&cleaned).to_string();
+            return self.resolve_type_inner(&last, from_file, ns, aliases);
+        }
         // Qualified names: `Shop.Models.Order`, `models.Order`, `ns.Type`.
         if cleaned.contains('.') {
             let last_seg = cleaned.rsplit('.').next().unwrap_or(&cleaned);
@@ -747,7 +951,12 @@ impl SymbolIndex {
                     s.name == name
                         && !matches!(
                             s.kind,
-                            SymbolKind::Method | SymbolKind::Constructor | SymbolKind::Property | SymbolKind::Field | SymbolKind::Test
+                            SymbolKind::Method
+                                | SymbolKind::Constructor
+                                | SymbolKind::Property
+                                | SymbolKind::Field
+                                | SymbolKind::Test
+                                | SymbolKind::Impl
                         )
                 });
                 if let Some(k) = hit {
@@ -770,6 +979,11 @@ impl SymbolIndex {
         let s = &self.syms[i];
         format!("{}:{}", s.file, s.sym.start_line)
     }
+}
+
+/// Key of a Rust module in [`SymbolIndex::rust_modules`].
+fn rust_key((crate_key, path): &(String, Vec<String>)) -> String {
+    format!("{crate_key}|{}", path.join("::"))
 }
 
 fn common_prefix_len(a: &str, b: &str) -> usize {

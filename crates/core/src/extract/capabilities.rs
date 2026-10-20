@@ -123,7 +123,47 @@ const AUTH_MARKERS: &[&str] = &[
     "Security(",
 ];
 
+/// Rust APIs (receivers are lowercased; path calls end with `::`, e.g. `std::fs::`).
+fn rust_call_tags(name: &str, recv: &str, rtype: &str) -> Vec<&'static str> {
+    let mut tags = Vec::new();
+    let path_head = recv.trim_end_matches(':').rsplit("::").next().unwrap_or("");
+    if path_head == "fs"
+        || (matches!(path_head, "file" | "openoptions") && recv.ends_with("::"))
+        || rtype.ends_with("file")
+        || rtype.contains("bufreader")
+    {
+        tags.push("FILE_IO");
+    }
+    let net = ["reqwest", "ureq", "hyper", "surf", "tcpstream", "tcplistener", "udpsocket", "websocket", "tonic"];
+    if net.iter().any(|x| recv.contains(x) || rtype.contains(x))
+        || ((rtype.ends_with("client") || recv.ends_with("client"))
+            && matches!(name, "get" | "post" | "put" | "delete" | "patch" | "head" | "send" | "execute" | "request"))
+    {
+        tags.push("NETWORK_IO");
+    }
+    // Whole words of the receiver (`self.db`, `tx`, `sqlx::query(…)`), never substrings (`ctx`).
+    const DB_WORDS: &[&str] =
+        &["conn", "connection", "pool", "db", "database", "tx", "transaction", "stmt", "statement", "sqlx", "diesel", "query", "session"];
+    let db_type =
+        ["connection", "pool", "transaction", "statement", "pgpool", "sqlitepool", "mysqlpool", "pgconnection", "sqliteconnection"]
+            .iter()
+            .any(|x| rtype.contains(x));
+    let dbish = db_type || recv.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| DB_WORDS.contains(&w));
+    let read = matches!(
+        name,
+        "fetch_one" | "fetch_all" | "fetch_optional" | "query_row" | "query_map" | "query_one" | "query_opt" | "get_result" | "get_results"
+    );
+    if (dbish && read) || (db_type && matches!(name, "load" | "first" | "query" | "prepare")) {
+        tags.push("DB_READ");
+    }
+    if dbish && matches!(name, "execute_batch" | "insert_one" | "insert_many" | "update_one" | "delete_one" | "commit") {
+        tags.push("DB_WRITE");
+    }
+    tags
+}
+
 pub(super) fn infer(ctx: &mut Ctx) {
+    let rust = ctx.lang == crate::lang::Language::Rust;
     let facts = &ctx.facts;
     let mut caps: HashMap<String, BTreeSet<String>> = HashMap::new();
     let mut add = |id: &str, tag: &str| {
@@ -151,13 +191,14 @@ pub(super) fn infer(ctx: &mut Ctx) {
                     || rtype.contains("repository")
                     || rtype.contains("dbset")
                     || rtype.contains("session");
-                if DB_READ_CALLS.contains(&n) && dbish {
+                if !rust && DB_READ_CALLS.contains(&n) && dbish {
                     add(&r.enclosing, "DB_READ");
                 }
-                if DB_WRITE_CALLS.contains(&n) && (dbish || n.starts_with("SaveChanges")) {
+                if !rust && DB_WRITE_CALLS.contains(&n) && (dbish || n.starts_with("SaveChanges")) {
                     add(&r.enclosing, "DB_WRITE");
                 }
-                if NETWORK_CALLS.contains(&n)
+                if !rust
+                    && NETWORK_CALLS.contains(&n)
                     && (r.receiver.is_none() || NETWORK_RECEIVERS.iter().any(|x| recv_last.contains(x)) || rtype.contains("httpclient"))
                 {
                     add(&r.enclosing, "NETWORK_IO");
@@ -195,6 +236,11 @@ pub(super) fn infer(ctx: &mut Ctx) {
                 }
                 if matches!(n, "publish" | "emit" | "Publish" | "PublishAsync" | "send_task" | "delay" | "dispatch") {
                     add(&r.enclosing, "EVENT_EMIT");
+                }
+                if rust {
+                    for tag in rust_call_tags(n, &recv, &rtype) {
+                        add(&r.enclosing, tag);
+                    }
                 }
             }
             _ => {}

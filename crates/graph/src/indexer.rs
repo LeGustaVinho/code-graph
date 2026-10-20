@@ -438,7 +438,7 @@ fn write_and_resolve(root: &Path, conn: &mut Connection, stats: &mut IndexStats,
     progress.begin(Stage::Resolve, affected.len());
     let tp = Instant::now();
     let assemblies = AssemblyKeys::load(root);
-    let mut index = load_index(&tx, &|f: &str| assemblies.key(f))?;
+    let mut index = load_index(&tx, &|f: &str| assemblies.key(f), root)?;
     if !index.js_paths.is_empty() {
         // tsconfig `paths` / `baseUrl` and workspace packages drive JS/TS module resolution.
         index.js = codegraph_semantic::jsconfig::load(root);
@@ -586,7 +586,7 @@ impl AssemblyKeys {
     }
 }
 
-pub fn load_index(conn: &Connection, assembly_of: &dyn Fn(&str) -> String) -> Result<SymbolIndex> {
+pub fn load_index(conn: &Connection, assembly_of: &dyn Fn(&str) -> String, root: &Path) -> Result<SymbolIndex> {
     let mut syms = Vec::new();
     {
         let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM node WHERE derived = 0 ORDER BY file_path, start_line, id"))?;
@@ -640,7 +640,11 @@ pub fn load_index(conn: &Connection, assembly_of: &dyn Fn(&str) -> String) -> Re
         })?;
         di.extend(rows.flatten());
     }
-    Ok(SymbolIndex::build(syms, imports, di, assembly_of))
+    // `Cargo.toml` package names: `use other_crate::x` across a workspace.
+    let rust_files = syms.iter().filter(|s| s.lang == Language::Rust && s.sym.kind == codegraph_core::SymbolKind::Module).map(|s| s.file.as_str());
+    let dirs = codegraph_semantic::rustcrate::crate_dirs(rust_files);
+    let rust_crates = if dirs.is_empty() { HashMap::new() } else { codegraph_semantic::rustcrate::load_crates(root, &dirs) };
+    Ok(SymbolIndex::build(syms, imports, di, assembly_of, rust_crates))
 }
 
 fn load_call_rows(tx: &Transaction) -> Result<Vec<CallRow>> {

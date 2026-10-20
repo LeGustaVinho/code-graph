@@ -1,4 +1,4 @@
-//! Data model / ERD extraction (EF Core, Prisma, TypeORM, SQLAlchemy, Django, SQLModel, Pydantic).
+//! Data model / ERD extraction (EF Core, Prisma, TypeORM, SQLAlchemy, Django, SQLModel, Pydantic, diesel, sqlx, SeaORM).
 
 use std::collections::{HashMap, HashSet};
 
@@ -101,9 +101,41 @@ fn detect(index: &SymbolIndex, i: usize, dbset_models: &HashSet<String>) -> Opti
                 return Some("pydantic".into());
             }
         }
+        Language::Rust => {
+            // `#[derive(Queryable, Insertable)]` (diesel), `FromRow` (sqlx), `DeriveEntityModel` (SeaORM).
+            let derives: Vec<String> = sym
+                .attrs
+                .iter()
+                .filter_map(|a| a.strip_prefix("#[derive(").and_then(|x| x.strip_suffix(")]")))
+                .flat_map(|d| d.split(',').map(|x| x.trim().rsplit("::").next().unwrap_or("").to_string()).collect::<Vec<_>>())
+                .collect();
+            let has = |names: &[&str]| derives.iter().any(|d| names.contains(&d.as_str()));
+            if has(&["DeriveEntityModel"]) || sym.attrs.iter().any(|a| a.starts_with("#[sea_orm(")) {
+                return Some("sea-orm".into());
+            }
+            if has(&["Queryable", "Insertable", "Selectable", "Identifiable", "AsChangeset"])
+                || sym.attrs.iter().any(|a| a.starts_with("#[diesel("))
+            {
+                return Some("diesel".into());
+            }
+            if has(&["FromRow"]) {
+                return Some("sqlx".into());
+            }
+        }
         _ => {}
     }
     None
+}
+
+/// Table named by a Rust ORM attribute: `#[diesel(table_name = users)]`, `#[sea_orm(table_name = "users")]`.
+fn rust_table(attrs: &[String]) -> Option<String> {
+    attrs.iter().find_map(|a| {
+        let i = a.find("table_name")?;
+        let rest = a[i + 10..].trim_start().strip_prefix('=')?.trim_start().trim_start_matches('"');
+        let t: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':').collect();
+        let t = t.rsplit("::").next().unwrap_or(&t).to_string();
+        (!t.is_empty()).then_some(t)
+    })
 }
 
 /// Detects data models and their fields across all supported ORMs.
@@ -133,7 +165,8 @@ pub fn extract_models(index: &SymbolIndex) -> (Vec<DataModel>, Vec<ModelField>) 
                 .get(&s.sym.id)
                 .and_then(|k| k.iter().find(|c| index.syms[**c].sym.name == "__tablename__"))
                 .and_then(|c| index.syms[*c].sym.value_text.clone())
-                .map(|v| v.trim_matches(|c| c == '"' || c == '\'').to_string());
+                .map(|v| v.trim_matches(|c| c == '"' || c == '\'').to_string())
+                .or_else(|| if s.lang == Language::Rust { rust_table(&s.sym.attrs) } else { None });
             models.push(DataModel { id: s.sym.id.clone(), name: s.sym.name.clone(), framework: fw, table });
         }
     }
@@ -332,6 +365,15 @@ pub fn extract_models(index: &SymbolIndex) -> (Vec<DataModel>, Vec<ModelField>) 
                         _ => {}
                     }
                     r.pk = val.replace(' ', "").contains("primary_key=True");
+                }
+                "diesel" | "sqlx" | "sea-orm" => {
+                    let element = codegraph_core::extract::element_type(&ty_raw);
+                    let inner = clean_type(&codegraph_core::extract::rust::unwrap_result_type(element.as_deref().unwrap_or(&ty_raw)));
+                    if by_name.contains_key(&inner) {
+                        r.nav_target = Some(inner);
+                        r.collection = element.is_some();
+                    }
+                    r.pk = c.name == "id" || c.attrs.iter().any(|a| a.contains("primary_key"));
                 }
                 _ => {
                     // pydantic / mongoose / mongoengine: typed attributes, nested models.

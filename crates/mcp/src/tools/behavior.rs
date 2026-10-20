@@ -452,7 +452,10 @@ pub fn find_orphaned_symbols(ctx: &Ctx, p: OrphanParams) -> ToolResult {
             if let Some(parent) = &s.parent_id {
                 let overrides =
                     ancestors(parent).iter().any(|a| children.get(a).map(|k| k.iter().any(|(_, name)| name == &s.name)).unwrap_or(false));
-                if overrides || (external_base.contains(parent) && s.visibility != "private") {
+                // Rust trait-impl methods carry `override`: their `impl` block is not the type
+                // the INHERITS edge starts from.
+                let declared_override = s.modifiers.iter().any(|m| m == "override");
+                if overrides || declared_override || (external_base.contains(parent) && s.visibility != "private") {
                     continue;
                 }
             }

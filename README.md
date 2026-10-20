@@ -77,7 +77,7 @@ All of this ships in a **single standalone binary (~20 MB)** with **zero externa
 ```mermaid
 flowchart TD
     subgraph Input["Source Repository"]
-        Files["Code & Config Files\n(C#, TS/JS, Python, Prisma, JSON, .env)"]
+        Files["Code & Config Files\n(C#, TS/JS, Python, Rust, Prisma, JSON, .env)"]
     end
 
     subgraph Core["codegraph-core"]
@@ -377,6 +377,7 @@ If unconfigured, CodeGraph applies default Clean Architecture layering conventio
 | **C# / .NET** | `.cs` | ASP.NET Core controllers, minimal APIs, .NET DI (`AddScoped`, `AddSingleton`, `AddTransient`), EF Core (`DbSet<T>`, LINQ queries), top-level statements, preprocessor directive neutralization (`#if UNITY_EDITOR`), Unity engine messages (`Awake`, `Update`), Unity hooks (`[MenuItem]`, `[InitializeOnLoadMethod]`), `PlayerPrefs`/`EditorPrefs`, `UnityWebRequest`. |
 | **TypeScript / JavaScript** | `.ts`, `.tsx`, `.js`, `.jsx` | React components & JSX trees, NestJS (`@Controller`, `@Injectable`, `@Module`, DI tokens), TypeORM (`@Entity`, relationships), Mongoose schemas, Axios/Fetch HTTP calls, Vitest & Jest test suites. |
 | **Python** | `.py` | FastAPI (`@app.get`, `Depends`), Flask routes, Django ORM (`models.Model`), SQLAlchemy & SQLModel (`mapped_column`, `relationship`), Pydantic models, Pytest test suites. |
+| **Rust** | `.rs` | Crates and workspaces (`Cargo.toml` names, `mod` / `use` paths, `pub use` re-exports), `impl` blocks merged with their type across files, trait dispatch (`dyn Trait`, generic bounds), `Result` / `Option` unwrapping (`?`), calls inside macros, axum / actix-web / Rocket routes, reqwest calls, `std::env::var` config, `Err(..)` / `panic!` error flow, diesel / sqlx / SeaORM models, `#[test]` functions and `#[cfg(test)]` modules. |
 | **Prisma** | `.prisma` | Data models, field definitions, relation mapping (`@relation`), foreign key constraints. |
 | **Configuration Files** | `appsettings*.json`, `.env*` | Environment variables, connection strings, structured configuration matrices. |
 

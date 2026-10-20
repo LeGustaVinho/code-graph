@@ -6,6 +6,7 @@ pub mod csharp;
 pub mod preprocessor;
 pub mod prisma;
 pub mod python;
+pub mod rust;
 pub mod typescript;
 
 use std::collections::{BTreeSet, HashMap};
@@ -102,6 +103,7 @@ fn extract_source(path: &str, lang: Language, source: &str, line_count: u32) -> 
                 match lang {
                     Language::CSharp => csharp::extract(&mut ctx, root),
                     Language::Python => python::extract(&mut ctx, root),
+                    Language::Rust => rust::extract(&mut ctx, root),
                     _ => typescript::extract(&mut ctx, root),
                 }
             }
@@ -654,7 +656,11 @@ pub fn truncate(s: &str, max: usize) -> String {
 
 /// Removes generic arguments, nullability, array markers and namespaces: `List<Order>?` → `List`.
 pub fn clean_type(t: &str) -> String {
-    let t = t.trim().trim_start_matches(':').trim();
+    let t = strip_rust_indirection(t.trim().trim_start_matches(':').trim());
+    // Rust smart pointers / locks dereference to what they hold: `Arc<Mutex<Repo>>` → `Repo`.
+    if let Some(inner) = rust_pointee(t) {
+        return clean_type(&inner);
+    }
     let t = t.trim_end_matches('?').trim_end_matches("[]");
     // Python Optional[T] / TS T | null.
     let t = if let Some(inner) = t.strip_prefix("Optional[").and_then(|x| x.strip_suffix(']')) { inner } else { t };
@@ -663,14 +669,82 @@ pub fn clean_type(t: &str) -> String {
     base.trim_start_matches("readonly ").trim().to_string()
 }
 
+/// Rust references, raw pointers, lifetimes and trait objects: `&'a mut dyn Repo + Send` → `Repo`.
+pub fn strip_rust_indirection(t: &str) -> &str {
+    let mut t = t.trim();
+    loop {
+        let before = t;
+        if let Some(r) = t.strip_prefix('&') {
+            t = r.trim_start();
+            // Lifetime of a reference: `&'a T` (a leading quote elsewhere is a TS string
+            // literal type such as `'asc' | 'desc'`).
+            if t.starts_with('\'') {
+                t = t.split_once(char::is_whitespace).map(|(_, r)| r).unwrap_or("").trim_start();
+            }
+        }
+        for p in ["mut ", "dyn ", "impl ", "*const ", "*mut "] {
+            if let Some(r) = t.strip_prefix(p) {
+                t = r.trim_start();
+            }
+        }
+        if t == before {
+            break;
+        }
+    }
+    // `Repo + Send + 'static`: the first bound outside generic arguments names the trait.
+    let mut depth = 0i32;
+    for (i, c) in t.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            '+' if depth == 0 => return t[..i].trim(),
+            _ => {}
+        }
+    }
+    t
+}
+
+/// Rust wrapper types that dereference to their single type argument (`Box<T>`, `Arc<T>`, …).
+fn rust_pointee(t: &str) -> Option<String> {
+    let base = t.split('<').next()?.trim();
+    let base = base.rsplit("::").next().unwrap_or(base);
+    if !matches!(
+        base,
+        "Box"
+            | "Rc"
+            | "Arc"
+            | "RefCell"
+            | "Cell"
+            | "Mutex"
+            | "RwLock"
+            | "Pin"
+            | "Weak"
+            | "MutexGuard"
+            | "RwLockReadGuard"
+            | "RwLockWriteGuard"
+    ) {
+        return None;
+    }
+    generic_args(t).into_iter().next()
+}
+
 /// Element type of a collection type: `List<Order>` / `Order[]` / `IEnumerable<Order>` → `Order`.
 pub fn element_type(t: &str) -> Option<String> {
-    let t = t.trim().trim_end_matches('?');
+    let t = strip_rust_indirection(t.trim().trim_end_matches('?'));
+    if let Some(inner) = rust_pointee(t) {
+        return element_type(&inner);
+    }
     if let Some(inner) = t.strip_suffix("[]") {
+        return Some(inner.trim().to_string());
+    }
+    // Rust slices and arrays: `[Order]` / `[Order; 4]`.
+    if let Some(inner) = t.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        let inner = inner.rsplit_once(';').map(|(a, _)| a).unwrap_or(inner);
         return Some(inner.trim().to_string());
     }
     let base = t.split('<').next().unwrap_or(t).trim();
     let base = base.rsplit('.').next().unwrap_or(base);
+    let base = base.rsplit("::").next().unwrap_or(base);
     const COLLECTIONS: &[&str] = &[
         "List",
         "IList",
@@ -703,6 +777,12 @@ pub fn element_type(t: &str) -> Option<String> {
         "AsyncIterable",
         "NativeArray",
         "NativeList",
+        "Vec",
+        "VecDeque",
+        "BTreeSet",
+        "BinaryHeap",
+        "IndexSet",
+        "SmallVec",
     ];
     if !COLLECTIONS.contains(&base) {
         return None;
@@ -788,6 +868,10 @@ pub fn is_test_path(path: &str) -> bool {
         || name.contains("-spec.")
         || name.starts_with("test_")
         || name.ends_with("_test.py")
+        // Rust: `mod tests;` files and `foo_test.rs` integration helpers.
+        || name == "tests.rs"
+        || name.ends_with("_test.rs")
+        || name.ends_with("_tests.rs")
         || cs_test
         || lower.contains("/__tests__/")
         || lower.starts_with("__tests__/")
@@ -838,6 +922,15 @@ pub fn cyclomatic(node: Node, src: &str, lang: Language) -> u32 {
                 }
                 _ => false,
             },
+            Language::Rust => match k {
+                "if_expression" | "while_expression" | "for_expression" => true,
+                // Every arm but the last is a branch (the last one is the fallthrough).
+                "match_arm" => n.next_named_sibling().is_some(),
+                "binary_expression" => {
+                    n.child_by_field_name("operator").map(|o| matches!(&src[o.byte_range()], "&&" | "||")).unwrap_or(false)
+                }
+                _ => false,
+            },
             Language::Python => matches!(
                 k,
                 "if_statement"
@@ -866,6 +959,7 @@ pub fn cyclomatic(node: Node, src: &str, lang: Language) -> u32 {
         match lang {
             Language::CSharp => matches!(k, "class_declaration" | "struct_declaration" | "interface_declaration" | "record_declaration"),
             Language::Python => matches!(k, "class_definition" | "function_definition"),
+            Language::Rust => matches!(k, "function_item" | "impl_item" | "trait_item" | "mod_item" | "struct_item" | "enum_item"),
             _ => matches!(k, "class_declaration" | "function_declaration" | "method_definition" | "class"),
         }
     }
@@ -1104,6 +1198,15 @@ pub fn is_upper_ident(s: &str) -> bool {
 
 pub fn is_const_name(s: &str) -> bool {
     s.len() > 1 && s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') && s.chars().any(|c| c.is_ascii_uppercase())
+}
+
+/// Text of the first quoted string in `s` (`get("/x")` → `/x`).
+pub fn first_quoted(s: &str) -> Option<String> {
+    let q = s.find(['"', '\''])?;
+    let quote = s.as_bytes()[q] as char;
+    let rest = &s[q + 1..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
 }
 
 /// Removes exactly one pair of surrounding parentheses: `(a, b=f())` → `a, b=f()`.

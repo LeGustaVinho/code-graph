@@ -14,6 +14,7 @@ pub enum Language {
     Tsx,
     JavaScript,
     Python,
+    Rust,
     Prisma,
     Config,
 }
@@ -26,6 +27,7 @@ impl Language {
             Language::TypeScript | Language::Tsx => "typescript",
             Language::JavaScript => "javascript",
             Language::Python => "python",
+            Language::Rust => "rust",
             Language::Prisma => "prisma",
             Language::Config => "config",
         }
@@ -37,6 +39,7 @@ impl Language {
             Language::CSharp => "dotnet",
             Language::TypeScript | Language::Tsx | Language::JavaScript => "js",
             Language::Python => "python",
+            Language::Rust => "rust",
             Language::Prisma => "prisma",
             Language::Config => "config",
         }
@@ -66,6 +69,7 @@ impl Language {
                 }
             }
             "py" | "pyi" => Some(Language::Python),
+            "rs" => Some(Language::Rust),
             "prisma" => Some(Language::Prisma),
             _ => None,
         }
@@ -82,6 +86,7 @@ impl Language {
             Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
             Language::Python => tree_sitter_python::LANGUAGE.into(),
+            Language::Rust => tree_sitter_rust::LANGUAGE.into(),
             _ => return None,
         })
     }
@@ -101,6 +106,22 @@ thread_local! {
 
 /// Parses `source` with a thread-local parser for `lang` (safe to call from Rayon workers).
 pub fn parse(lang: Language, source: &str) -> Option<Tree> {
+    with_parser(lang, |p| p.parse(source, None))
+}
+
+/// Parses only `ranges` of `source` (sorted, disjoint): node positions stay those of the
+/// whole text, and the cost is that of the ranges.
+pub fn parse_ranges(lang: Language, source: &[u8], ranges: &[tree_sitter::Range]) -> Option<Tree> {
+    with_parser(lang, |p| {
+        p.set_included_ranges(ranges).ok()?;
+        let tree = p.parse(source, None);
+        // The parser is shared by every later parse on this thread.
+        let _ = p.set_included_ranges(&[]);
+        tree
+    })
+}
+
+fn with_parser(lang: Language, f: impl FnOnce(&mut Parser) -> Option<Tree>) -> Option<Tree> {
     let ts_lang = lang.ts_language()?;
     PARSERS.with(|cell| {
         let mut map = cell.borrow_mut();
@@ -109,6 +130,6 @@ pub fn parse(lang: Language, source: &str) -> Option<Tree> {
             p.set_language(&ts_lang).expect("incompatible tree-sitter grammar");
             p
         });
-        parser.parse(source, None)
+        f(parser)
     })
 }

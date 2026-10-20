@@ -186,6 +186,12 @@ impl<'a> FileResolver<'a> {
         let types: Vec<usize> = ids.iter().copied().filter(|i| self.index.syms[*i].sym.kind.is_type()).collect();
         for t in types {
             let sym = self.index.syms[t].sym.clone();
+            // A Rust `impl Trait for T` makes `T` (its declaration) implement the trait.
+            let source = if sym.kind == SymbolKind::Impl {
+                self.index.syms[self.index.representative(t)].sym.id.clone()
+            } else {
+                sym.id.clone()
+            };
             for raw in &sym.bases {
                 let base = clean_type(raw);
                 if base.is_empty() || base == "object" {
@@ -196,7 +202,7 @@ impl<'a> FileResolver<'a> {
                         let bk = self.index.syms[b].sym.kind;
                         let kind = if bk == SymbolKind::Interface { "implements" } else { "extends" };
                         let e = Edge::new(
-                            &sym.id,
+                            &source,
                             self.file,
                             Some(self.target(b)),
                             relation::INHERITS,
@@ -210,7 +216,7 @@ impl<'a> FileResolver<'a> {
                     }
                     Resolved::Many(c) => {
                         let e = Edge::unresolved(
-                            &sym.id,
+                            &source,
                             self.file,
                             relation::INHERITS,
                             &base,
@@ -223,7 +229,7 @@ impl<'a> FileResolver<'a> {
                     Resolved::None => {
                         let kind = if self.lang == Language::CSharp && looks_like_interface(&base) { "implements" } else { "extends" };
                         let e = Edge::unresolved(
-                            &sym.id,
+                            &source,
                             self.file,
                             relation::INHERITS,
                             &base,
@@ -594,15 +600,31 @@ impl<'a> FileResolver<'a> {
             Some(m) => (m, true),
             None => (member, false),
         };
+        // Rust `if let Err(e) = f()`: the `E` of the `Result<T, E>` returned.
+        let (member, errored) = match member.strip_suffix("!err") {
+            Some(m) => (m, true),
+            None => (member, false),
+        };
         // `@fn`: the declared return type of a free function visible from here.
         if owner_raw == "@fn" {
-            let f = match self.index.resolve_value(member, self.file, &r.enclosing) {
-                Resolved::One(f, _, _) => f,
-                _ => return TypeOf::Unknown,
+            let found = if self.lang == Language::Rust && member.contains("::") {
+                // `tree::get(&conn)?`: a function reached through a module path.
+                self.index.resolve_rust_path(self.file, member).map(|(f, _, _)| f).filter(|f| self.index.syms[*f].sym.kind.is_callable())
+            } else {
+                match self.index.resolve_value(member, self.file, &r.enclosing) {
+                    Resolved::One(f, _, _) => Some(f),
+                    _ => None,
+                }
             };
+            let Some(f) = found else { return TypeOf::Unknown };
             let fs = &self.index.syms[f];
             let mut ty = fs.sym.type_ref.clone().unwrap_or_default();
-            if awaited && matches!(clean_type(&ty).as_str(), "Promise" | "Task") {
+            if errored {
+                ty = codegraph_core::extract::rust::result_error_type(&ty).unwrap_or_default();
+            } else if awaited && self.lang == Language::Rust {
+                // `f()?` / `f().unwrap()`: the `T` of `Result<T, E>` / `Option<T>`.
+                ty = codegraph_core::extract::rust::unwrap_result_type(&ty);
+            } else if awaited && matches!(clean_type(&ty).as_str(), "Promise" | "Task") {
                 ty = codegraph_core::extract::generic_args(&ty).into_iter().next().unwrap_or_default();
             }
             if ty.is_empty() {
@@ -633,7 +655,11 @@ impl<'a> FileResolver<'a> {
         };
         let ms = &self.index.syms[m];
         let mut ty = ms.sym.type_ref.clone().unwrap_or_default();
-        if awaited {
+        if errored {
+            ty = codegraph_core::extract::rust::result_error_type(&ty).unwrap_or_default();
+        } else if awaited && self.lang == Language::Rust {
+            ty = codegraph_core::extract::rust::unwrap_result_type(&ty);
+        } else if awaited {
             let base = clean_type(&ty);
             if matches!(base.as_str(), "Task" | "ValueTask" | "Promise" | "UniTask" | "Awaitable") {
                 ty = codegraph_core::extract::generic_args(&ty).into_iter().next().unwrap_or_default();
@@ -768,6 +794,9 @@ impl<'a> FileResolver<'a> {
                 }
                 self.global_by_name(r, false);
             }
+            Some(recv) if self.lang == Language::Rust && recv.ends_with("::") => {
+                self.rust_path_call(r, recv.trim_end_matches(':'));
+            }
             Some(recv) => {
                 let recv_l = recv;
                 if recv_l == "this" || recv_l == "self" || recv_l == "cls" {
@@ -796,7 +825,8 @@ impl<'a> FileResolver<'a> {
                     return;
                 }
                 // Members inherited from an external base (`gameObject.SetActive`, `transform.position`).
-                if r.receiver_type.is_none()
+                if self.lang != Language::Rust
+                    && r.receiver_type.is_none()
                     && r.root_type.is_none()
                     && head.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false)
                 {
@@ -925,6 +955,34 @@ impl<'a> FileResolver<'a> {
         }
     }
 
+    /// Rust `path::name(…)`: an associated function of a type (`Foo::new`, `<T as Repo>::find`)
+    /// or a function of a module (`crate::db::open`, `models::build`).
+    fn rust_path_call(&mut self, r: &Reference, path: &str) {
+        let Some((t, c, ev)) = self.index.resolve_rust_path(self.file, path) else {
+            // A function of an inline module (`util::shout()`) has no module symbol of its
+            // own: resolve the whole path. Otherwise (`Vec::new()`, `serde_json::to_string()`)
+            // the target is outside the project.
+            if let Some((f, c, ev)) = self.index.resolve_rust_path(self.file, &format!("{path}::{}", r.name)) {
+                if self.index.syms[f].sym.kind.is_callable() {
+                    self.emit_call(r, f, c, ev, "call-resolver");
+                }
+            }
+            return;
+        };
+        let owner = &self.index.syms[t];
+        if owner.sym.kind == SymbolKind::Module {
+            let file = owner.file.clone();
+            if let Some(s) = self.index.exported_symbol(&file, &r.name, 0) {
+                if self.index.syms[s].sym.kind.is_callable() || self.index.syms[s].sym.kind.is_type() {
+                    self.emit_call(r, s, c, format!("function of module {path} ({ev})"), "call-resolver");
+                }
+            }
+        } else if owner.sym.kind.is_type() {
+            let tn = owner.sym.name.clone();
+            self.call_on_type(r, t, c, format!("associated function of {tn} ({ev})"), None);
+        }
+    }
+
     /// A method used as a value (`event += OnClick`, `AddListener(OnClick)`, `setTimeout(this.tick)`)
     /// is a reference to that method: record it as a CALLS edge flagged as a delegate.
     fn method_group(&mut self, r: &Reference) -> bool {
@@ -939,6 +997,12 @@ impl<'a> FileResolver<'a> {
             Some("this") | Some("self") => self.enclosing_type(&r.enclosing).and_then(|t| {
                 self.index.members_named(t, &r.name).into_iter().find(|m| matches!(self.index.syms[*m].sym.kind, SymbolKind::Method))
             }),
+            // Rust `get(handlers::list)`, `.map(Order::total)`.
+            Some(recv) if self.lang == Language::Rust && recv.ends_with("::") => self
+                .index
+                .resolve_rust_path(self.file, &format!("{recv}{}", r.name))
+                .map(|(t, _, _)| t)
+                .filter(|t| self.index.syms[*t].sym.kind.is_callable()),
             _ => None,
         };
         let Some(m) = target else { return false };
@@ -1234,6 +1298,14 @@ impl<'a> FileResolver<'a> {
                     .find(|m| is_var(self.index, *m))
                     .map(|m| (m, Confidence::Exact, "member of enclosing class".to_string()))
             }),
+            // Rust `Status::Paid`, `config::DEFAULT_PORT`, `Self::LIMIT`.
+            Some(recv) if self.lang == Language::Rust && recv.ends_with("::") => {
+                let path = format!("{recv}{}", r.name);
+                match self.index.resolve_rust_path(file, &path) {
+                    Some((t, c, ev)) if is_var(self.index, t) => Some((t, c, ev)),
+                    _ => None,
+                }
+            }
             Some(recv) => {
                 let typed = r.receiver_type.clone().or_else(|| {
                     if recv.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) && !recv.contains('.') {
