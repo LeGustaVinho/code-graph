@@ -17,6 +17,8 @@ CodeGraph is structured as a modular Rust workspace consisting of six crates:
 | **`codegraph-ui`** | `crates/ui` | Embedded Axum HTTP server hosting the Cytoscape.js interactive graph explorer SPA compiled into the binary via `rust-embed`. |
 | **`codegraph-cli`** | `crates/cli` | Command-line interface (`codegraph index`, `mcp`, `ui`, `query`, `tools`, `status`, `dump-ast`, `facts`). |
 
+Outside the workspace, `skills/codegraph/SKILL.md` is the agent skill (Claude Code, Codex, Antigravity) that teaches coding agents to read supported files through CodeGraph. It isn't compiled; keep it in sync with the tool registry and supported extensions.
+
 ---
 
 ## Prerequisites
@@ -78,6 +80,7 @@ CODEGRAPH_UI_DEV=crates/ui/assets cargo run -p codegraph-cli -- ui fixtures/full
 3. Implement the tool function returning `crate::tools::ToolResult` (`Result<Out, ToolError>`).
 4. Register the tool with the `tool!` macro in `crates/mcp/src/tools/mod.rs` inside `pub fn registry()`.
 5. Add unit and integration tests in `crates/mcp/tests/tools.rs`.
+6. Document the tool in `README.md` and, if agents should reach for it, add it to the tables in `skills/codegraph/SKILL.md`.
 
 ---
 
@@ -91,6 +94,7 @@ CODEGRAPH_UI_DEV=crates/ui/assets cargo run -p codegraph-cli -- ui fixtures/full
    - Imports and exports.
    - Framework routes, DI registrations, and configuration accesses where applicable.
 4. Add fixture files and extraction unit tests in `crates/core/tests/extraction.rs`.
+5. List the new extensions in the README's *Supported Languages* table and in both the `description` and *Supported files* table of `skills/codegraph/SKILL.md`, so agents know to read those files through the graph.
 
 ---
 

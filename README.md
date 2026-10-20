@@ -29,7 +29,9 @@
 - [Connecting to AI Coding Agents (MCP)](#connecting-to-ai-coding-agents-mcp)
   - [Claude Code](#claude-code)
   - [Claude Desktop / Cursor / Antigravity](#claude-desktop--cursor--antigravity)
+  - [Codex](#codex)
   - [Windsurf & VS Code Extensions](#windsurf--vs-code-extensions)
+- [Agent Skills (Claude Code, Codex, Antigravity)](#agent-skills-claude-code-codex-antigravity)
 - [Confidence Levels & Evidence Tracing](#confidence-levels--evidence-tracing)
 - [MCP Toolset (28 Analytical Tools)](#mcp-toolset-28-analytical-tools)
 - [Interactive Graph Explorer (`codegraph ui`)](#interactive-graph-explorer-codegraph-ui)
@@ -149,6 +151,11 @@ Opens `http://localhost:4321` in your default browser with an interactive graph,
   --args '{"query":"OrderService"}'
 ```
 
+`query` indexes the project on first use and re-indexes changed files before answering, so it is safe to call right after editing code.
+
+> [!IMPORTANT]
+> Windows PowerShell 5.1 strips the inner double quotes from arguments passed to native executables. Escape them there: `--args '{\"query\":\"OrderService\"}'`. Bash, Git Bash and PowerShell 7.3+ accept the plain form.
+
 ---
 
 ## Connecting to AI Coding Agents (MCP)
@@ -190,6 +197,16 @@ On **Windows**:
 }
 ```
 
+### Codex
+
+Add the server to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.codegraph]
+command = "/usr/local/bin/codegraph"   # e.g. 'C:\tools\codegraph.exe' on Windows
+args = ["mcp", "--root", "/path/to/your/project"]
+```
+
 ### Windsurf & VS Code Extensions
 
 For extensions supporting MCP servers over standard input/output (e.g. Continue, Roo Code, Cline):
@@ -208,6 +225,35 @@ For extensions supporting MCP servers over standard input/output (e.g. Continue,
 
 > [!TIP]
 > If `--root` is omitted from `args`, CodeGraph checks the `CODEGRAPH_ROOT` environment variable and falls back to the current working directory. Logs are written exclusively to `stderr` (`CODEGRAPH_LOG=debug` or `warn`), leaving `stdout` clean for JSON-RPC messages.
+
+---
+
+## Agent Skills (Claude Code, Codex, Antigravity)
+
+An MCP server makes the tools available; a skill teaches the agent **when** to reach for them. [`skills/codegraph/SKILL.md`](skills/codegraph/SKILL.md) tells the agent to read supported files through the graph instead of opening them whole:
+
+1. Map the file with `get_file_outline` / `get_file_skeleton`.
+2. Read only the symbols it needs with `get_symbol_body`.
+3. Follow callers, types, DI, routes and tests through the graph instead of grep.
+4. Before editing, read just the line range the outline reported.
+
+It falls back to normal reading for unsupported files (Markdown, YAML, `.d.ts`, `.min.js`, assets…), small files, and answers that look wrong. The skill uses the MCP tools when the server is registered and the `codegraph query` CLI otherwise, so it also works with no MCP setup.
+
+Install it by copying the folder into the agent's skills directory:
+
+| Agent | Skills directory |
+|---|---|
+| Claude Code | `~/.claude/skills/codegraph/` (or `<project>/.claude/skills/codegraph/` for one repo) |
+| Codex | `~/.codex/skills/codegraph/` |
+| Antigravity | `~/.gemini/config/skills/codegraph/` |
+
+```bash
+cp -r skills/codegraph ~/.claude/skills/
+cp -r skills/codegraph ~/.codex/skills/
+cp -r skills/codegraph ~/.gemini/config/skills/
+```
+
+If `codegraph` isn't on your `PATH`, edit the **Binary** line in the copied `SKILL.md` to point at your executable.
 
 ---
 
@@ -375,11 +421,11 @@ If unconfigured, CodeGraph applies default Clean Architecture layering conventio
 | Language / Tech | Extensions | Frameworks & Special Capabilities |
 |---|---|---|
 | **C# / .NET** | `.cs` | ASP.NET Core controllers, minimal APIs, .NET DI (`AddScoped`, `AddSingleton`, `AddTransient`), EF Core (`DbSet<T>`, LINQ queries), top-level statements, preprocessor directive neutralization (`#if UNITY_EDITOR`), Unity engine messages (`Awake`, `Update`), Unity hooks (`[MenuItem]`, `[InitializeOnLoadMethod]`), `PlayerPrefs`/`EditorPrefs`, `UnityWebRequest`. |
-| **TypeScript / JavaScript** | `.ts`, `.tsx`, `.js`, `.jsx` | React components & JSX trees, NestJS (`@Controller`, `@Injectable`, `@Module`, DI tokens), TypeORM (`@Entity`, relationships), Mongoose schemas, Axios/Fetch HTTP calls, Vitest & Jest test suites. |
-| **Python** | `.py` | FastAPI (`@app.get`, `Depends`), Flask routes, Django ORM (`models.Model`), SQLAlchemy & SQLModel (`mapped_column`, `relationship`), Pydantic models, Pytest test suites. |
+| **TypeScript / JavaScript** | `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs` (declaration files `.d.ts` and minified `.min.js` are skipped) | React components & JSX trees, NestJS (`@Controller`, `@Injectable`, `@Module`, DI tokens), TypeORM (`@Entity`, relationships), Mongoose schemas, Axios/Fetch HTTP calls, Vitest & Jest test suites. |
+| **Python** | `.py`, `.pyi` | FastAPI (`@app.get`, `Depends`), Flask routes, Django ORM (`models.Model`), SQLAlchemy & SQLModel (`mapped_column`, `relationship`), Pydantic models, Pytest test suites. |
 | **Rust** | `.rs` | Crates and workspaces (`Cargo.toml` names, `mod` / `use` paths, `pub use` re-exports), `impl` blocks merged with their type across files, trait dispatch (`dyn Trait`, generic bounds), `Result` / `Option` unwrapping (`?`), calls inside macros, axum / actix-web / Rocket routes, reqwest calls, `std::env::var` config, `Err(..)` / `panic!` error flow, diesel / sqlx / SeaORM models, `#[test]` functions and `#[cfg(test)]` modules. |
 | **Prisma** | `.prisma` | Data models, field definitions, relation mapping (`@relation`), foreign key constraints. |
-| **Configuration Files** | `appsettings*.json`, `.env*` | Environment variables, connection strings, structured configuration matrices. |
+| **Configuration Files** | `appsettings*.json`, `local.settings.json`, `.env`, `.env.*` | Environment variables, connection strings, structured configuration matrices. |
 
 ---
 
