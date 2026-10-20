@@ -22,6 +22,8 @@ pub struct HotspotParams {
     pub limit: Option<usize>,
     /// Optional module filter (path fragment).
     pub module: Option<String>,
+    /// Include third-party (vendor) and generated code (default false).
+    pub include_vendor: Option<bool>,
     pub max_token_budget: Option<usize>,
     pub format: Option<String>,
 }
@@ -32,12 +34,12 @@ pub fn get_complexity_hotspots(ctx: &Ctx, p: HotspotParams) -> ToolResult {
     let sql = format!(
         "SELECT {}, (SELECT COUNT(*) FROM edge e WHERE e.target_id = n.id AND e.relation IN ('CALLS', 'HTTP_CALLS')) AS fan_in \
          FROM node n WHERE n.derived = 0 AND n.kind IN ('function', 'method', 'constructor', 'test') AND n.cyclomatic_complexity >= ?1 \
-         AND (?2 IS NULL OR n.file_path LIKE '%' || ?2 || '%') ORDER BY n.cyclomatic_complexity DESC, n.file_path, n.start_line, n.id LIMIT 500",
+         AND (?2 IS NULL OR n.file_path LIKE '%' || ?2 || '%')          AND (?3 = 1 OR (n.file_path NOT IN (SELECT file_path FROM file_meta WHERE is_vendor = 1)               AND n.file_path NOT IN (SELECT file_path FROM node WHERE kind = 'module' AND attrs LIKE '%\"generated\"%')))          ORDER BY n.cyclomatic_complexity DESC, n.file_path, n.start_line, n.id LIMIT 500",
         NODE_COLS.split(", ").map(|c| format!("n.{c}")).collect::<Vec<_>>().join(", ")
     );
     let mut st = ctx.conn.prepare(&sql)?;
     let mut rows: Vec<(Node, i64)> = st
-        .query_map(params![min, p.module], |r| Ok((node_from_row(r)?, r.get::<_, i64>(codegraph_graph::store::NODE_COLS_LEN)?)))?
+        .query_map(params![min, p.module, p.include_vendor.unwrap_or(false)], |r| Ok((node_from_row(r)?, r.get::<_, i64>(codegraph_graph::store::NODE_COLS_LEN)?)))?
         .flatten()
         .collect();
     let risk = |n: &Node, fan_in: i64| n.sym.complexity as f64 * (1.0 + (1.0 + fan_in as f64).ln());

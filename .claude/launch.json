@@ -53,6 +53,21 @@
         "CODEGRAPH_CONFIG_DIR": "target/launcher-config"
       },
       "port": 4321
+    },
+    {
+      "name": "codegraph-ui-edge-unity",
+      "runtimeExecutable": "target/debug/codegraph.exe",
+      "runtimeArgs": [
+        "ui",
+        "fixtures/edge-cases/unity",
+        "--no-open",
+        "--port",
+        "4324"
+      ],
+      "env": {
+        "CODEGRAPH_UI_DEV": "crates/ui/assets"
+      },
+      "port": 4324
     }
   ]
 }

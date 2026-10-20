@@ -201,7 +201,9 @@ async fn search(Eng(engine): Eng, Query(q): Query<SearchQ>) -> Result<Json<Value
     blocking(move || {
         let conn = engine.reader()?;
         let (rows, total) = query::search(&conn, &q.q, q.kind.as_deref(), q.limit.unwrap_or(30), false)?;
-        Ok(Json(json!({ "total": total, "results": rows.iter().map(|n| node_json(n, None)).collect::<Vec<_>>() })))
+        let mut results: Vec<Value> = rows.iter().map(|n| node_json(n, None)).collect();
+        mark_vendor(&mut results, &vendor_files(&conn)?);
+        Ok(Json(json!({ "total": total, "results": results })))
     })
     .await
 }
@@ -212,6 +214,23 @@ struct GraphQ {
     depth: Option<usize>,
     relations: Option<String>,
     limit: Option<usize>,
+    /// Include third-party code in the overview graph (default false).
+    include_vendor: Option<bool>,
+}
+
+/// Files flagged as third-party code.
+fn vendor_files(conn: &rusqlite::Connection) -> Result<HashSet<String>, ApiError> {
+    let mut st = conn.prepare("SELECT file_path FROM file_meta WHERE is_vendor = 1")?;
+    let rows: HashSet<String> = st.query_map([], |r| r.get::<_, String>(0))?.flatten().collect();
+    Ok(rows)
+}
+
+/// Adds the `vendor` flag to node JSON values carrying a `file`.
+fn mark_vendor(values: &mut [Value], vendor: &HashSet<String>) {
+    for v in values.iter_mut() {
+        let is = v["file"].as_str().map(|f| vendor.contains(f)).unwrap_or(false);
+        v["vendor"] = json!(is);
+    }
 }
 
 const DEFAULT_RELATIONS: &[&str] = &[
@@ -226,6 +245,7 @@ const DEFAULT_RELATIONS: &[&str] = &[
     "READS_VAR",
     "WRITES_VAR",
     "USES_LITERAL",
+    "USES_TYPE",
 ];
 
 async fn graph(Eng(engine): Eng, Query(q): Query<GraphQ>) -> Result<Json<Value>, ApiError> {
@@ -277,9 +297,14 @@ async fn graph(Eng(engine): Eng, Query(q): Query<GraphQ>) -> Result<Json<Value>,
             None => {
                 // Overview: most connected symbols (excluding modules & literals) and their links.
                 let ph = rel_refs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let vendor_filter = if q.include_vendor.unwrap_or(false) {
+                    ""
+                } else {
+                    " AND n.file_path NOT IN (SELECT file_path FROM file_meta WHERE is_vendor = 1)"
+                };
                 let sql = format!(
                     "SELECT id FROM (SELECT n.id, (SELECT COUNT(*) FROM edge e WHERE (e.source_id = n.id OR e.target_id = n.id) AND e.relation IN ({ph})) AS deg \
-                     FROM node n WHERE n.kind NOT IN ('module', 'literal', 'field', 'property', 'variable', 'const')) WHERE deg > 0 ORDER BY deg DESC LIMIT {limit}"
+                     FROM node n WHERE n.kind NOT IN ('module', 'literal', 'field', 'property', 'variable', 'const'){vendor_filter}) WHERE deg > 0 ORDER BY deg DESC LIMIT {limit}"
                 );
                 let mut st = conn.prepare(&sql)?;
                 let ids: Vec<String> = st.query_map(rusqlite::params_from_iter(rel_refs.iter()), |r| r.get(0))?.flatten().collect();
@@ -298,6 +323,7 @@ async fn graph(Eng(engine): Eng, Query(q): Query<GraphQ>) -> Result<Json<Value>,
         let ids: Vec<String> = node_ids.into_iter().collect();
         let nodes = query::nodes_by_ids(&conn, &ids)?;
         let mut node_list: Vec<Value> = nodes.values().map(|n| node_json(n, None)).collect();
+        mark_vendor(&mut node_list, &vendor_files(&conn)?);
         // Placeholder nodes for unresolved targets.
         let mut extra = HashSet::new();
         for e in &edges {
@@ -337,6 +363,7 @@ struct TreeQ {
     /// Levels of descendants to include (1 = direct children).
     depth: Option<usize>,
     limit: Option<usize>,
+    include_vendor: Option<bool>,
 }
 
 /// Children of a hierarchy item (roots when `id` is empty), plus the item's ancestor path.
@@ -355,7 +382,7 @@ async fn tree_children(Eng(engine): Eng, Query(q): Query<TreeQ>) -> Result<Json<
         'outer: for _ in 0..depth {
             let mut next = Vec::new();
             for p in level {
-                let kids = tree.children_json(p.as_deref());
+                let kids = tree.children_json(p.as_deref(), q.include_vendor.unwrap_or(false));
                 if items.len() + kids.len() > limit {
                     truncated = true;
                     break 'outer;
@@ -444,6 +471,8 @@ async fn node_detail(Eng(engine): Eng, Path(id): Path<String>) -> Result<Json<Va
         nj["bases"] = json!(n.sym.bases);
         nj["type_ref"] = json!(n.sym.type_ref);
         nj["params"] = json!(n.sym.params);
+        nj["modifiers"] = json!(n.sym.modifiers);
+        nj["vendor"] = json!(vendor_files(&conn)?.contains(&n.file_path));
         Ok(Json(json!({
             "node": nj,
             "parent": parent,
@@ -475,7 +504,12 @@ async fn reindex(Eng(engine): Eng) -> Result<Json<Value>, ApiError> {
 }
 
 /// Dashboard data: graph statistics plus the lists used by the sidebar views.
-async fn overview(Eng(engine): Eng) -> Result<Json<Value>, ApiError> {
+#[derive(Deserialize)]
+struct OverviewQ {
+    include_vendor: Option<bool>,
+}
+
+async fn overview(Eng(engine): Eng, Query(oq): Query<OverviewQ>) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let conn = engine.reader()?;
         let status = engine.status()?;
@@ -500,10 +534,20 @@ async fn overview(Eng(engine): Eng) -> Result<Json<Value>, ApiError> {
             Ok(rows.iter().map(|n| node_json(n, None)).collect())
         };
         let cols = codegraph_graph::store::NODE_COLS;
-        let entrypoints = node_list(&format!("SELECT {cols} FROM node WHERE is_entrypoint = 1 ORDER BY entry_kind, file_path, start_line, id LIMIT 200"))?;
+        // Third-party and generated code stay out of the dashboard lists unless asked for.
+        let own = if oq.include_vendor.unwrap_or(false) {
+            String::new()
+        } else {
+            " AND file_path NOT IN (SELECT file_path FROM file_meta WHERE is_vendor = 1) \
+              AND file_path NOT IN (SELECT file_path FROM node WHERE kind = 'module' AND attrs LIKE '%\"generated\"%')"
+                .to_string()
+        };
+        let entrypoints =
+            node_list(&format!("SELECT {cols} FROM node WHERE is_entrypoint = 1{own} ORDER BY entry_kind, file_path, start_line, id LIMIT 200"))?;
         let hotspots = node_list(&format!(
-            "SELECT {cols} FROM node WHERE kind IN ('function','method','constructor') AND cyclomatic_complexity > 1 ORDER BY cyclomatic_complexity DESC, file_path, start_line, id LIMIT 50"
+            "SELECT {cols} FROM node WHERE kind IN ('function','method','constructor') AND cyclomatic_complexity > 1{own} ORDER BY cyclomatic_complexity DESC, file_path, start_line, id LIMIT 50"
         ))?;
+        let vendor_count: i64 = conn.query_row("SELECT COUNT(*) FROM file_meta WHERE is_vendor = 1", [], |r| r.get(0))?;
         let models = {
             let mut st = conn.prepare(&format!(
                 "SELECT {}, d.framework, (SELECT COUNT(*) FROM data_model_field f WHERE f.model_node_id = n.id) FROM data_model d JOIN node n ON n.id = d.model_node_id ORDER BY n.name, n.file_path, n.id",
@@ -548,6 +592,7 @@ async fn overview(Eng(engine): Eng) -> Result<Json<Value>, ApiError> {
             "hotspots": hotspots,
             "models": models,
             "unresolved": unresolved,
+            "vendor_files": vendor_count,
         })))
     })
     .await

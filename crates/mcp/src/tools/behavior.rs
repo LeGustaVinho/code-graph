@@ -254,6 +254,8 @@ pub struct OrphanParams {
     pub module: Option<String>,
     /// Include exported / public symbols (default true).
     pub include_exported: Option<bool>,
+    /// Include third-party (vendor) code such as Assets/Plugins (default false).
+    pub include_vendor: Option<bool>,
     /// Maximum results (default 50).
     pub limit: Option<usize>,
     pub max_token_budget: Option<usize>,
@@ -371,6 +373,14 @@ pub fn find_orphaned_symbols(ctx: &Ctx, p: OrphanParams) -> ToolResult {
         let rows: HashSet<String> = st.query_map([], |r| r.get::<_, String>(0))?.flatten().collect();
         rows
     };
+    // Third-party code is not the project's to clean up.
+    let vendor_files: HashSet<String> = if p.include_vendor.unwrap_or(false) {
+        HashSet::new()
+    } else {
+        let mut st = conn.prepare("SELECT file_path FROM file_meta WHERE is_vendor = 1")?;
+        let rows: HashSet<String> = st.query_map([], |r| r.get::<_, String>(0))?.flatten().collect();
+        rows
+    };
     let used = |id: &str| referenced.contains(id) || dynamic_ids.contains(id) || entry_ids.contains(id);
     let used_or_members_used = |id: &str| used(id) || children.get(id).map(|k| k.iter().any(|(c, _)| used(c))).unwrap_or(false);
     let ancestors = |t: &str| -> Vec<String> {
@@ -405,7 +415,7 @@ pub fn find_orphaned_symbols(ctx: &Ctx, p: OrphanParams) -> ToolResult {
     let mut out_rows = Vec::new();
     for n in rows {
         let s = &n.sym;
-        if used_or_members_used(&s.id) || generated_files.contains(&n.file_path) {
+        if used_or_members_used(&s.id) || generated_files.contains(&n.file_path) || vendor_files.contains(&n.file_path) {
             continue;
         }
         if s.kind.is_type() && is_serialized(&s.id) {

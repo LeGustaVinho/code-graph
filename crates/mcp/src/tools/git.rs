@@ -35,7 +35,8 @@ fn changed_files(root: &Path, git_ref: &str) -> Result<(Vec<String>, HashSet<Str
     let mut files: Vec<String> = tracked.lines().map(|l| l.trim().replace('\\', "/")).filter(|l| !l.is_empty()).collect();
     let new: HashSet<String> = untracked.lines().map(|l| l.trim().replace('\\', "/")).filter(|l| !l.is_empty()).collect();
     files.extend(new.iter().cloned());
-    files.retain(|f| Language::from_path(Path::new(f)).is_some() && !codegraph_core::walk::is_ignored_rel_path(f));
+    let rules = codegraph_core::walk::IgnoreRules::load(root);
+    files.retain(|f| Language::from_path(Path::new(f)).is_some() && !rules.is_ignored(f));
     files.sort();
     files.dedup();
     Ok((files, new))

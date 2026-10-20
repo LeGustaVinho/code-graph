@@ -88,3 +88,33 @@ fn reachability_without_scenes() {
         assert!(!text.contains(reachable), "{reachable} is reachable through scenes / assets:\n{text}");
     }
 }
+
+// ---------------------------------------------------------------- phase 5: discovery & vendor
+
+#[test]
+fn engine_folders_skipped_nested_build_folders_kept() {
+    let mut f = fixture();
+    let c = &f.conn;
+    assert_eq!(count(c, "SELECT COUNT(*) FROM file_meta WHERE file_path LIKE 'Library/%'"), 0, "Library/PackageCache");
+    assert_eq!(count(c, "SELECT COUNT(*) FROM file_meta WHERE file_path = 'Assets/Editor/Build/PostBuild.cs'"), 1);
+    assert!(entry(&f, "PostBuild.OnPostprocessBuild").contains("PostProcessBuild"));
+    // Incremental re-index (watcher / freshness path) applies the same rules.
+    let rel = "Library/PackageCache/com.unity.foo/Cached.cs".to_string();
+    codegraph_graph::index_paths(&f.root.clone(), &mut f.conn, &[rel]).unwrap();
+    assert_eq!(count(&f.conn, "SELECT COUNT(*) FROM file_meta WHERE file_path LIKE 'Library/%'"), 0);
+}
+
+#[test]
+fn third_party_code_is_flagged_and_left_out_of_reports() {
+    let f = fixture();
+    let c = &f.conn;
+    let vendor = |p: &str| count(c, &format!("SELECT COALESCE(MAX(is_vendor), -1) FROM file_meta WHERE file_path = '{p}'"));
+    assert_eq!(vendor("Assets/Plugins/Vendor/VendorLib.cs"), 1);
+    assert_eq!(vendor("Packages/com.vendor.tool/Editor/EditorUtil.cs"), 1);
+    assert_eq!(vendor("Assets/Scripts/Player.cs"), 0);
+    let engine = codegraph_mcp::Engine::open(&f.root).unwrap();
+    let (default, _) = codegraph_mcp::call_tool(&engine, "find_orphaned_symbols", json!({ "limit": 200 }));
+    assert!(!default.contains("VendorLib"), "{default}");
+    let (all, _) = codegraph_mcp::call_tool(&engine, "find_orphaned_symbols", json!({ "limit": 200, "include_vendor": true }));
+    assert!(all.contains("VendorLib"), "{all}");
+}

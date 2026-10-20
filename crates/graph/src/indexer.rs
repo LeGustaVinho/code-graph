@@ -73,12 +73,14 @@ pub fn index_project(root: &Path, conn: &mut Connection, opts: IndexOptions) -> 
 pub fn index_paths(root: &Path, conn: &mut Connection, rel_paths: &[String]) -> Result<IndexStats> {
     let mut candidates = Vec::new();
     let mut removed = Vec::new();
+    // Same rules as discovery: .gitignore / .ignore / .codegraphignore, build and engine folders.
+    let rules = codegraph_core::walk::IgnoreRules::load(root);
     for rel in rel_paths {
         let abs = root.join(rel);
         match std::fs::metadata(&abs) {
             Ok(meta) if meta.is_file() => {
                 if let Some(language) = Language::from_path(&abs) {
-                    if codegraph_core::walk::is_ignored_rel_path(rel) {
+                    if rules.is_ignored(rel) {
                         continue;
                     }
                     candidates.push(SourceFile {
@@ -109,6 +111,7 @@ pub fn stale_files(root: &Path, conn: &Connection, only: Option<&[String]>) -> R
     let mut stale = Vec::new();
     match only {
         Some(paths) => {
+            let rules = codegraph_core::walk::IgnoreRules::load(root);
             for p in paths {
                 let abs = root.join(p);
                 match (std::fs::metadata(&abs), meta.get(p)) {
@@ -118,7 +121,7 @@ pub fn stale_files(root: &Path, conn: &Connection, only: Option<&[String]>) -> R
                         }
                     }
                     (Ok(m), None) => {
-                        if m.is_file() && Language::from_path(&abs).is_some() {
+                        if m.is_file() && Language::from_path(&abs).is_some() && !rules.is_ignored(p) {
                             stale.push(p.clone());
                         }
                     }
@@ -256,6 +259,22 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
                     "INSERT OR REPLACE INTO file_meta (file_path, content_hash, last_mtime, size, last_indexed_at, status, language, line_count, error, facts) VALUES (?1, ?2, ?3, ?4, ?5, 'error', ?6, 0, ?7, NULL)",
                     params![p.file.rel_path, p.hash, p.file.mtime, p.file.size as i64, now, p.file.language.as_str(), e],
                 )?;
+            }
+        }
+    }
+    // Third-party code (defaults + `.codegraph/config.toml`), re-evaluated for every file.
+    {
+        let vendor = codegraph_core::walk::VendorRules::load(root);
+        let files: Vec<(String, bool)> = {
+            let mut st = tx.prepare("SELECT file_path, is_vendor FROM file_meta")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))?;
+            rows.flatten().collect()
+        };
+        let mut st = tx.prepare_cached("UPDATE file_meta SET is_vendor = ?2 WHERE file_path = ?1")?;
+        for (f, current) in files {
+            let v = vendor.is_vendor(&f);
+            if v != current {
+                st.execute(params![f, v])?;
             }
         }
     }

@@ -261,11 +261,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "globset",
  "ignore",
  "rayon",
  "serde",
  "serde_json",
  "tempfile",
+ "toml",
  "tree-sitter",
  "tree-sitter-c-sharp",
  "tree-sitter-javascript",

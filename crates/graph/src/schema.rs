@@ -5,7 +5,7 @@
 
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
 
 const TABLES: &[&str] = &[
     "file_meta",
@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS file_meta (
     language        TEXT,
     line_count      INTEGER,
     error           TEXT,
-    facts           TEXT                    -- JSON references kept for re-resolution without re-parsing
+    facts           TEXT,                   -- JSON references kept for re-resolution without re-parsing
+    is_vendor       INTEGER NOT NULL DEFAULT 0  -- third-party code (Assets/Plugins, vendor/, config)
 );
 
 CREATE TABLE IF NOT EXISTS node (

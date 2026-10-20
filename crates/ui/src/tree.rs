@@ -22,6 +22,8 @@ pub struct TreeItem {
     pub coords: String,
     pub is_entrypoint: bool,
     pub signature: String,
+    /// Third-party code (a folder / namespace is vendor when everything in it is).
+    pub vendor: bool,
 }
 
 pub struct Tree {
@@ -46,6 +48,11 @@ impl Tree {
         let mut items: HashMap<String, TreeItem> = HashMap::new();
         let mut file_ns: HashMap<String, BTreeMap<String, usize>> = HashMap::new();
         let mut module_of_file: HashMap<String, String> = HashMap::new();
+        let vendor_files: HashSet<String> = {
+            let mut st = conn.prepare("SELECT file_path FROM file_meta WHERE is_vendor = 1")?;
+            let rows: HashSet<String> = st.query_map([], |r| r.get::<_, String>(0))?.flatten().collect();
+            rows
+        };
         {
             let mut st = conn.prepare(
                 "SELECT id, parent_id, kind, name, qualified_name, file_path, namespace, start_line, end_line, is_entrypoint, signature \
@@ -75,6 +82,7 @@ impl Tree {
                     module_of_file.insert(file.clone(), id.clone());
                 }
                 let coords = if end > start { format!("{file}:{start}-{end}") } else { format!("{file}:{start}") };
+                let vendor = vendor_files.contains(&file);
                 items.insert(
                     id.clone(),
                     TreeItem {
@@ -89,6 +97,7 @@ impl Tree {
                         coords,
                         is_entrypoint: entry,
                         signature: sig,
+                        vendor,
                     },
                 );
             }
@@ -124,6 +133,7 @@ impl Tree {
                     coords: String::new(),
                     is_entrypoint: false,
                     signature: String::new(),
+                    vendor: false,
                 });
                 parent = Some(id);
             }
@@ -164,6 +174,7 @@ impl Tree {
         }
         let mut tree = Tree { items, children, roots };
         tree.compact();
+        tree.mark_vendor_containers();
         let sort_key = |t: &Tree, id: &String| {
             let i = &t.items[id];
             (rank(&i.kind), i.start, i.label.to_ascii_lowercase())
@@ -257,10 +268,12 @@ impl Tree {
             "is_entrypoint": it.is_entrypoint,
             "signature": it.signature,
             "child_count": count,
+            "vendor": it.vendor,
         }))
     }
 
-    pub fn children_json(&self, id: Option<&str>) -> Vec<Value> {
+    /// Children of `id` (roots when empty); third-party items only with `include_vendor`.
+    pub fn children_json(&self, id: Option<&str>, include_vendor: bool) -> Vec<Value> {
         let ids = match id {
             None | Some("") => &self.roots,
             Some(p) => match self.children.get(p) {
@@ -268,7 +281,32 @@ impl Tree {
                 None => return Vec::new(),
             },
         };
-        ids.iter().filter_map(|c| self.item_json(c)).collect()
+        ids.iter()
+            .filter(|c| include_vendor || !self.items.get(*c).map(|i| i.vendor).unwrap_or(false))
+            .filter_map(|c| self.item_json(c))
+            .collect()
+    }
+
+    /// Containers are vendor when every item inside them is.
+    fn mark_vendor_containers(&mut self) {
+        fn visit(t: &mut Tree, id: &str, guard: u32) -> bool {
+            let kids = t.children.get(id).cloned().unwrap_or_default();
+            let kind = t.items.get(id).map(|i| i.kind.clone()).unwrap_or_default();
+            if guard > 64 || !matches!(kind.as_str(), "namespace" | "directory") {
+                return t.items.get(id).map(|i| i.vendor).unwrap_or(false);
+            }
+            let mut all = !kids.is_empty();
+            for k in &kids {
+                all &= visit(t, k, guard + 1);
+            }
+            if let Some(i) = t.items.get_mut(id) {
+                i.vendor = all;
+            }
+            all
+        }
+        for r in self.roots.clone() {
+            visit(self, &r, 0);
+        }
     }
 
     /// Aggregates relations onto the visible items (each endpoint climbs to its nearest

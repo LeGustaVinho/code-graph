@@ -63,10 +63,10 @@
     unresolved: { color: "#ef4444", shape: "octagon" },
   };
   const kindColor = (k) => (KINDS[k] || KINDS.variable).color;
-  const RELATIONS = ["CALLS", "HTTP_CALLS", "RESOLVES_DI", "INHERITS", "THROWS", "CAUGHT_BY", "TESTS", "IMPORTS", "READS_VAR", "WRITES_VAR", "USES_LITERAL"];
+  const RELATIONS = ["CALLS", "HTTP_CALLS", "RESOLVES_DI", "INHERITS", "THROWS", "CAUGHT_BY", "TESTS", "IMPORTS", "READS_VAR", "WRITES_VAR", "USES_TYPE", "USES_LITERAL"];
   const REL_COLORS = {
     CALLS: "#64748b", HTTP_CALLS: "#6366f1", RESOLVES_DI: "#8b5cf6", INHERITS: "#0ea5e9", THROWS: "#ef4444", CAUGHT_BY: "#f97316",
-    TESTS: "#10b981", IMPORTS: "#94a3b8", READS_VAR: "#14b8a6", WRITES_VAR: "#eab308", USES_LITERAL: "#a3a3a3",
+    TESTS: "#10b981", IMPORTS: "#94a3b8", READS_VAR: "#14b8a6", WRITES_VAR: "#eab308", USES_LITERAL: "#a3a3a3", USES_TYPE: "#0891b2",
   };
   const DEFAULT_RELATIONS = ["CALLS", "HTTP_CALLS", "RESOLVES_DI", "INHERITS", "THROWS", "CAUGHT_BY", "TESTS"];
   const CONFIDENCES = ["exact", "inferred", "unresolved"];
@@ -121,6 +121,8 @@
     groupBy: GROUPS.includes(store.get("groupBy", "none")) ? store.get("groupBy", "none") : "none",
     spacing: SPACING[store.get("spacing", "normal")] ? store.get("spacing", "normal") : "normal",
     treeLinks: store.get("treeLinks", true),
+    // Third-party code (Assets/Plugins, vendor/, …) in graphs and lists.
+    includeVendor: store.get("includeVendor", false),
     edgeMode: EDGE_MODES.includes(store.get("edgeMode", "all")) ? store.get("edgeMode", "all") : "all",
     edgeAnchor: null,
     // Hierarchy model: items by id, loaded child lists by parent ("" = roots), expanded containers.
@@ -255,6 +257,10 @@
         <span class="radio"></span>${edgeSwatch[m] || ""}<span class="label">${esc(t("edges." + m))}</span>${edgeCount[m] !== undefined && edgeCount[m] !== null ? `<span class="count">${num(edgeCount[m])}</span>` : ""}</button>`
     ).join(""));
 
+    const vendorCount = state.overview?.vendor_files || 0;
+    setHTML($("#scope-filters"), `<button class="filter ${state.includeVendor ? "" : "off"}" data-vendor-toggle title="${esc(t("scope.vendor.desc"))}">
+        <span class="checkbox">${icon("check", 11)}</span><span class="label">${esc(t("scope.vendor"))}</span><span class="count">${num(vendorCount)}</span></button>`);
+
     const st = state.status?.stats;
     setHTML($("#index-info"), st
       ? `<span>${esc(t("index.files"))}</span><b>${num(st.files)}</b>
@@ -374,6 +380,8 @@
       },
       ...kindStyles,
       { selector: "node[?is_entrypoint]", style: { "border-color": "#f59e0b", "border-width": 3 } },
+      // Third-party code recedes (shown only when "third-party code" is on).
+      { selector: "node[?vendor]", style: { opacity: 0.6, "border-style": "dashed" } },
       // Collapsed containers (namespace / folder / file / type with hidden children).
       {
         selector: "node.collapsed",
@@ -820,7 +828,7 @@
       const rels = [...state.relations].join(",");
       const url = state.focus
         ? `/api/graph?focus=${encodeURIComponent(state.focus)}&depth=${state.depth}&relations=${rels}`
-        : `/api/graph?relations=${rels}&limit=220`;
+        : `/api/graph?relations=${rels}&limit=220&include_vendor=${state.includeVendor}`;
       const data = await api(url);
       render(data, state.focus);
     } catch (e) {
@@ -875,7 +883,8 @@
     const todo = parents.filter((p) => !tree.kids.has(p));
     for (let i = 0; i < todo.length; i += 80) {
       const chunk = todo.slice(i, i + 80);
-      const url = chunk.length === 1 && chunk[0] === "" ? "/api/tree?limit=5000" : `/api/tree?ids=${chunk.map(encodeURIComponent).join(",")}&limit=5000`;
+      const v = `&include_vendor=${state.includeVendor}`;
+      const url = chunk.length === 1 && chunk[0] === "" ? `/api/tree?limit=5000${v}` : `/api/tree?ids=${chunk.map(encodeURIComponent).join(",")}&limit=5000${v}`;
       const r = await api(url);
       storeTreeItems(r.items);
       if (!r.truncated) for (const p of chunk) if (!tree.kids.has(p)) tree.kids.set(p, []);
@@ -1020,7 +1029,7 @@
     busy(true);
     try {
       const room = Math.max(10, TREE_CAP - treeVisible().length);
-      const r = await api(`/api/tree?id=${encodeURIComponent(id)}&depth=8&limit=${room}`);
+      const r = await api(`/api/tree?id=${encodeURIComponent(id)}&depth=8&limit=${room}&include_vendor=${state.includeVendor}`);
       const groups = storeTreeItems(r.items);
       for (const p of groups.keys()) if (p) tree.expanded.add(p);
       if (r.truncated) toast(t("tree.capped", { n: num(TREE_CAP) }));
@@ -1042,7 +1051,7 @@
   async function revealInTree(id) {
     busy(true);
     try {
-      const r = await api(`/api/tree?id=${encodeURIComponent(id)}`);
+      const r = await api(`/api/tree?id=${encodeURIComponent(id)}&include_vendor=true`);
       if (!r.item) return toast(t("tree.notFound"), "error");
       tree.items.set(r.item.id, r.item);
       for (const p of r.path) tree.items.set(p.id, p);
@@ -1401,6 +1410,7 @@
   function nodeHeader(n, d) {
     const badges = [kindBadge(n.kind)];
     if (n.entry_kind) badges.push(`<span class="badge entry">${icon("entry", 12)}${esc(n.entry_kind)}</span>`);
+    if (n.vendor) badges.push(`<span class="badge" title="${esc(t("scope.vendor.desc"))}">${esc(t("badge.vendor"))}</span>`);
     if (n.is_test) badges.push(`<span class="badge test">${icon("tests", 12)}${esc(t("ov.test"))}</span>`);
     const evCount = d.outgoing.length + d.incoming.length;
     const tabs = TABS.map(
@@ -1453,7 +1463,15 @@
         ${d.parent ? `<div class="k">${esc(t("ov.declaredIn"))}</div><div><button class="link-btn" data-open="${esc(d.parent.id)}" data-label="${esc(d.parent.label)}">${esc(d.parent.label)}</button></div>` : ""}
       </div></div>
       ${n.capabilities?.length ? `<div class="section"><div class="section-title">${esc(t("ov.capabilities"))}</div><div class="chips">${chips(n.capabilities, "cap")}</div></div>` : ""}
-      ${n.attrs?.length ? `<div class="section"><div class="section-title">${esc(t("ov.attributes"))}</div><div class="chips">${chips(n.attrs.map((a) => "@" + a))}</div></div>` : ""}
+      ${(() => {
+        // `#if UNITY_ANDROID` tags (preprocessor branches) are not attributes.
+        const attrs = (n.attrs || []).filter((a) => !a.startsWith("#"));
+        const conds = (n.attrs || []).filter((a) => a.startsWith("#"));
+        const mods = (n.modifiers || []).filter((m) => m !== "unity-msg");
+        return (attrs.length ? `<div class="section"><div class="section-title">${esc(t("ov.attributes"))}</div><div class="chips">${chips(attrs.map((a) => "@" + a))}</div></div>` : "")
+          + (conds.length ? `<div class="section"><div class="section-title">${esc(t("ov.conditions"))}</div><div class="chips">${chips(conds, "cond")}</div></div>` : "")
+          + (mods.length ? `<div class="section"><div class="section-title">${esc(t("ov.modifiers"))}</div><div class="chips">${chips(mods)}</div></div>` : "");
+      })()}
       ${n.bases?.length ? `<div class="section"><div class="section-title">${esc(t("ov.bases"))}</div><div class="chips">${chips(n.bases)}</div></div>` : ""}
       ${muts ? `<div class="section"><div class="section-title">${esc(t("ov.mutations"))}</div><table class="grid"><tbody>${muts}</tbody></table></div>` : ""}
       ${members ? `<div class="section"><div class="section-title">${esc(t("ov.members"))}<span class="count">${d.children.length}</span></div><div class="rows">${members}</div></div>` : ""}`;
@@ -1825,7 +1843,7 @@
   // ------------------------------------------------------------------ status, overview, reindex
   async function loadOverview() {
     try {
-      state.overview = await api("/api/overview");
+      state.overview = await api(`/api/overview?include_vendor=${state.includeVendor}`);
       state.status = state.overview.status;
       renderSidebar();
       renderStatus();
@@ -1929,6 +1947,16 @@
     }
     const em = el.closest("[data-edgemode]");
     if (em) return setEdgeMode(em.dataset.edgemode);
+    if (el.closest("[data-vendor-toggle]")) {
+      state.includeVendor = !state.includeVendor;
+      store.set("includeVendor", state.includeVendor);
+      // Child lists depend on the filter: refetch, keeping what was expanded.
+      tree.items.clear();
+      tree.kids.clear();
+      loadOverview();
+      renderSidebar();
+      return loadStage();
+    }
     const conf = el.closest("[data-conf]");
     if (conf) {
       const c = conf.dataset.conf;

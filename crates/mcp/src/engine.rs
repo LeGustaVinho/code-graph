@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use codegraph_core::lang::Language;
-use codegraph_core::walk::{is_ignored_rel_path, normalize_rel};
+use codegraph_core::walk::{normalize_rel, IgnoreRules};
 use codegraph_graph::{index_paths, index_project, stale_files, IndexOptions, IndexStats};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::Connection;
@@ -103,6 +103,9 @@ impl Engine {
     pub fn start_watcher(&self) {
         let dirty = self.dirty.clone();
         let root = self.root.clone();
+        // The watcher sees every write (Unity rewrites Library/PackageCache constantly): apply
+        // the same rules as discovery before marking anything dirty.
+        let rules = IgnoreRules::load(&root);
         let handler = move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
             if matches!(ev.kind, notify::EventKind::Access(_)) {
@@ -111,7 +114,7 @@ impl Engine {
             let mut d = dirty.lock().unwrap();
             for p in ev.paths {
                 let rel = normalize_rel(&root, &p);
-                if rel.starts_with("..") || is_ignored_rel_path(&rel) || rel.starts_with(".codegraph") || rel.starts_with(".git/") {
+                if rel.starts_with("..") || rules.is_ignored(&rel) || rel.starts_with(".codegraph") || rel.starts_with(".git/") {
                     continue;
                 }
                 if Language::from_path(&p).is_some() {
