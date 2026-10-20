@@ -140,7 +140,9 @@ fn is_test_assembly(v: &serde_json::Value) -> bool {
 pub fn load_assemblies(root: &Path) -> Assemblies {
     let mut defs: Vec<(String, AsmDef)> = Vec::new();
     let mut refs: Vec<(String, String)> = Vec::new();
-    collect(root, root, 0, &mut defs, &mut refs);
+    // Same folders as discovery: a Unity project's own script folders only.
+    let rules = codegraph_core::walk::IgnoreRules::load(root);
+    collect(root, root, 0, &rules, &mut defs, &mut refs);
     defs.sort_by(|a, b| a.0.cmp(&b.0));
     let mut out = Assemblies::default();
     for (dir, def) in defs {
@@ -162,7 +164,14 @@ fn read_json(path: &Path) -> Option<serde_json::Value> {
     serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
 }
 
-fn collect(root: &Path, dir: &Path, depth: usize, defs: &mut Vec<(String, AsmDef)>, refs: &mut Vec<(String, String)>) {
+fn collect(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    rules: &codegraph_core::walk::IgnoreRules,
+    defs: &mut Vec<(String, AsmDef)>,
+    refs: &mut Vec<(String, String)>,
+) {
     if depth > 12 {
         return;
     }
@@ -172,11 +181,9 @@ fn collect(root: &Path, dir: &Path, depth: usize, defs: &mut Vec<(String, AsmDef
         let name = e.file_name().to_string_lossy().to_string();
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_dir() {
-            if !name.starts_with('.')
-                && !codegraph_core::walk::is_skipped_dir(&name)
-                && !matches!(name.as_str(), "Library" | "Temp" | "Logs")
-            {
-                collect(root, &e.path(), depth + 1, defs, refs);
+            let child = if rel().is_empty() { name.clone() } else { format!("{}/{name}", rel()) };
+            if !name.starts_with('.') && !rules.dir_ignored(&child) {
+                collect(root, &e.path(), depth + 1, rules, defs, refs);
             }
         } else if name.ends_with(".asmdef") {
             let Some(v) = read_json(&e.path()) else { continue };

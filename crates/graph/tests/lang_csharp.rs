@@ -246,3 +246,98 @@ fn generated_files_and_test_hooks() {
     assert!(init.is_entrypoint && init.entry_kind.contains("SetUp"), "{init:?}");
     assert!(sym(c, "HookTests.Plays").is_test);
 }
+
+// ---------------------------------------------------------------- copies of a project
+
+/// A large overload family (`math.mul`, `Assert.AreEqual` for every vector type) gives a
+/// call one inferred link, not one edge per same-arity overload.
+#[test]
+fn large_overload_families_do_not_fan_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    let overloads: String = (0..40).map(|i| format!("public static bool AreEqual(V{i} a, V{i} b) => true; ")).collect();
+    let types: String = (0..40).map(|i| format!("public struct V{i} {{ }} ")).collect();
+    std::fs::write(root.join("Asserts.cs"), format!("namespace T {{ {types} public static class Check {{ {overloads} }} }}")).unwrap();
+    std::fs::write(
+        root.join("Uses.cs"),
+        "namespace T { public class Uses { public void Run(V3 a, V3 b) { Check.AreEqual(a, b); } public void Two() { Pair.Add(1); } } \
+         public static class Pair { public static void Add(int x) { } public static void Add(float x) { } } }",
+    )
+    .unwrap();
+    let mut conn = codegraph_graph::open(&root).unwrap();
+    codegraph_graph::index_project(&root, &mut conn, codegraph_graph::IndexOptions::default()).unwrap();
+    let run = target_sigs(&conn, "Uses.Run", "CALLS");
+    assert_eq!(run.len(), 1, "{run:?}");
+    assert_eq!(edge(&conn, "Uses.Run", "Check.AreEqual", "CALLS").as_deref(), Some("inferred"));
+    // A small overload set keeps every candidate.
+    assert_eq!(target_sigs(&conn, "Uses.Two", "CALLS").len(), 2);
+}
+
+/// Side-by-side copies of one project (build artifacts, validation snapshots): `partial`
+/// parts merge only within an assembly, so each call links once, inside its own copy.
+#[test]
+fn partial_types_merge_within_one_assembly_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    const COPIES: usize = 40;
+    for k in 0..COPIES {
+        let dir = root.join(format!("copies/run{k:02}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Graph.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\" />").unwrap();
+        std::fs::write(
+            dir.join("Graph.cs"),
+            "namespace Lib { public partial class Graph { public void Add(int x) { } public void Add(int x, int y) { } } }",
+        )
+        .unwrap();
+        std::fs::write(dir.join("Graph.Query.cs"), "namespace Lib { public partial class Graph { public int Count() { Add(1); return 0; } } }")
+            .unwrap();
+        std::fs::write(dir.join("Use.cs"), "namespace Lib { public class Use { public void Run() { var g = new Graph(); g.Add(1); g.Count(); } } }")
+            .unwrap();
+    }
+    let mut conn = codegraph_graph::open(&root).unwrap();
+    codegraph_graph::index_project(&root, &mut conn, codegraph_graph::IndexOptions::default()).unwrap();
+    // Every call site resolves to exactly one target, in the same copy.
+    let fan_out = count(
+        &conn,
+        "SELECT COALESCE(MAX(n), 0) FROM (SELECT COUNT(*) n FROM edge e JOIN node t ON t.id = e.target_id          WHERE e.relation = 'CALLS' GROUP BY e.source_id, e.line_number, t.name)",
+    );
+    if fan_out != 1 {
+        let mut st = conn
+            .prepare(
+                "SELECT s.qualified_name, e.source_file, e.line_number, t.qualified_name, e.target_file, e.confidence, e.resolver, e.evidence                  FROM edge e JOIN node s ON s.id = e.source_id JOIN node t ON t.id = e.target_id WHERE e.relation = 'CALLS' AND e.source_file LIKE 'copies/run00/%'",
+            )
+            .unwrap();
+        let rows: Vec<String> = st
+            .query_map([], |r| {
+                Ok(format!(
+                    "{} {}:{} -> {} {} {} {} {}",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?
+                ))
+            })
+            .unwrap()
+            .flatten()
+            .take(12)
+            .collect();
+        panic!("a call site fans out across copies ({fan_out}):
+{}", rows.join("
+"));
+    }
+    let cross = count(
+        &conn,
+        "SELECT COUNT(*) FROM edge e WHERE e.relation = 'CALLS' AND e.target_file IS NOT NULL \
+         AND substr(e.source_file, 1, 12) <> substr(e.target_file, 1, 12)",
+    );
+    assert_eq!(cross, 0, "calls must stay inside their copy");
+    // Per copy: Count → Add (other part); Use.Run → new Graph(), Add and Count, all bound to
+    // the copy's own Graph.
+    let exact = count(&conn, "SELECT COUNT(*) FROM edge WHERE relation = 'CALLS' AND confidence = 'exact' AND target_id IS NOT NULL");
+    assert_eq!(exact, (COPIES * 4) as i64, "exact calls");
+}

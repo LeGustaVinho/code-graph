@@ -54,6 +54,13 @@ pub struct SymbolIndex {
     /// Type index → every declaration of the same logical type (C# `partial` parts,
     /// TS interface merging), the type itself included. Absent for ordinary types.
     pub parts: HashMap<usize, Vec<usize>>,
+    /// Part → canonical part of its logical type (precomputed: types can have hundreds).
+    part_rep: HashMap<usize, usize>,
+    /// Parent id → member name → members (huge partial classes like Unity.Mathematics
+    /// `math` have thousands of members; lookups must not scan them).
+    pub children_by_name: HashMap<String, HashMap<String, Vec<usize>>>,
+    /// C# file → the assembly compiling it (see [`SymbolIndex::build`]).
+    pub file_assembly: HashMap<String, String>,
     /// C# `global using` namespaces (visible from every file).
     pub global_usings: Vec<String>,
     /// Extension method name → (method index, extended type name).
@@ -101,10 +108,13 @@ pub fn normalize_path(path: &str) -> String {
 impl SymbolIndex {
     /// Builds the index. Symbols and DI registrations are put in a canonical order first, so
     /// every "first match" below is independent of how (or in which row order) they were loaded.
+    /// `assembly_of` names the assembly compiling a file: C# `partial` parts only merge
+    /// within one assembly (copies of a project kept side by side stay separate types).
     pub fn build(
         mut syms: Vec<IndexedSymbol>,
         imports: HashMap<String, Vec<Import>>,
         mut di: Vec<(String, DiRegistration)>,
+        assembly_of: &dyn Fn(&str) -> String,
     ) -> SymbolIndex {
         syms.sort_by(|a, b| (&a.file, a.sym.start_line, &a.sym.id).cmp(&(&b.file, b.sym.start_line, &b.sym.id)));
         di.sort_by(|a, b| (&a.0, a.1.line).cmp(&(&b.0, b.1.line)));
@@ -124,6 +134,9 @@ impl SymbolIndex {
             impls: HashMap::new(),
             di: HashMap::new(),
             parts: HashMap::new(),
+            part_rep: HashMap::new(),
+            children_by_name: HashMap::new(),
+            file_assembly: HashMap::new(),
             global_usings: Vec::new(),
             extensions: HashMap::new(),
             js: Default::default(),
@@ -150,12 +163,18 @@ impl SymbolIndex {
             idx.by_name.entry(s.sym.name.clone()).or_default().push(i);
             if let Some(p) = &s.sym.parent_id {
                 idx.children.entry(p.clone()).or_default().push(i);
+                idx.children_by_name.entry(p.clone()).or_default().entry(s.sym.name.clone()).or_default().push(i);
             }
             if let Some(ns) = &s.sym.namespace {
                 let list = idx.file_namespace.entry(s.file.clone()).or_default();
                 if !list.contains(ns) {
                     list.push(ns.clone());
                 }
+            }
+        }
+        for (file, lang) in &idx.file_lang {
+            if lang.family() == "dotnet" {
+                idx.file_assembly.insert(file.clone(), assembly_of(file));
             }
         }
         // Logical types declared in several parts.
@@ -165,7 +184,8 @@ impl SymbolIndex {
                 continue;
             }
             let key = if s.lang.family() == "dotnet" && s.sym.modifiers.iter().any(|m| m == "partial") {
-                ("dotnet".to_string(), s.sym.qualified_name.clone(), s.sym.kind)
+                let asm = idx.file_assembly.get(&s.file).cloned().unwrap_or_default();
+                (format!("dotnet:{asm}"), s.sym.qualified_name.clone(), s.sym.kind)
             } else if s.sym.kind == SymbolKind::Interface {
                 // TS declaration merging: same interface declared twice in one module.
                 (format!("file:{}", s.file), s.sym.qualified_name.clone(), s.sym.kind)
@@ -176,8 +196,10 @@ impl SymbolIndex {
         }
         for (_, g) in groups {
             if g.len() > 1 {
+                let rep = g.iter().copied().min().unwrap_or_default();
                 for i in &g {
                     idx.parts.insert(*i, g.clone());
+                    idx.part_rep.insert(*i, rep);
                 }
             }
         }
@@ -266,24 +288,23 @@ impl SymbolIndex {
     pub fn members_named(&self, type_idx: usize, name: &str) -> Vec<usize> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
+        let mut seen_groups = HashSet::new();
         let mut stack = vec![(type_idx, 0)];
         while let Some((t, depth)) = stack.pop() {
             let tid = &self.syms[t].sym.id;
             if !seen.insert(tid.clone()) {
                 continue;
             }
-            // Partial declarations contribute members (and bases) to the same type.
-            for p in self.parts_of(t) {
-                if p != t {
-                    stack.push((p, depth));
+            // Partial declarations contribute members (and bases) to the same type; each
+            // group is expanded once.
+            if let Some(parts) = self.parts.get(&t) {
+                if seen_groups.insert(self.representative(t)) {
+                    stack.extend(parts.iter().filter(|p| **p != t).map(|p| (*p, depth)));
                 }
             }
-            if let Some(kids) = self.children.get(tid) {
-                let found: Vec<usize> = kids.iter().copied().filter(|k| self.syms[*k].sym.name == name).collect();
-                if !found.is_empty() {
-                    out.extend(found);
-                    continue; // nearest declaration wins (override)
-                }
+            if let Some(found) = self.children_by_name.get(tid).and_then(|m| m.get(name)) {
+                out.extend(found.iter().copied());
+                continue; // nearest declaration wins (override)
             }
             if depth < 6 {
                 if let Some(bs) = self.bases.get(tid) {
@@ -314,6 +335,18 @@ impl SymbolIndex {
         }
     }
 
+    /// Of several equally good type candidates, the ones compiled with `from_file` (a C#
+    /// compiler binds a name to its own assembly's type first); all of them when none is.
+    pub fn prefer_same_assembly(&self, from_file: &str, cands: Vec<usize>) -> Vec<usize> {
+        let Some(asm) = self.file_assembly.get(from_file) else { return cands };
+        let same: Vec<usize> = cands.iter().copied().filter(|c| self.file_assembly.get(&self.syms[*c].file) == Some(asm)).collect();
+        if same.is_empty() {
+            cands
+        } else {
+            same
+        }
+    }
+
     /// Every declaration of the logical type `t` (just `t` unless it is partial / merged).
     pub fn parts_of(&self, t: usize) -> Vec<usize> {
         self.parts.get(&t).cloned().unwrap_or_else(|| vec![t])
@@ -321,7 +354,7 @@ impl SymbolIndex {
 
     /// Canonical declaration standing for the logical type `t`.
     pub fn representative(&self, t: usize) -> usize {
-        self.parts.get(&t).and_then(|p| p.iter().copied().min()).unwrap_or(t)
+        self.part_rep.get(&t).copied().unwrap_or(t)
     }
 
     /// All (transitive) implementations / subclasses of a type.
@@ -568,13 +601,20 @@ impl SymbolIndex {
         let family = self.family_of_file(from_file);
         // Qualified names: `Shop.Models.Order`, `models.Order`, `ns.Type`.
         if cleaned.contains('.') {
-            let exact: Vec<usize> = self
-                .syms
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.sym.kind.is_type() && s.sym.qualified_name == cleaned)
-                .map(|(i, _)| i)
-                .collect();
+            let last_seg = cleaned.rsplit('.').next().unwrap_or(&cleaned);
+            let mut exact: Vec<usize> = self
+                .by_name
+                .get(last_seg)
+                .map(|v| v.iter().copied().filter(|i| self.syms[*i].sym.kind.is_type() && self.syms[*i].sym.qualified_name == cleaned).collect())
+                .unwrap_or_default();
+            if !self.parts.is_empty() {
+                exact = exact.into_iter().map(|c| self.representative(c)).collect();
+                exact.sort_unstable();
+                exact.dedup();
+            }
+            if exact.len() > 1 {
+                exact = self.prefer_same_assembly(from_file, exact);
+            }
             if exact.len() == 1 {
                 return Resolved::One(exact[0], Confidence::Exact, format!("qualified type name '{cleaned}'"));
             }
@@ -679,6 +719,10 @@ impl SymbolIndex {
                 return Resolved::One(visible[0], Confidence::Exact, format!("type match via {how}"));
             }
             if visible.len() > 1 {
+                let same = self.prefer_same_assembly(from_file, visible.clone());
+                if same.len() == 1 {
+                    return Resolved::One(same[0], Confidence::Exact, "type match in the same assembly".into());
+                }
                 return Resolved::Many(visible);
             }
         }

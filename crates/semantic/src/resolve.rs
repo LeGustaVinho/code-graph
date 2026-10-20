@@ -476,8 +476,18 @@ impl<'a> FileResolver<'a> {
                 }
             }
         }
-        for m in &methods {
-            self.emit_call(r, *m, conf, ev.clone(), "call-resolver");
+        if methods.len() > MAX_OVERLOAD_LINKS {
+            // Overload families (Unity.Mathematics `math.*`, test asserts) can have hundreds of
+            // members of one arity; without argument types the overload is unknown. One
+            // inferred link to the canonical overload instead of one edge per candidate.
+            let n = methods.len();
+            methods.sort_unstable();
+            methods.truncate(1);
+            self.emit_call(r, methods[0], Confidence::Inferred, format!("{ev}; 1 of {n} overloads of {} (argument types unknown)", r.name), "call-resolver");
+        } else {
+            for m in &methods {
+                self.emit_call(r, *m, conf, ev.clone(), "call-resolver");
+            }
         }
         // Virtual dispatch on interfaces / abstract members.
         let decl_owner = self.index.syms[methods[0]].sym.parent_id.clone().and_then(|p| self.index.by_id.get(&p).copied());
@@ -1008,12 +1018,21 @@ impl<'a> FileResolver<'a> {
                 } else {
                     let prefix = segs[..k].join(".");
                     let suffix = format!(".{prefix}");
-                    let hits: Vec<usize> = (0..self.index.syms.len())
-                        .filter(|i| {
-                            let s = &self.index.syms[*i].sym;
-                            s.kind.is_type() && (s.qualified_name == prefix || s.qualified_name.ends_with(&suffix))
+                    // Types named like the prefix's last segment (not a scan of every symbol).
+                    let hits: Vec<usize> = self
+                        .index
+                        .by_name
+                        .get(segs[k - 1])
+                        .map(|v| {
+                            v.iter()
+                                .copied()
+                                .filter(|i| {
+                                    let s = &self.index.syms[*i].sym;
+                                    s.kind.is_type() && (s.qualified_name == prefix || s.qualified_name.ends_with(&suffix))
+                                })
+                                .collect()
                         })
-                        .collect();
+                        .unwrap_or_default();
                     // An exact qualified name beats suffix matches; a unique hit is exact, otherwise
                     // take the canonical first candidate and only claim an inferred link.
                     let exact: Vec<usize> = hits.iter().copied().filter(|i| self.index.syms[*i].sym.qualified_name == prefix).collect();
@@ -1242,6 +1261,10 @@ impl<'a> FileResolver<'a> {
 }
 
 /// True when a callable with these parameters can be invoked with `argc` arguments.
+/// Overloads still matching a call (by arity) that are all linked; beyond this the call
+/// gets a single inferred link.
+const MAX_OVERLOAD_LINKS: usize = 8;
+
 fn accepts_args(params: &Option<codegraph_core::ParamInfo>, argc: u32) -> bool {
     match params {
         None => true,

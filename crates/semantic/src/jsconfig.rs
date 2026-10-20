@@ -58,7 +58,8 @@ const MAX_DEPTH: usize = 8;
 pub fn load(root: &Path) -> JsProject {
     let mut project = JsProject::default();
     let mut files = Vec::new();
-    collect(root, root, 0, &mut files);
+    let rules = codegraph_core::walk::IgnoreRules::load(root);
+    collect(root, root, 0, &rules, &mut files);
     files.sort();
     for rel in files {
         let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
@@ -76,7 +77,7 @@ pub fn load(root: &Path) -> JsProject {
     project
 }
 
-fn collect(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
+fn collect(root: &Path, dir: &Path, depth: usize, rules: &codegraph_core::walk::IgnoreRules, out: &mut Vec<String>) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -85,8 +86,9 @@ fn collect(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
         let name = e.file_name().to_string_lossy().to_string();
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_dir() {
-            if !name.starts_with('.') && !codegraph_core::walk::is_skipped_dir(&name) {
-                collect(root, &e.path(), depth + 1, out);
+            let child = e.path().strip_prefix(root).map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+            if !name.starts_with('.') && !rules.dir_ignored(&child) {
+                collect(root, &e.path(), depth + 1, rules, out);
             }
         } else if name == "package.json" || name == "jsconfig.json" || (name.starts_with("tsconfig") && name.ends_with(".json")) {
             let rel = e.path().strip_prefix(root).map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();

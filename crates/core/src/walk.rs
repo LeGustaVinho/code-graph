@@ -44,8 +44,6 @@ const MANIFEST_NAMES: &[&str] =
     &["package.json", "Cargo.toml", "pyproject.toml", "setup.py", "build.gradle", "build.gradle.kts", "pom.xml", "go.mod"];
 const MANIFEST_EXTS: &[&str] = &[".csproj", ".fsproj", ".vbproj", ".sln"];
 
-/// Folders the Unity editor owns at the root of a Unity project.
-const UNITY_ROOT_DIRS: &[&str] = &["Library", "Temp", "Logs", "UserSettings", "MemoryCaptures", "Build", "Builds", "Obj"];
 
 /// Files larger than this are skipped (generated bundles, dumps).
 pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -86,13 +84,68 @@ pub fn is_unity_project(root: &Path) -> bool {
     root.join("ProjectSettings").join("ProjectVersion.txt").is_file()
 }
 
+/// Folders a Unity project compiles scripts from, relative to its root: `Assets/`,
+/// `Packages/` (embedded packages) and local packages that `Packages/manifest.json`
+/// references with `file:` inside the project. Everything else in a Unity project
+/// (`Library/` with its package cache, `Temp/`, `Logs/`, `UserSettings/`, builds, copies
+/// of other projects…) is never compiled by Unity, so it is not indexed.
+pub fn unity_source_dirs(unity_root: &Path) -> Vec<String> {
+    let mut dirs = vec!["Assets".to_string(), "Packages".to_string()];
+    let manifest = std::fs::read_to_string(unity_root.join("Packages").join("manifest.json")).ok();
+    let deps = manifest
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(t.trim_start_matches('\u{feff}')).ok())
+        .and_then(|v| v.get("dependencies").and_then(|d| d.as_object()).cloned())
+        .unwrap_or_default();
+    for spec in deps.values().filter_map(|v| v.as_str()) {
+        let Some(path) = spec.strip_prefix("file:") else { continue };
+        if path.ends_with(".tgz") {
+            continue;
+        }
+        // Relative to `Packages/`; kept only when it stays inside the Unity project.
+        let mut parts: Vec<String> = vec!["Packages".into()];
+        let mut inside = !Path::new(path).is_absolute();
+        for seg in path.replace('\\', "/").split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => inside &= parts.pop().is_some(),
+                s => parts.push(s.to_string()),
+            }
+        }
+        if inside && !parts.is_empty() && !dirs.iter().any(|d| d == &parts.join("/")) {
+            dirs.push(parts.join("/"));
+        }
+    }
+    dirs
+}
+
+/// Assets Unity never imports: hidden names (`.git`, `.cache`), names ending in `~`
+/// (`Samples~`, `Documentation~`), `cvs` folders and `*.tmp` files.
+pub fn is_unity_hidden(name: &str) -> bool {
+    name.starts_with('.') || name.ends_with('~') || name.eq_ignore_ascii_case("cvs") || name.to_ascii_lowercase().ends_with(".tmp")
+}
+
+/// Where a path sits relative to the script folders of the Unity project containing it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UnityScope {
+    /// Not inside any Unity project.
+    None,
+    /// A folder Unity does not compile from.
+    Outside,
+    /// The Unity project root, or a folder on the way to a script folder (the parent of a
+    /// local package): walked, but files directly in it are not compiled.
+    Ancestor,
+    /// Inside a script folder (`Assets/…`); `true` when it is a hidden asset.
+    Inside(bool),
+}
+
 /// The complete ignore rule set of a project.
 pub struct IgnoreRules {
     root: PathBuf,
     ignore_files: Option<Gitignore>,
-    unity: bool,
     /// Directory (relative) → does it hold a build manifest?
     manifests: Mutex<HashMap<String, bool>>,
+    /// Directory (relative) → script folders when it is a Unity project root.
+    unity_roots: Mutex<HashMap<String, Option<std::sync::Arc<Vec<String>>>>>,
 }
 
 impl IgnoreRules {
@@ -106,7 +159,56 @@ impl IgnoreRules {
             }
         }
         let ignore_files = if any { b.build().ok() } else { None };
-        IgnoreRules { root: root.to_path_buf(), ignore_files, unity: is_unity_project(root), manifests: Mutex::new(HashMap::new()) }
+        IgnoreRules {
+            root: root.to_path_buf(),
+            ignore_files,
+            manifests: Mutex::new(HashMap::new()),
+            unity_roots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn unity_root(&self, rel_dir: &str) -> Option<std::sync::Arc<Vec<String>>> {
+        if let Some(v) = self.unity_roots.lock().unwrap().get(rel_dir) {
+            return v.clone();
+        }
+        let abs = if rel_dir.is_empty() { self.root.clone() } else { self.root.join(rel_dir) };
+        let found = is_unity_project(&abs).then(|| std::sync::Arc::new(unity_source_dirs(&abs)));
+        self.unity_roots.lock().unwrap().insert(rel_dir.to_string(), found.clone());
+        found
+    }
+
+    /// Scope of `rel` (a directory) in the outermost Unity project containing it.
+    fn unity_scope(&self, rel: &str) -> UnityScope {
+        let segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+        for i in 0..=segs.len() {
+            let Some(dirs) = self.unity_root(&segs[..i].join("/")) else { continue };
+            let sub = &segs[i..];
+            if sub.is_empty() {
+                return UnityScope::Ancestor;
+            }
+            for d in dirs.iter() {
+                let ds: Vec<&str> = d.split('/').collect();
+                if sub.len() >= ds.len() && sub[..ds.len()].iter().zip(&ds).all(|(a, b)| a.eq_ignore_ascii_case(b)) {
+                    return UnityScope::Inside(sub[ds.len()..].iter().any(|s| is_unity_hidden(s)));
+                }
+                if sub.len() < ds.len() && sub.iter().zip(&ds).all(|(a, b)| a.eq_ignore_ascii_case(b)) {
+                    return UnityScope::Ancestor;
+                }
+            }
+            return UnityScope::Outside;
+        }
+        UnityScope::None
+    }
+
+    /// Files a Unity project would not compile: outside its script folders (files at the
+    /// project root, in `Library/`…) or hidden assets.
+    pub fn unity_file_excluded(&self, rel_path: &str) -> bool {
+        let (dir, name) = rel_path.rsplit_once('/').unwrap_or(("", rel_path));
+        match self.unity_scope(dir) {
+            UnityScope::None => false,
+            UnityScope::Inside(hidden) => hidden || is_unity_hidden(name),
+            UnityScope::Outside | UnityScope::Ancestor => true,
+        }
     }
 
     fn has_manifest(&self, rel_dir: &str) -> bool {
@@ -137,10 +239,10 @@ impl IgnoreRules {
         if BUILD_DIRS.iter().any(|d| d.eq_ignore_ascii_case(name)) && (segs.len() == 1 || self.has_manifest(&parent)) {
             return true;
         }
-        if self.unity && segs.len() == 1 && UNITY_ROOT_DIRS.contains(name) {
-            return true;
+        match self.unity_scope(rel_dir) {
+            UnityScope::Outside | UnityScope::Inside(true) => true,
+            UnityScope::None | UnityScope::Ancestor | UnityScope::Inside(false) => false,
         }
-        false
     }
 
     /// Is the file `rel_path` excluded (any ignored ancestor directory, or ignore files)?
@@ -150,6 +252,9 @@ impl IgnoreRules {
             if self.dir_ignored(&segs[..i].join("/")) {
                 return true;
             }
+        }
+        if self.unity_file_excluded(rel_path) {
+            return true;
         }
         match &self.ignore_files {
             Some(g) => g.matched_path_or_any_parents(self.root.join(rel_path), false).is_ignore(),
@@ -242,6 +347,9 @@ pub fn discover_counting(root: &Path, found: &std::sync::atomic::AtomicUsize) ->
         }
         let path = entry.path();
         let Some(language) = Language::from_path(path) else { continue };
+        if rules.unity_file_excluded(&normalize_rel(root, path)) {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else { continue };
         if meta.len() > MAX_FILE_BYTES {
             continue;
@@ -286,5 +394,47 @@ mod tests {
         assert!(v.is_vendor("Assets/Plugins/DOTween/Tween.cs"));
         assert!(v.is_vendor("Packages/com.x/Runtime/A.cs"));
         assert!(!v.is_vendor("Assets/Game/Player.cs"));
+    }
+
+    fn unity_project(dir: &Path, manifest: &str) {
+        std::fs::create_dir_all(dir.join("ProjectSettings")).unwrap();
+        std::fs::write(dir.join("ProjectSettings/ProjectVersion.txt"), "m_EditorVersion: 6000.0").unwrap();
+        std::fs::create_dir_all(dir.join("Packages")).unwrap();
+        std::fs::write(dir.join("Packages/manifest.json"), manifest).unwrap();
+    }
+
+    #[test]
+    fn unity_projects_compile_only_assets_packages_and_local_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        unity_project(root, r#"{ "dependencies": { "com.me.core": "file:../LocalPackages/com.me.core", "com.x": "file:../../Outside", "com.y": "1.0.0" } }"#);
+        // A copy of another Unity project kept as evidence, with its own package cache.
+        unity_project(&root.join("Evidence/run1/unity-project"), "{}");
+        let rules = IgnoreRules::load(root);
+        for dir in ["Library", "Temp", "Logs", "Evidence", "Evidence/run1/unity-project/Assets", ".validation-copy", "Assets/Samples~", "Assets/.cache", "Assets/Game/cvs", "Packages/com.me.tool/Documentation~"] {
+            assert!(rules.dir_ignored(dir), "{dir} should be skipped");
+        }
+        for dir in ["Assets", "Assets/Game/Scripts", "Packages/com.me.tool/Runtime", "LocalPackages", "LocalPackages/com.me.core/Runtime"] {
+            assert!(!rules.dir_ignored(dir), "{dir} should be walked");
+        }
+        assert!(rules.is_ignored("Library/PackageCache/com.unity.ugui/Runtime/Button.cs"));
+        assert!(rules.is_ignored("Root.cs"), "files at the project root are not compiled");
+        assert!(rules.is_ignored("LocalPackages/Stray.cs"), "only the referenced package folder");
+        assert!(rules.is_ignored("Assets/Game/.Hidden.cs"));
+        assert!(!rules.is_ignored("Assets/Game/Player.cs"));
+        assert!(!rules.is_ignored("LocalPackages/com.me.core/Runtime/Core.cs"));
+    }
+
+    #[test]
+    fn unity_project_nested_in_a_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("server/src")).unwrap();
+        unity_project(&root.join("client"), "{}");
+        let rules = IgnoreRules::load(root);
+        assert!(!rules.is_ignored("server/src/app.ts"));
+        assert!(!rules.is_ignored("client/Assets/Game.cs"));
+        assert!(rules.is_ignored("client/Library/PackageCache/a/B.cs"));
+        assert!(rules.is_ignored("client/Tools/Gen.cs"));
     }
 }

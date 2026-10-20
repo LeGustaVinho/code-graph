@@ -437,19 +437,19 @@ fn write_and_resolve(root: &Path, conn: &mut Connection, stats: &mut IndexStats,
     // 5. Semantic resolution of affected files.
     progress.begin(Stage::Resolve, affected.len());
     let tp = Instant::now();
-    let mut index = load_index(&tx)?;
+    let assemblies = AssemblyKeys::load(root);
+    let mut index = load_index(&tx, &|f: &str| assemblies.key(f))?;
     if !index.js_paths.is_empty() {
         // tsconfig `paths` / `baseUrl` and workspace packages drive JS/TS module resolution.
         index.js = codegraph_semantic::jsconfig::load(root);
     }
-    if codegraph_core::walk::is_unity_project(root) {
-        let asm = codegraph_semantic::unity::load_assemblies(root);
+    if let Some(asm) = &assemblies.unity {
         // Editor-only assemblies (runtime code never resolves into them).
         index.editor_dirs = asm.editor_dirs();
         // Test code is what the Test Framework runs (test assemblies, NUnit tests), not what
         // a folder is called: Unity projects keep mock data and editor helpers in `Test/`.
         let mut st = tx.prepare_cached("UPDATE node SET is_test = ?2 WHERE id = ?1")?;
-        for (id, is_test) in codegraph_semantic::unity::apply_test_files(&mut index, &asm) {
+        for (id, is_test) in codegraph_semantic::unity::apply_test_files(&mut index, asm) {
             st.execute(params![id, is_test])?;
         }
     }
@@ -540,7 +540,53 @@ fn select_strings(tx: &Transaction, sql_prefix: &str, values: &[String]) -> Resu
 }
 
 /// Loads the symbol index (all non-derived nodes, imports and DI registrations).
-pub fn load_index(conn: &Connection) -> Result<SymbolIndex> {
+/// Names the assembly compiling a C# file (partial types only merge within one): the
+/// owning `.asmdef` or Unity predefined assembly, otherwise the nearest `.csproj` folder.
+struct AssemblyKeys {
+    root: std::path::PathBuf,
+    unity: Option<codegraph_semantic::unity::Assemblies>,
+    csproj: std::sync::Mutex<HashMap<String, bool>>,
+}
+
+impl AssemblyKeys {
+    fn load(root: &Path) -> AssemblyKeys {
+        let unity = codegraph_core::walk::is_unity_project(root).then(|| codegraph_semantic::unity::load_assemblies(root));
+        AssemblyKeys { root: root.to_path_buf(), unity, csproj: Default::default() }
+    }
+
+    fn key(&self, file: &str) -> String {
+        if let Some(asm) = &self.unity {
+            if let Some(def) = asm.owner(file) {
+                return def.name.clone();
+            }
+            // Unity's predefined assemblies (Assembly-CSharp[-Editor][-firstpass]).
+            let editor = file.split('/').rev().skip(1).any(|s| s == "Editor");
+            let firstpass =
+                ["Assets/Plugins/", "Assets/Standard Assets/", "Assets/Pro Standard Assets/"].iter().any(|p| file.starts_with(p));
+            return format!("Assembly-CSharp{}{}", if editor { "-Editor" } else { "" }, if firstpass { "-firstpass" } else { "" });
+        }
+        let mut dir = file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        loop {
+            if self.has_csproj(dir) || dir.is_empty() {
+                return dir.to_string();
+            }
+            dir = dir.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        }
+    }
+
+    fn has_csproj(&self, dir: &str) -> bool {
+        if let Some(v) = self.csproj.lock().unwrap().get(dir) {
+            return *v;
+        }
+        let found = std::fs::read_dir(self.root.join(dir))
+            .map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().to_ascii_lowercase().ends_with(".csproj")))
+            .unwrap_or(false);
+        self.csproj.lock().unwrap().insert(dir.to_string(), found);
+        found
+    }
+}
+
+pub fn load_index(conn: &Connection, assembly_of: &dyn Fn(&str) -> String) -> Result<SymbolIndex> {
     let mut syms = Vec::new();
     {
         let mut st = conn.prepare(&format!("SELECT {NODE_COLS} FROM node WHERE derived = 0 ORDER BY file_path, start_line, id"))?;
@@ -594,7 +640,7 @@ pub fn load_index(conn: &Connection) -> Result<SymbolIndex> {
         })?;
         di.extend(rows.flatten());
     }
-    Ok(SymbolIndex::build(syms, imports, di))
+    Ok(SymbolIndex::build(syms, imports, di, assembly_of))
 }
 
 fn load_call_rows(tx: &Transaction) -> Result<Vec<CallRow>> {
