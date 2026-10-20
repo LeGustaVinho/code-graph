@@ -429,7 +429,7 @@ impl<'a> FileResolver<'a> {
                 // Production code never dispatches to test doubles: if exactly one candidate is
                 // a real implementation, link it (inferred) and name the excluded doubles.
                 let caller_is_test =
-                    self.index.get(&r.enclosing).map(|s| s.sym.is_test || codegraph_core::extract::is_test_path(&s.file)).unwrap_or(false);
+                    self.index.get(&r.enclosing).map(|s| s.sym.is_test || self.index.is_test_file(&s.file)).unwrap_or(false);
                 if !caller_is_test {
                     let (doubles, real): (Vec<usize>, Vec<usize>) = targets.iter().partition(|t| self.is_test_double(**t));
                     if real.len() == 1 && !doubles.is_empty() {
@@ -952,7 +952,7 @@ impl<'a> FileResolver<'a> {
         let s = &self.index.syms[member];
         let owner = s.sym.parent_id.as_deref().and_then(|p| self.index.get(p)).map(|p| p.sym.name.as_str()).unwrap_or("");
         let lower = owner.to_ascii_lowercase();
-        codegraph_core::extract::is_test_path(&s.file)
+        self.index.is_test_file(&s.file)
             || ["mock", "fake", "stub", "dummy", "spy"].iter().any(|p| lower.starts_with(p) || lower.ends_with(p))
     }
 

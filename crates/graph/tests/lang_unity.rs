@@ -120,3 +120,63 @@ fn third_party_code_is_flagged_and_left_out_of_reports() {
     let (all, _) = codegraph_mcp::call_tool(&engine, "find_orphaned_symbols", json!({ "limit": 200, "include_vendor": true }));
     assert!(all.contains("VendorLib"), "{all}");
 }
+
+// ---------------------------------------------------------------- Unity Test Framework
+
+fn module_is_test(c: &rusqlite::Connection, path: &str) -> bool {
+    count(c, &format!("SELECT COALESCE(MAX(is_test), -1) FROM node WHERE kind = 'module' AND file_path = '{path}'")) == 1
+}
+
+#[test]
+fn tests_follow_test_assemblies_not_folder_names() {
+    let f = fixture();
+    let c = &f.conn;
+    // Test assemblies: runner references by name (EditMode) or by GUID (PlayMode, in a folder
+    // whose name says nothing about tests); helpers without attributes included.
+    assert!(module_is_test(c, "Assets/Tests/EditMode/ScoreTests.cs"));
+    assert!(module_is_test(c, "Assets/Tests/EditMode/ScoreBuilder.cs"));
+    assert!(module_is_test(c, "Assets/Verification/PlayMode/SceneSmoke.cs"));
+    // Assembly-CSharp declaring NUnit tests.
+    assert!(module_is_test(c, "Assets/Scripts/InlineChecks.cs"));
+    // Production code in a `Test/` folder, and a support assembly under `Tests/`.
+    assert!(!module_is_test(c, "Assets/Scripts/Test/MockData.cs"));
+    assert!(!module_is_test(c, "Assets/Tests/Support/FakeClock.cs"));
+    assert!(!module_is_test(c, "Assets/Scripts/Scoring/Score.cs"));
+    for t in ["ScoreTests", "ScoreTests.AddAccumulates", "ScoreTests.AddOnce", "SceneSmoke.Boots", "InlineChecks.CoinsStartPositive"] {
+        assert!(sym(c, t).is_test, "{t}");
+    }
+    assert!(!sym(c, "MockData").is_test);
+    assert!(!sym(c, "MockData.StartingCoins").is_test);
+}
+
+#[test]
+fn tests_link_to_the_runtime_code_they_call() {
+    let f = fixture();
+    let c = &f.conn;
+    assert!(edge(c, "ScoreTests.AddAccumulates", "Score.Add", "TESTS").is_some(), "{:?}", targets(c, "ScoreTests.AddAccumulates", "TESTS"));
+    assert!(edge(c, "ScoreTests.AddOnce", "Score.Add", "TESTS").is_some());
+    assert!(edge(c, "InlineChecks.CoinsStartPositive", "MockData.StartingCoins", "TESTS").is_some());
+}
+
+#[test]
+fn runner_hooks_are_entry_points() {
+    let f = fixture();
+    assert!(entry(&f, "ScoreTests.Init").contains("[SetUp]"));
+    assert!(entry(&f, "ScoreTests.Done").contains("[OneTimeTearDown]"));
+    assert!(entry(&f, "SceneSmoke.Prepare").contains("[UnitySetUp]"));
+    assert_eq!(entry(&f, "SceneSmoke.Setup"), "unity message IPrebuildSetup.Setup");
+    assert_eq!(entry(&f, "SceneSmoke.Cleanup"), "unity message IPostBuildCleanup.Cleanup");
+    assert!(!sym(&f.conn, "SmokeSettings.Setup").is_entrypoint);
+}
+
+#[test]
+fn test_flags_follow_asmdef_changes_on_reindex() {
+    let mut f = fixture();
+    // The support assembly starts referencing the runner: its files become tests.
+    let asmdef = f.root.join("Assets/Tests/Support/Game.TestSupport.asmdef");
+    std::fs::write(&asmdef, r#"{ "name": "Game.TestSupport", "defineConstraints": ["UNITY_INCLUDE_TESTS"] }"#).unwrap();
+    let rel = "Assets/Tests/Support/FakeClock.cs".to_string();
+    std::fs::write(f.root.join(&rel), "namespace Game.TestSupport { public class FakeClock { public float Now => 1f; } }").unwrap();
+    codegraph_graph::index_paths(&f.root.clone(), &mut f.conn, &[rel.clone()]).unwrap();
+    assert!(module_is_test(&f.conn, &rel));
+}

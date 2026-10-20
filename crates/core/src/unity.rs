@@ -186,7 +186,7 @@ const NETWORK_BEHAVIOUR: &[&str] = &[
     "OnDeserialize",
 ];
 
-/// Interfaces the engine calls through (UGUI events, serialization, build pipeline).
+/// Interfaces the engine calls through (UGUI events, serialization, build pipeline, test runner).
 const INTERFACE_MESSAGES: &[(&str, &[&str])] = &[
     ("ISerializationCallbackReceiver", &["OnBeforeSerialize", "OnAfterDeserialize"]),
     ("IPointerClickHandler", &["OnPointerClick"]),
@@ -218,6 +218,9 @@ const INTERFACE_MESSAGES: &[(&str, &[&str])] = &[
     ("IActiveBuildTargetChanged", &["OnActiveBuildTargetChanged"]),
     ("IPostBuildPlayerScriptDLLs", &["OnPostBuildPlayerScriptDLLs"]),
     ("IFilterBuildAssemblies", &["OnFilterAssemblies"]),
+    // Unity Test Framework: the runner calls these around a test run / player build.
+    ("IPrebuildSetup", &["Setup"]),
+    ("IPostBuildCleanup", &["Cleanup"]),
 ];
 
 /// Engine-invoked methods declared by a Unity base type / interface.

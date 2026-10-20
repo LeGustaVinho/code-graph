@@ -309,9 +309,16 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
         // tsconfig `paths` / `baseUrl` and workspace packages drive JS/TS module resolution.
         index.js = codegraph_semantic::jsconfig::load(root);
     }
-    if index.file_lang.values().any(|l| *l == codegraph_core::Language::CSharp) {
-        // Unity Editor-only assemblies (runtime code never resolves into them).
-        index.editor_dirs = codegraph_semantic::unity::load_editor_dirs(root);
+    if codegraph_core::walk::is_unity_project(root) {
+        let asm = codegraph_semantic::unity::load_assemblies(root);
+        // Editor-only assemblies (runtime code never resolves into them).
+        index.editor_dirs = asm.editor_dirs();
+        // Test code is what the Test Framework runs (test assemblies, NUnit tests), not what
+        // a folder is called: Unity projects keep mock data and editor helpers in `Test/`.
+        let mut st = tx.prepare_cached("UPDATE node SET is_test = ?2 WHERE id = ?1")?;
+        for (id, is_test) in codegraph_semantic::unity::apply_test_files(&mut index, &asm) {
+            st.execute(params![id, is_test])?;
+        }
     }
     tracing::debug!("load_index: {} ms", tp.elapsed().as_millis());
     let tp = Instant::now();

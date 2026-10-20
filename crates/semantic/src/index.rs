@@ -62,6 +62,8 @@ pub struct SymbolIndex {
     pub js: crate::jsconfig::JsProject,
     /// Unity: directories of Editor-only assembly definitions (set by the indexer).
     pub editor_dirs: Vec<String>,
+    /// Unity: the C# files that are test code (`unity::apply_test_files`); None elsewhere.
+    pub unity_test_files: Option<HashSet<String>>,
 }
 
 const JS_EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"];
@@ -126,6 +128,7 @@ impl SymbolIndex {
             extensions: HashMap::new(),
             js: Default::default(),
             editor_dirs: Vec::new(),
+            unity_test_files: None,
         };
         for (i, s) in idx.syms.iter().enumerate() {
             idx.by_id.insert(s.sym.id.clone(), i);
@@ -300,6 +303,15 @@ impl SymbolIndex {
     pub fn is_editor_file(&self, file: &str) -> bool {
         file.split('/').rev().skip(1).any(|seg| seg == "Editor")
             || self.editor_dirs.iter().any(|d| !d.is_empty() && file.starts_with(&format!("{d}/")))
+    }
+
+    /// Is `file` test code? Unity C# follows the test assemblies; everything else the
+    /// file-name / folder conventions.
+    pub fn is_test_file(&self, file: &str) -> bool {
+        match &self.unity_test_files {
+            Some(tests) if self.file_lang.get(file) == Some(&Language::CSharp) => tests.contains(file),
+            _ => codegraph_core::extract::is_test_path(file),
+        }
     }
 
     /// Every declaration of the logical type `t` (just `t` unless it is partial / merged).

@@ -1,0 +1,6 @@
+{
+    "name": "Game.TestSupport",
+    "references": [
+        "Game.Scoring"
+    ]
+}
