@@ -290,6 +290,10 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
         // tsconfig `paths` / `baseUrl` and workspace packages drive JS/TS module resolution.
         index.js = codegraph_semantic::jsconfig::load(root);
     }
+    if index.file_lang.values().any(|l| *l == codegraph_core::Language::CSharp) {
+        // Unity Editor-only assemblies (runtime code never resolves into them).
+        index.editor_dirs = codegraph_semantic::unity::load_editor_dirs(root);
+    }
     tracing::debug!("load_index: {} ms", tp.elapsed().as_millis());
     let tp = Instant::now();
     let mut facts: Vec<(String, StoredFacts)> = Vec::new();
@@ -443,8 +447,17 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex) -> Result<()> {
          DELETE FROM api_route;
          DELETE FROM data_model;
          DELETE FROM data_model_field;
-         UPDATE node SET kind = orig_kind WHERE kind <> orig_kind;",
+         UPDATE node SET kind = orig_kind WHERE kind <> orig_kind;
+         UPDATE node SET is_entrypoint = 0, entry_kind = NULL WHERE entry_kind LIKE 'unity message %';",
     )?;
+    // Unity messages (`Update`, `OnPointerClick`, …) confirmed through the real inheritance
+    // chain: base classes may live in other files, so this is a project-wide property.
+    {
+        let mut st = tx.prepare_cached("UPDATE node SET is_entrypoint = 1, entry_kind = ?2 WHERE id = ?1")?;
+        for (id, kind) in codegraph_semantic::unity::entrypoints(index) {
+            st.execute(params![id, kind])?;
+        }
+    }
     let mut edges: Vec<Edge> = Vec::new();
 
     let tg = Instant::now();

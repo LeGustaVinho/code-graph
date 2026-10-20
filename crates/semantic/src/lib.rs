@@ -18,6 +18,7 @@ pub mod index;
 pub mod jsconfig;
 pub mod models;
 pub mod resolve;
+pub mod unity;
 
 use serde::{Deserialize, Serialize};
 

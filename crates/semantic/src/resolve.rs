@@ -1065,6 +1065,8 @@ impl<'a> FileResolver<'a> {
             return;
         }
         let family = self.family;
+        // Runtime code never runs editor-only code (Unity `Editor` folders / assemblies).
+        let runtime_caller = !self.index.is_editor_file(self.file);
         let cands: Vec<usize> = self
             .index
             .by_name
@@ -1075,6 +1077,7 @@ impl<'a> FileResolver<'a> {
                     .filter(|i| {
                         let s = &self.index.syms[*i];
                         s.lang.family() == family
+                            && !(runtime_caller && family == "dotnet" && self.index.is_editor_file(&s.file))
                             && if method_only {
                                 matches!(s.sym.kind, SymbolKind::Method)
                             } else {

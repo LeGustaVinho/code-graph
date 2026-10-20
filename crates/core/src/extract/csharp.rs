@@ -12,6 +12,8 @@ struct ClassInfo {
     route_prefix: Option<String>,
     is_controller: bool,
     bases: Vec<String>,
+    /// Attribute names on the type (`InitializeOnLoad`, `CustomEditor`, …).
+    attrs: Vec<String>,
 }
 
 pub(crate) fn extract(ctx: &mut Ctx, root: Node) {
@@ -26,101 +28,6 @@ pub(crate) fn extract(ctx: &mut Ctx, root: Node) {
         }
     }
 }
-
-/// Methods the Unity engine / editor invokes by name on MonoBehaviour, ScriptableObject,
-/// Editor, EditorWindow and StateMachineBehaviour subclasses.
-const UNITY_MESSAGES: &[&str] = &[
-    "Awake",
-    "Start",
-    "Update",
-    "FixedUpdate",
-    "LateUpdate",
-    "OnEnable",
-    "OnDisable",
-    "OnDestroy",
-    "OnValidate",
-    "Reset",
-    "OnGUI",
-    "OnApplicationPause",
-    "OnApplicationFocus",
-    "OnApplicationQuit",
-    "OnTriggerEnter",
-    "OnTriggerExit",
-    "OnTriggerStay",
-    "OnTriggerEnter2D",
-    "OnTriggerExit2D",
-    "OnTriggerStay2D",
-    "OnCollisionEnter",
-    "OnCollisionExit",
-    "OnCollisionStay",
-    "OnCollisionEnter2D",
-    "OnCollisionExit2D",
-    "OnCollisionStay2D",
-    "OnControllerColliderHit",
-    "OnMouseDown",
-    "OnMouseUp",
-    "OnMouseUpAsButton",
-    "OnMouseEnter",
-    "OnMouseExit",
-    "OnMouseOver",
-    "OnMouseDrag",
-    "OnBecameVisible",
-    "OnBecameInvisible",
-    "OnDrawGizmos",
-    "OnDrawGizmosSelected",
-    "OnRenderObject",
-    "OnPreRender",
-    "OnPostRender",
-    "OnPreCull",
-    "OnWillRenderObject",
-    "OnRenderImage",
-    "OnAnimatorMove",
-    "OnAnimatorIK",
-    "OnParticleCollision",
-    "OnParticleTrigger",
-    "OnParticleSystemStopped",
-    "OnTransformParentChanged",
-    "OnTransformChildrenChanged",
-    "OnRectTransformDimensionsChange",
-    "OnCanvasGroupChanged",
-    "OnDidApplyAnimationProperties",
-    "OnBeforeTransformParentChanged",
-    "OnInspectorGUI",
-    "OnSceneGUI",
-    "OnSelectionChange",
-    "OnHierarchyChange",
-    "OnProjectChange",
-    "OnFocus",
-    "OnLostFocus",
-    "OnInspectorUpdate",
-    "CreateGUI",
-    "CreateInspectorGUI",
-    "OnPreviewGUI",
-    "HasPreviewGUI",
-    "OnBeforeSerialize",
-    "OnAfterDeserialize",
-    "OnStateEnter",
-    "OnStateExit",
-    "OnStateUpdate",
-    "OnStateMove",
-    "OnStateIK",
-    "OnStateMachineEnter",
-    "OnStateMachineExit",
-    "OnWizardCreate",
-    "OnWizardUpdate",
-    "OnWizardOtherButton",
-    "OnPostprocessAllAssets",
-    "OnPreprocessTexture",
-    "OnPostprocessTexture",
-    "OnPreprocessModel",
-    "OnPostprocessModel",
-    "OnPreprocessAsset",
-    "OnPreprocessBuild",
-    "OnPostprocessBuild",
-    "OnProcessScene",
-    "OnServerInitialized",
-    "OnConnectedToServer",
-];
 
 /// Attributes that make Unity call a method without any code reference.
 const UNITY_HOOK_ATTRS: &[&str] = &[
@@ -511,6 +418,14 @@ fn visit_type(ctx: &mut Ctx, node: Node, outer: Option<&ClassInfo>) {
     sym.bases = bases.clone();
     sym.body_hash = token_hash(node, ctx.src);
     sym.modifiers = kept_modifiers(&mods);
+    // Unity instantiates these types itself (asset menus, inspectors for a target type).
+    if let Some(a) = attrs.iter().map(|a| attr_name(a)).find(|a| {
+        matches!(*a, "CreateAssetMenu" | "CustomEditor" | "CustomPropertyDrawer" | "CustomPreview" | "CustomEditorForRenderPipeline")
+    }) {
+        sym.is_entrypoint = true;
+        sym.entry_kind = Some(format!("unity hook [{a}]"));
+    }
+    let attr_names: Vec<String> = attrs.iter().map(|a| attr_name(a).to_string()).collect();
     let route_prefix = attrs.iter().find(|a| attr_name(a) == "Route").and_then(|a| attr_string_arg(a));
     let is_controller = name.ends_with("Controller")
         || attrs.iter().any(|a| matches!(attr_name(a), "ApiController" | "Controller"))
@@ -582,7 +497,7 @@ fn visit_type(ctx: &mut Ctx, node: Node, outer: Option<&ClassInfo>) {
         ctx.push_ref(RefKind::Call, &base, Some("base".into()), None, argc, line_of(args), None);
         walk(ctx, args);
     }
-    let info = ClassInfo { name: name.clone(), kind: Some(kind), route_prefix, is_controller, bases };
+    let info = ClassInfo { name: name.clone(), kind: Some(kind), route_prefix, is_controller, bases, attrs: attr_names };
     if let Some(body) = body {
         if kind == SymbolKind::Enum {
             for m in named_children(body) {
@@ -681,6 +596,7 @@ fn visit_field(ctx: &mut Ctx, node: Node, cls: &ClassInfo) {
         if first {
             // `[ContextMenuItem("…", "Method")]`, `[OnValueChanged("M")]`, `[SerializeField]`.
             record_attr_literals(ctx, node);
+            attr_method_refs(ctx, node);
             first = false;
         }
         if let Some(v) = value {
@@ -691,6 +607,44 @@ fn visit_field(ctx: &mut Ctx, node: Node, cls: &ClassInfo) {
         }
         ctx.pop_scope();
     }
+}
+
+/// `[ContextMenuItem("Reset", "ResetValue")]`, Odin `[OnValueChanged("Refresh")]`: the string
+/// names a method of the same class, invoked by the inspector.
+fn attr_method_refs(ctx: &mut Ctx, node: Node) {
+    for list in named_children(node).into_iter().filter(|c| c.kind() == "attribute_list") {
+        for a in named_children(list).into_iter().filter(|c| c.kind() == "attribute") {
+            let Some(n) = a.child_by_field_name("name") else { continue };
+            let an = attr_name(ctx.text(n)).to_string();
+            let Some(positions) = crate::unity::method_name_attr_args(&an) else { continue };
+            let args: Vec<Node> = named_children(a)
+                .into_iter()
+                .filter(|c| c.kind() == "attribute_argument_list")
+                .flat_map(named_children)
+                .filter(|c| c.kind() == "attribute_argument")
+                .collect();
+            for p in positions {
+                let Some(arg) = args.get(*p).and_then(|x| x.named_child(0)) else { continue };
+                let method = string_like(arg, ctx.src).or_else(|| nameof_target(ctx, arg));
+                if let Some(m) = method.filter(|m| m.chars().all(|c| c.is_alphanumeric() || c == '_') && !m.is_empty()) {
+                    ctx.push_ref(RefKind::Call, &m, None, None, None, line_of(a), Some(format!("[{an}] by name")));
+                }
+            }
+        }
+    }
+}
+
+/// `nameof(Foo)` / `nameof(this.Foo)` → `Foo`.
+fn nameof_target(ctx: &Ctx, node: Node) -> Option<String> {
+    if node.kind() != "invocation_expression" {
+        return None;
+    }
+    let f = node.child_by_field_name("function")?;
+    if ctx.text(f) != "nameof" {
+        return None;
+    }
+    let arg = node.child_by_field_name("arguments").and_then(|a| named_children(a).into_iter().next())?;
+    Some(last_segment(ctx.text(arg)).to_string())
 }
 
 /// Name of operators, conversions, indexers and finalizers (`operator +`, `implicit operator int`,
@@ -1041,10 +995,22 @@ fn visit_callable_as(ctx: &mut Ctx, node: Node, kind: SymbolKind, cls: &ClassInf
         if let Some(a) = attrs.iter().find(|a| UNITY_HOOK_ATTRS.contains(&attr_name(a))) {
             s.is_entrypoint = true;
             s.entry_kind = Some(format!("unity hook [{}]", attr_name(a)));
-        } else if kind == SymbolKind::Method && !cls.bases.is_empty() && UNITY_MESSAGES.contains(&name.as_str()) {
-            s.is_entrypoint = true;
-            s.entry_kind = Some(format!("unity message {name}"));
         }
+    }
+    // `[InitializeOnLoad] class X { static X() { … } }`: the editor runs the static constructor.
+    if kind == SymbolKind::Constructor && s.is_static && cls.attrs.iter().any(|a| a == "InitializeOnLoad") {
+        s.is_entrypoint = true;
+        s.entry_kind = Some("unity hook [InitializeOnLoad]".into());
+    }
+    // A possible Unity message (`Update`, `OnPointerClick`, …): confirmed or dropped by the global
+    // pass, which follows the real inheritance chain (project base classes included).
+    if !s.is_entrypoint
+        && kind == SymbolKind::Method
+        && !cls.bases.is_empty()
+        && !(body.is_none() && arrow.is_none())
+        && crate::unity::is_message_name(&name)
+    {
+        s.modifiers.push("unity-msg".into());
     }
     let is_exception_filter = cls.bases.iter().any(|b| {
         let b = clean_type(b);
@@ -1793,17 +1759,50 @@ fn special_call<'t>(
         _ => {}
     }
 
+    // ---- Unity calls by method name: Invoke("Foo"), StartCoroutine(nameof(Foo)), SendMessage("Foo") ----
+    if crate::unity::BY_NAME_CALLS.contains(&name) {
+        if let Some(arg) = arg_nodes(args).first().copied() {
+            let target = string_like(arg, ctx.src).or_else(|| nameof_target(ctx, arg));
+            if let Some(t) = target.filter(|t| !t.is_empty() && t.chars().all(|c| c.is_alphanumeric() || c == '_')) {
+                // `other.SendMessage("Hit")` targets another object; everything else is `this`.
+                let recv = receiver.filter(|r| *r != "this" && matches!(name, "SendMessage" | "SendMessageUpwards" | "BroadcastMessage"));
+                ctx.push_ref(RefKind::Call, &t, recv.map(|r| r.to_string()), None, None, line, Some(format!("{name}(\"{t}\")")));
+            }
+        }
+    }
+
     // ---- State mutations ----
     let prefs = recv_lower.ends_with("playerprefs") || recv_lower.ends_with("editorprefs");
+    let store = if recv_lower.ends_with("editorprefs") { "EditorPrefs" } else { "PlayerPrefs" };
     match name {
         "SetInt" | "SetFloat" | "SetString" | "SetBool" | "DeleteKey" | "DeleteAll" if prefs => {
-            let store = if recv_lower.ends_with("editorprefs") { "EditorPrefs" } else { "PlayerPrefs" };
-            let key = first_str.clone().unwrap_or_else(|| "*".into());
+            let key = prefs_key(ctx, args).unwrap_or_else(|| "*".into());
             ctx.push_mutation(&format!("{store}:{key}"), "storage", line);
         }
-        "Get" | "Post" | "Put" | "Delete" | "Head" | "PostWwwForm" if recv_lower.ends_with("unitywebrequest") => {
-            if let Some(url) = first_str.clone() {
-                ctx.push_http_call(name.trim_end_matches("WwwForm"), &url, "UnityWebRequest", line);
+        "GetInt" | "GetFloat" | "GetString" | "GetBool" | "HasKey" if prefs => {
+            if let Some(key) = prefs_key(ctx, args) {
+                let default = arg_nodes(args).get(1).map(|n| ctx.text(*n).to_string());
+                ctx.push_config(&key, store, line, default);
+            }
+        }
+        "Get" | "Post" | "Put" | "Delete" | "Head" | "PostWwwForm" | "GetTexture" | "GetAssetBundle" | "GetAudioClip"
+            if recv_lower.ends_with("unitywebrequest")
+                || recv_lower.ends_with("unitywebrequesttexture")
+                || recv_lower.ends_with("unitywebrequestassetbundle")
+                || recv_lower.ends_with("unitywebrequestmultimedia") =>
+        {
+            let method = match name {
+                "Post" | "PostWwwForm" => "POST",
+                "Put" => "PUT",
+                "Delete" => "DELETE",
+                "Head" => "HEAD",
+                _ => "GET",
+            };
+            let url = first_str
+                .clone()
+                .or_else(|| arg_nodes(args).first().map(|n| format!("<dynamic: {}>", truncate(&collapse_ws(ctx.text(*n)), 60))));
+            if let Some(url) = url {
+                ctx.push_http_call(method, &url, "UnityWebRequest", line);
             }
         }
         "SaveChanges" | "SaveChangesAsync" => {
@@ -1849,6 +1848,22 @@ fn special_call<'t>(
     }
 }
 
+/// PlayerPrefs key: a string literal, or the value of a same-file `const string`, or the
+/// expression itself (`Keys.Coins`).
+fn prefs_key(ctx: &Ctx, args: Option<Node>) -> Option<String> {
+    let arg = arg_nodes(args).first().copied()?;
+    if let Some(s) = string_like(arg, ctx.src) {
+        return Some(s);
+    }
+    let text = collapse_ws(ctx.text(arg));
+    let last = last_segment(&text).to_string();
+    let constant = ctx.facts.symbols.iter().find(|s| s.kind == SymbolKind::Const && s.name == last).and_then(|s| s.value_text.clone());
+    match constant.map(|v| v.trim().trim_matches('"').to_string()).filter(|v| !v.is_empty() && !v.contains(' ')) {
+        Some(v) => Some(v),
+        None => Some(text),
+    }
+}
+
 fn find_creation_type(ctx: &Ctx, node: Node) -> Option<String> {
     if node.kind() == "object_creation_expression" {
         return node.child_by_field_name("type").map(|t| ctx.text(t).to_string());
@@ -1861,6 +1876,13 @@ fn find_creation_type(ctx: &Ctx, node: Node) -> Option<String> {
 fn new_expr(ctx: &mut Ctx, node: Node) {
     let ty = node.child_by_field_name("type").map(|t| ctx.text(t).to_string()).unwrap_or_default();
     let args = node.child_by_field_name("arguments");
+    if clean_type(&ty) == "UnityWebRequest" {
+        if let Some(first) = arg_nodes(args).first().copied() {
+            let url = string_like(first, ctx.src).unwrap_or_else(|| format!("<dynamic: {}>", truncate(&collapse_ws(ctx.text(first)), 60)));
+            let method = arg_nodes(args).get(1).and_then(|m| string_like(*m, ctx.src)).unwrap_or_else(|| "GET".into());
+            ctx.push_http_call(&method, &url, "UnityWebRequest", line_of(node));
+        }
+    }
     let argc = args.map(count_args).or(Some(0));
     let generic = if ty.contains('<') { Some(ty.clone()) } else { None };
     ctx.push_ref(RefKind::New, &clean_type(&ty), None, None, argc, line_of(node), generic);

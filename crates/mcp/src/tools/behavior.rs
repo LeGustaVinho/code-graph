@@ -337,27 +337,41 @@ pub fn find_orphaned_symbols(ctx: &Ctx, p: OrphanParams) -> ToolResult {
     }
     let mut bases: HashMap<String, Vec<String>> = HashMap::new();
     let mut external_base: HashSet<String> = HashSet::new();
+    // Types deriving directly from a Unity type whose instances live in scenes / assets.
+    let mut serialized_root: HashSet<String> = HashSet::new();
     {
-        let mut st = conn.prepare("SELECT source_id, target_id FROM edge WHERE relation = 'INHERITS'")?;
-        for (src, tgt) in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?.flatten() {
+        let mut st = conn.prepare("SELECT source_id, target_id, unresolved_symbol FROM edge WHERE relation = 'INHERITS'")?;
+        for (src, tgt, ext) in st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?
+            .flatten()
+        {
             match tgt {
                 Some(t) => bases.entry(src).or_default().push(t),
                 None => {
+                    let name = ext.unwrap_or_default();
+                    let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                    let lineage = codegraph_core::unity::lineage(&short);
+                    if codegraph_core::unity::SERIALIZED_ROOTS.iter().any(|r| *r == short || lineage.contains(r)) {
+                        serialized_root.insert(src.clone());
+                    }
                     external_base.insert(src);
                 }
             }
         }
     }
-    // Methods invoked by name (`Invoke("Foo")`, `StartCoroutine("Foo")`, `SendMessage("Foo")`, reflection).
-    {
-        let mut st = conn.prepare("SELECT DISTINCT literal_value FROM literal_occurrence WHERE literal_type = 'string' AND length(literal_value) BETWEEN 3 AND 80")?;
-        for v in st.query_map([], |r| r.get::<_, String>(0))?.flatten() {
-            if v.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                dynamic_names.insert(v);
-            }
-        }
-    }
-    let used = |id: &str| referenced.contains(id) || dynamic_ids.contains(id);
+    // Engine / framework entry points: a type declaring one is in use.
+    let entry_ids: HashSet<String> = {
+        let mut st = conn.prepare("SELECT id FROM node WHERE is_entrypoint = 1")?;
+        let rows: HashSet<String> = st.query_map([], |r| r.get::<_, String>(0))?.flatten().collect();
+        rows
+    };
+    // Generated sources (designers, source generators) are never dead code to delete.
+    let generated_files: HashSet<String> = {
+        let mut st = conn.prepare("SELECT file_path FROM node WHERE kind = 'module' AND attrs LIKE '%\"generated\"%'")?;
+        let rows: HashSet<String> = st.query_map([], |r| r.get::<_, String>(0))?.flatten().collect();
+        rows
+    };
+    let used = |id: &str| referenced.contains(id) || dynamic_ids.contains(id) || entry_ids.contains(id);
     let used_or_members_used = |id: &str| used(id) || children.get(id).map(|k| k.iter().any(|(c, _)| used(c))).unwrap_or(false);
     let ancestors = |t: &str| -> Vec<String> {
         let mut out = Vec::new();
@@ -376,6 +390,10 @@ pub fn find_orphaned_symbols(ctx: &Ctx, p: OrphanParams) -> ToolResult {
         }
         out
     };
+    // MonoBehaviours / ScriptableObjects (also through project base classes) are attached in
+    // scenes and assets, which are not indexed: the type and its public members (UnityEvent
+    // targets, inspector-wired callbacks) are reachable without a code reference.
+    let is_serialized = |t: &str| -> bool { serialized_root.contains(t) || ancestors(t).iter().any(|a| serialized_root.contains(a)) };
 
     let ph = (1..=kinds.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
     let sql = format!(
@@ -387,7 +405,13 @@ pub fn find_orphaned_symbols(ctx: &Ctx, p: OrphanParams) -> ToolResult {
     let mut out_rows = Vec::new();
     for n in rows {
         let s = &n.sym;
-        if used_or_members_used(&s.id) {
+        if used_or_members_used(&s.id) || generated_files.contains(&n.file_path) {
+            continue;
+        }
+        if s.kind.is_type() && is_serialized(&s.id) {
+            continue;
+        }
+        if !s.kind.is_type() && s.visibility != "private" && s.parent_id.as_deref().map(is_serialized).unwrap_or(false) {
             continue;
         }
         if FRAMEWORK_NAMES.contains(&s.name.as_str()) || s.name.starts_with("__") || dynamic_names.contains(&s.name) {

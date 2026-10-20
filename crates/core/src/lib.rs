@@ -10,6 +10,7 @@ pub mod model;
 pub mod render;
 pub mod routes;
 pub mod tokens;
+pub mod unity;
 pub mod walk;
 
 pub use extract::extract_file;

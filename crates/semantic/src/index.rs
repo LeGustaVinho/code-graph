@@ -60,6 +60,8 @@ pub struct SymbolIndex {
     pub extensions: HashMap<String, Vec<(usize, String)>>,
     /// tsconfig / jsconfig paths and workspace packages (set by the indexer, which reads them).
     pub js: crate::jsconfig::JsProject,
+    /// Unity: directories of Editor-only assembly definitions (set by the indexer).
+    pub editor_dirs: Vec<String>,
 }
 
 const JS_EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"];
@@ -123,6 +125,7 @@ impl SymbolIndex {
             global_usings: Vec::new(),
             extensions: HashMap::new(),
             js: Default::default(),
+            editor_dirs: Vec::new(),
         };
         for (i, s) in idx.syms.iter().enumerate() {
             idx.by_id.insert(s.sym.id.clone(), i);
@@ -290,6 +293,13 @@ impl SymbolIndex {
             }
         }
         out
+    }
+
+    /// Unity editor-only code: an `Editor` folder anywhere in the path, or an assembly
+    /// definition restricted to the Editor platform.
+    pub fn is_editor_file(&self, file: &str) -> bool {
+        file.split('/').rev().skip(1).any(|seg| seg == "Editor")
+            || self.editor_dirs.iter().any(|d| !d.is_empty() && file.starts_with(&format!("{d}/")))
     }
 
     /// Every declaration of the logical type `t` (just `t` unless it is partial / merged).
