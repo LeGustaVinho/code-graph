@@ -51,6 +51,13 @@ pub struct SymbolIndex {
     pub impls: HashMap<String, Vec<String>>,
     /// (family, service name/token) → registrations.
     pub di: HashMap<(String, String), Vec<DiEntry>>,
+    /// Type index → every declaration of the same logical type (C# `partial` parts,
+    /// TS interface merging), the type itself included. Absent for ordinary types.
+    pub parts: HashMap<usize, Vec<usize>>,
+    /// C# `global using` namespaces (visible from every file).
+    pub global_usings: Vec<String>,
+    /// Extension method name → (method index, extended type name).
+    pub extensions: HashMap<String, Vec<(usize, String)>>,
 }
 
 const JS_EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"];
@@ -110,6 +117,9 @@ impl SymbolIndex {
             bases: HashMap::new(),
             impls: HashMap::new(),
             di: HashMap::new(),
+            parts: HashMap::new(),
+            global_usings: Vec::new(),
+            extensions: HashMap::new(),
         };
         for (i, s) in idx.syms.iter().enumerate() {
             idx.by_id.insert(s.sym.id.clone(), i);
@@ -139,6 +149,42 @@ impl SymbolIndex {
                 }
             }
         }
+        // Logical types declared in several parts.
+        let mut groups: HashMap<(String, String, SymbolKind), Vec<usize>> = HashMap::new();
+        for (i, s) in idx.syms.iter().enumerate() {
+            if !s.sym.kind.is_type() {
+                continue;
+            }
+            let key = if s.lang.family() == "dotnet" && s.sym.modifiers.iter().any(|m| m == "partial") {
+                ("dotnet".to_string(), s.sym.qualified_name.clone(), s.sym.kind)
+            } else if s.sym.kind == SymbolKind::Interface {
+                // TS declaration merging: same interface declared twice in one module.
+                (format!("file:{}", s.file), s.sym.qualified_name.clone(), s.sym.kind)
+            } else {
+                continue;
+            };
+            groups.entry(key).or_default().push(i);
+        }
+        for (_, g) in groups {
+            if g.len() > 1 {
+                for i in &g {
+                    idx.parts.insert(*i, g.clone());
+                }
+            }
+        }
+        for (i, s) in idx.syms.iter().enumerate() {
+            if let Some(t) = s.sym.modifiers.iter().find_map(|m| m.strip_prefix("extension:")) {
+                idx.extensions.entry(s.sym.name.clone()).or_default().push((i, t.to_string()));
+            }
+        }
+        for imps in idx.imports.values() {
+            for i in imps {
+                if i.kind == ImportKind::GlobalUsing && !idx.global_usings.contains(&i.module) {
+                    idx.global_usings.push(i.module.clone());
+                }
+            }
+        }
+        idx.global_usings.sort();
         for (file, reg) in di {
             let fam = idx.file_lang.get(&file).map(|l| l.family()).unwrap_or("");
             let key = (fam.to_string(), clean_type(&reg.service));
@@ -217,6 +263,12 @@ impl SymbolIndex {
             if !seen.insert(tid.clone()) {
                 continue;
             }
+            // Partial declarations contribute members (and bases) to the same type.
+            for p in self.parts_of(t) {
+                if p != t {
+                    stack.push((p, depth));
+                }
+            }
             if let Some(kids) = self.children.get(tid) {
                 let found: Vec<usize> = kids.iter().copied().filter(|k| self.syms[*k].sym.name == name).collect();
                 if !found.is_empty() {
@@ -235,6 +287,16 @@ impl SymbolIndex {
             }
         }
         out
+    }
+
+    /// Every declaration of the logical type `t` (just `t` unless it is partial / merged).
+    pub fn parts_of(&self, t: usize) -> Vec<usize> {
+        self.parts.get(&t).cloned().unwrap_or_else(|| vec![t])
+    }
+
+    /// Canonical declaration standing for the logical type `t`.
+    pub fn representative(&self, t: usize) -> usize {
+        self.parts.get(&t).and_then(|p| p.iter().copied().min()).unwrap_or(t)
     }
 
     /// All (transitive) implementations / subclasses of a type.
@@ -415,6 +477,12 @@ impl SymbolIndex {
     // -----------------------------------------------------------------------
 
     pub fn resolve_type(&self, raw: &str, from_file: &str) -> Resolved {
+        self.resolve_type_ns(raw, from_file, None)
+    }
+
+    /// Like [`resolve_type`], seen from namespace `ns` (C#: the namespace of the referencing
+    /// symbol; files may hold several namespace blocks). `None` = every namespace of the file.
+    pub fn resolve_type_ns(&self, raw: &str, from_file: &str, ns: Option<&str>) -> Resolved {
         let cleaned = clean_type(raw);
         if cleaned.is_empty() {
             return Resolved::None;
@@ -440,18 +508,34 @@ impl SymbolIndex {
                     }
                 }
             }
-            return self.resolve_type(last, from_file);
+            return self.resolve_type_ns(last, from_file, ns);
         }
         let name = cleaned.as_str();
-        let cands: Vec<usize> = self
+        let mut cands: Vec<usize> = self
             .by_name
             .get(name)
             .map(|v| v.iter().copied().filter(|i| self.syms[*i].sym.kind.is_type() && self.same_family(*i, family)).collect())
             .unwrap_or_default();
+        // Parts of one partial / merged type are a single candidate.
+        if !self.parts.is_empty() {
+            cands = cands.into_iter().map(|c| self.representative(c)).collect();
+            cands.sort_unstable();
+            cands.dedup();
+        }
         // Imports first (JS / Python): an explicit binding beats everything.
         if let Some((s, conf, ev)) = self.resolve_imported(from_file, name) {
             if self.syms[s].sym.kind.is_type() {
                 return Resolved::One(s, conf, ev);
+            }
+        }
+        // C# `using Alias = Some.Type;` names a type that has no declaration of its own.
+        if family == "dotnet" {
+            if let Some(target) = self.imports.get(from_file).and_then(|imps| {
+                imps.iter().find(|i| i.kind == ImportKind::Using && i.local.as_deref() == Some(name)).map(|i| i.module.clone())
+            }) {
+                if target != name {
+                    return self.resolve_type_ns(&target, from_file, ns);
+                }
             }
         }
         if cands.is_empty() {
@@ -463,7 +547,11 @@ impl SymbolIndex {
         }
         if family == "dotnet" {
             let mut visible_ns: Vec<String> = Vec::new();
-            for ns in self.file_namespace.get(from_file).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let file_ns: Vec<String> = match ns {
+                Some(n) => vec![n.to_string()],
+                None => self.file_namespace.get(from_file).cloned().unwrap_or_default(),
+            };
+            for ns in &file_ns {
                 // A namespace sees its own types and its parents'.
                 let mut cur = ns.as_str();
                 loop {
@@ -476,13 +564,13 @@ impl SymbolIndex {
                     }
                 }
             }
-            let mut usings: Vec<String> = Vec::new();
+            let mut usings: Vec<String> = self.global_usings.clone();
             if let Some(imps) = self.imports.get(from_file) {
                 for i in imps {
                     if i.kind == ImportKind::Using {
                         if let Some(alias) = &i.local {
                             if alias == name {
-                                return self.resolve_type(&i.module, from_file);
+                                return self.resolve_type_ns(&i.module, from_file, ns);
                             }
                         } else {
                             usings.push(i.module.clone());

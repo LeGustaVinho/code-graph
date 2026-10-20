@@ -63,6 +63,8 @@ pub mod relation {
     pub const THROWS: &str = "THROWS";
     pub const CAUGHT_BY: &str = "CAUGHT_BY";
     pub const TESTS: &str = "TESTS";
+    /// A type used without being called or inherited (`typeof`, attributes, annotations).
+    pub const USES_TYPE: &str = "USES_TYPE";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

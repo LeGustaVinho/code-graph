@@ -513,8 +513,9 @@ async fn overview(Eng(engine): Eng) -> Result<Json<Value>, ApiError> {
                 .query_map([], |r| {
                     let n = codegraph_graph::store::node_from_row(r)?;
                     let mut v = node_json(&n, None);
-                    v["framework"] = json!(r.get::<_, Option<String>>(28)?);
-                    v["fields"] = json!(r.get::<_, i64>(29)?);
+                    let extra = codegraph_graph::store::NODE_COLS_LEN;
+                    v["framework"] = json!(r.get::<_, Option<String>>(extra)?);
+                    v["fields"] = json!(r.get::<_, i64>(extra + 1)?);
                     Ok(v)
                 })?
                 .flatten()

@@ -393,8 +393,10 @@ pub fn find_orphaned_symbols(ctx: &Ctx, p: OrphanParams) -> ToolResult {
         if FRAMEWORK_NAMES.contains(&s.name.as_str()) || s.name.starts_with("__") || dynamic_names.contains(&s.name) {
             continue;
         }
-        if !s.attrs.is_empty() && s.kind != SymbolKind::Class {
-            continue; // decorated / attributed members are invoked by frameworks
+        // Decorated / attributed members are invoked by frameworks (`#if …` condition tags
+        // added by the preprocessor are not attributes).
+        if s.attrs.iter().any(|a| !a.starts_with('#')) && s.kind != SymbolKind::Class {
+            continue;
         }
         if s.kind == SymbolKind::Constructor || (s.kind == SymbolKind::Method && s.is_abstract) {
             continue;

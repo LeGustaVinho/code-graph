@@ -121,6 +121,16 @@ enum Chain {
     Unknown,
 }
 
+/// Outcome of resolving a reference's static type.
+enum TypeOf {
+    /// A project type.
+    Project(usize, Confidence, String),
+    /// Known to be outside the project (framework / engine / package type).
+    External,
+    /// Several project types match, or the type cannot be determined.
+    Unknown,
+}
+
 pub struct FileResolver<'a> {
     pub index: &'a SymbolIndex,
     pub file: &'a str,
@@ -162,6 +172,7 @@ impl<'a> FileResolver<'a> {
                 RefKind::New | RefKind::Jsx => self.construct(r),
                 RefKind::Throw => self.throw(r),
                 RefKind::Read | RefKind::Write => self.var_access(r),
+                RefKind::TypeUse => self.type_use(r),
                 RefKind::Catch => {}
             }
         }
@@ -180,7 +191,7 @@ impl<'a> FileResolver<'a> {
                 if base.is_empty() || base == "object" {
                     continue;
                 }
-                match self.index.resolve_type(raw, self.file) {
+                match self.index.resolve_type_ns(raw, self.file, sym.namespace.as_deref()) {
                     Resolved::One(b, conf, ev) => {
                         let bk = self.index.syms[b].sym.kind;
                         let kind = if bk == SymbolKind::Interface { "implements" } else { "extends" };
@@ -310,18 +321,15 @@ impl<'a> FileResolver<'a> {
         let mut target = t;
         let mut evidence = evidence;
         if self.index.syms[t].sym.kind.is_type() {
-            // Static constructors (type initialisers) are never the target of `new`.
+            // Static constructors (type initialisers) are never the target of `new`; partial
+            // types may declare constructors in any part.
             let ctors: Vec<usize> = self
                 .index
-                .children
-                .get(&self.index.syms[t].sym.id)
-                .map(|kids| {
-                    kids.iter()
-                        .copied()
-                        .filter(|k| self.index.syms[*k].sym.kind == SymbolKind::Constructor && !self.index.syms[*k].sym.is_static)
-                        .collect()
-                })
-                .unwrap_or_default();
+                .parts_of(t)
+                .into_iter()
+                .flat_map(|p| self.index.children.get(&self.index.syms[p].sym.id).cloned().unwrap_or_default())
+                .filter(|k| self.index.syms[*k].sym.kind == SymbolKind::Constructor && !self.index.syms[*k].sym.is_static)
+                .collect();
             let ctor = ctors
                 .iter()
                 .copied()
@@ -447,8 +455,15 @@ impl<'a> FileResolver<'a> {
     }
 
     fn call_on_type(&mut self, r: &Reference, t: usize, conf: Confidence, ev: String, field: Option<&str>) -> bool {
-        let mut methods: Vec<usize> =
-            self.index.members_named(t, &r.name).into_iter().filter(|m| self.index.syms[*m].sym.kind.is_callable()).collect();
+        let mut methods: Vec<usize> = self
+            .index
+            .members_named(t, &r.name)
+            .into_iter()
+            .filter(|m| {
+                let s = &self.index.syms[*m].sym;
+                s.kind.is_callable() && !(s.kind == SymbolKind::Constructor && s.is_static)
+            })
+            .collect();
         if methods.is_empty() {
             return false;
         }
@@ -470,20 +485,231 @@ impl<'a> FileResolver<'a> {
         if abstract_target {
             let owner = decl_owner.unwrap_or(t);
             self.dispatch(r, owner, &r.name, field);
+        } else if methods.iter().any(|m| self.index.syms[*m].sym.modifiers.iter().any(|x| x == "virtual" || x == "override")) {
+            self.dispatch_virtual(r, &methods);
         }
         true
+    }
+
+    /// A call to a virtual member may run any override: link them (inferred), never ambiguity.
+    fn dispatch_virtual(&mut self, r: &Reference, methods: &[usize]) {
+        let mut targets = Vec::new();
+        for m in methods {
+            let Some(owner) = self.index.syms[*m].sym.parent_id.clone() else { continue };
+            for sub in self.index.implementations(&owner) {
+                let sub_id = self.index.syms[sub].sym.id.clone();
+                for k in self.index.children.get(&sub_id).cloned().unwrap_or_default() {
+                    let s = &self.index.syms[k].sym;
+                    if s.name == r.name && s.modifiers.iter().any(|x| x == "override") && !targets.contains(&k) {
+                        targets.push(k);
+                    }
+                }
+            }
+        }
+        targets.sort_unstable();
+        for k in targets.into_iter().take(8) {
+            let owner =
+                self.index.get(self.index.syms[k].sym.parent_id.as_deref().unwrap_or("")).map(|p| p.sym.name.clone()).unwrap_or_default();
+            self.emit_call(r, k, Confidence::Inferred, format!("virtual dispatch to override in {owner}"), "dispatch-resolver");
+        }
+    }
+
+    /// `items.ToDto()` → `static Dto ToDto(this Item x)`: an extension method on the receiver
+    /// type (or one of its ancestors), or a generic extension (`this T x`).
+    fn extension_call(&mut self, r: &Reference, owner: Option<usize>, raw: &str) -> bool {
+        let Some(cands) = self.index.extensions.get(&r.name).cloned() else { return false };
+        let names: HashSet<String> = match owner {
+            Some(t) => self.type_names(t),
+            None => [clean_type(raw)].into_iter().collect(),
+        };
+        let is_generic = |ext: &str| ext.len() <= 2 && ext.starts_with('T') || ext == "object";
+        let exact: Vec<usize> = cands.iter().filter(|(_, ext)| names.contains(ext)).map(|(i, _)| *i).collect();
+        if !exact.is_empty() {
+            let conf = if exact.len() == 1 { Confidence::Exact } else { Confidence::Inferred };
+            let tn = names.iter().min().cloned().unwrap_or_default();
+            for i in exact.into_iter().take(4) {
+                self.emit_call(r, i, conf, format!("extension method {}(this {tn})", r.name), "extension-resolver");
+            }
+            return true;
+        }
+        let generic: Vec<usize> = cands.iter().filter(|(_, ext)| is_generic(ext)).map(|(i, _)| *i).collect();
+        if generic.len() == 1 {
+            self.emit_call(r, generic[0], Confidence::Inferred, format!("generic extension method {}", r.name), "extension-resolver");
+            return true;
+        }
+        false
+    }
+
+    /// Names of a project type, its other partial declarations and every ancestor (project
+    /// types and declared external bases).
+    fn type_names(&self, t: usize) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let mut stack = vec![t];
+        let mut seen = HashSet::new();
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x) || seen.len() > 64 {
+                continue;
+            }
+            for p in self.index.parts_of(x) {
+                let s = &self.index.syms[p].sym;
+                out.insert(s.name.clone());
+                for b in &s.bases {
+                    out.insert(clean_type(b));
+                }
+                for (b, _) in self.index.bases.get(&s.id).cloned().unwrap_or_default() {
+                    if let Some(bi) = self.index.by_id.get(&b) {
+                        stack.push(*bi);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Static type of a receiver: plain names, or deferred member types (`@mt#Owner#member`)
+    /// recorded for `var x = repo.Find(id)` / `GetUser().Profile` / `(await svc.Load()).Name`.
+    fn ref_type(&self, raw: &str, r: &Reference, depth: u32) -> TypeOf {
+        let Some(rest) = raw.strip_prefix("@mt#") else {
+            return match self.ty(raw, r) {
+                Resolved::One(t, c, ev) => TypeOf::Project(t, c, ev),
+                Resolved::None => TypeOf::External,
+                Resolved::Many(_) => TypeOf::Unknown,
+            };
+        };
+        if depth > 6 {
+            return TypeOf::Unknown;
+        }
+        let Some((owner_raw, member)) = rest.rsplit_once('#') else { return TypeOf::Unknown };
+        let (member, awaited) = match member.strip_suffix("!await") {
+            Some(m) => (m, true),
+            None => (member, false),
+        };
+        let owner = if owner_raw.is_empty() {
+            match self.enclosing_type(&r.enclosing) {
+                Some(t) => t,
+                None => return TypeOf::Unknown,
+            }
+        } else {
+            match self.ref_type(owner_raw, r, depth + 1) {
+                TypeOf::Project(t, _, _) => t,
+                other => return other,
+            }
+        };
+        let found = self.index.members_named(owner, member).into_iter().find(|m| self.index.syms[*m].sym.type_ref.is_some());
+        let Some(m) = found else {
+            // Not declared in the project: inherited from an external base type.
+            return if self.has_external_base(owner) { TypeOf::External } else { TypeOf::Unknown };
+        };
+        let ms = &self.index.syms[m];
+        let mut ty = ms.sym.type_ref.clone().unwrap_or_default();
+        if awaited {
+            let base = clean_type(&ty);
+            if matches!(base.as_str(), "Task" | "ValueTask" | "Promise" | "UniTask" | "Awaitable") {
+                ty = codegraph_core::extract::generic_args(&ty).into_iter().next().unwrap_or_default();
+            }
+        }
+        if ty.is_empty() || matches!(clean_type(&ty).as_str(), "void" | "Task" | "ValueTask" | "Promise" | "UniTask" | "IEnumerator") {
+            return TypeOf::External;
+        }
+        let file = ms.file.clone();
+        match self.index.resolve_type_ns(&ty, &file, ms.sym.namespace.as_deref()) {
+            Resolved::One(t, c, _) => {
+                let tn = self.index.syms[t].sym.name.clone();
+                TypeOf::Project(t, c.weakest(Confidence::Exact), format!("declared type {tn} of {member}"))
+            }
+            Resolved::None => TypeOf::External,
+            Resolved::Many(_) => TypeOf::Unknown,
+        }
+    }
+
+    /// `USES_TYPE`: `typeof(T)`, attributes, generic arguments of factory calls.
+    fn type_use(&mut self, r: &Reference) {
+        let attr = r.detail.as_deref() == Some("attribute");
+        let names = if attr { vec![format!("{}Attribute", r.name), r.name.clone()] } else { vec![r.name.clone()] };
+        let own = self.enclosing_type(&r.enclosing);
+        for name in names {
+            if let Resolved::One(t, c, ev) = self.ty(&name, r) {
+                if Some(t) == own {
+                    return;
+                }
+                let what = match r.detail.as_deref() {
+                    Some("attribute") => format!("attribute [{}]", r.name),
+                    Some("typeof") => format!("typeof({})", r.name),
+                    Some(d) => d.to_string(),
+                    None => format!("type {}", r.name),
+                };
+                let e = Edge::new(
+                    &r.enclosing,
+                    self.file,
+                    Some(self.target(t)),
+                    relation::USES_TYPE,
+                    c,
+                    format!("{what} ({ev})"),
+                    "type-use",
+                    r.line,
+                );
+                self.push(e);
+                return;
+            }
+        }
+    }
+
+    /// Resolves a type name as seen from the reference's own namespace.
+    fn ty(&self, raw: &str, r: &Reference) -> Resolved {
+        let ns = self.index.get(&r.enclosing).and_then(|s| s.sym.namespace.clone());
+        self.index.resolve_type_ns(raw, self.file, ns.as_deref())
+    }
+
+    /// A function declared inside an enclosing function body (C# local function, nested JS function).
+    fn local_function(&self, r: &Reference) -> Option<usize> {
+        let mut scope = Some(r.enclosing.clone());
+        let mut guard = 0;
+        while let Some(sid) = scope {
+            let s = self.index.get(&sid)?;
+            if s.sym.kind.is_type() || s.sym.kind == SymbolKind::Module {
+                return None;
+            }
+            if let Some(kids) = self.index.children.get(&sid) {
+                if let Some(k) =
+                    kids.iter().find(|k| self.index.syms[**k].sym.name == r.name && self.index.syms[**k].sym.kind == SymbolKind::Function)
+                {
+                    return Some(*k);
+                }
+            }
+            scope = s.sym.parent_id.clone();
+            guard += 1;
+            if guard > 16 {
+                break;
+            }
+        }
+        None
     }
 
     fn call(&mut self, r: &Reference) {
         let file = self.file;
         match r.receiver.as_deref() {
             None => {
+                // A local function shadows every other declaration.
+                if let Some(f) = self.local_function(r) {
+                    self.emit_call(r, f, Confidence::Exact, "local function".into(), "call-resolver");
+                    return;
+                }
                 // C# implicit `this`: methods of the enclosing type.
                 if self.lang == Language::CSharp {
                     if let Some(t) = self.enclosing_type(&r.enclosing) {
                         let tn = self.index.syms[t].sym.name.clone();
                         if self.call_on_type(r, t, Confidence::Exact, format!("same-class method of {tn}"), None) {
                             return;
+                        }
+                        // `using static Shop.Util;` brings static members into scope.
+                        for imp in self.index.imports.get(file).cloned().unwrap_or_default() {
+                            if imp.kind == ImportKind::UsingStatic {
+                                if let Resolved::One(st, c, _) = self.ty(&imp.module, r) {
+                                    if self.call_on_type(r, st, c, format!("using static {}", imp.module), None) {
+                                        return;
+                                    }
+                                }
+                            }
                         }
                         // Not declared in the project: inherited from an engine/framework base
                         // (`StartCoroutine`, `Instantiate`, `GetComponent`).
@@ -505,7 +731,7 @@ impl<'a> FileResolver<'a> {
                     _ => {}
                 }
                 // Class instantiation without `new` (Python) or global functions.
-                if let Resolved::One(t, c, ev) = self.index.resolve_type(&r.name, file) {
+                if let Resolved::One(t, c, ev) = self.ty(&r.name, r) {
                     self.emit_call(r, t, c, ev, "call-resolver");
                     return;
                 }
@@ -556,22 +782,31 @@ impl<'a> FileResolver<'a> {
                 let field = recv_l.strip_prefix("this.").or_else(|| recv_l.strip_prefix("self."));
                 // Typed receiver (declared / inferred static type).
                 if let Some(rt) = &r.receiver_type {
-                    match self.index.resolve_type(rt, file) {
-                        Resolved::One(t, c, ev) => {
+                    match self.ref_type(rt, r, 0) {
+                        TypeOf::Project(t, c, ev) => {
                             let tn = self.index.syms[t].sym.name.clone();
                             let how = format!("typed receiver '{recv_l}: {tn}' ({ev})");
                             if self.call_on_type(r, t, c, how, field.or(Some(recv_l))) {
                                 return;
                             }
+                            self.extension_call(r, Some(t), rt);
                             return; // method inherited from an external type
                         }
-                        Resolved::Many(_) => {}
-                        Resolved::None => return, // external type (HttpClient, ILogger, ...)
+                        TypeOf::Unknown => {}
+                        TypeOf::External => {
+                            // External type (HttpClient, ILogger, Transform, ...): only project
+                            // extension methods on it can be targets.
+                            if !rt.starts_with("@mt#") {
+                                self.extension_call(r, None, rt);
+                            }
+                            return;
+                        }
                     }
                 }
                 let head = recv_l.split('.').next().unwrap_or(recv_l);
-                // Namespace / module import: `utils.hash()`, `models.Item(...)`.
-                if !recv_l.contains('(') {
+                // Namespace / module import: `utils.hash()`, `models.Item(...)`. C# usings are
+                // namespaces / aliases, resolved as types below.
+                if !recv_l.contains('(') && self.lang != Language::CSharp {
                     if let Some(imp) = self.index.import_binding(file, head).cloned() {
                         match self.index.resolve_imported(file, head) {
                             Some((m, c, ev)) => {
@@ -593,7 +828,7 @@ impl<'a> FileResolver<'a> {
                 // Static call on a type: `OrderService.Create()`, `Item.query()`.
                 if !recv_l.contains('.') && !recv_l.contains('(') && recv_l.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
                 {
-                    match self.index.resolve_type(recv_l, file) {
+                    match self.ty(recv_l, r) {
                         Resolved::One(t, c, ev) => {
                             self.call_on_type(r, t, c, format!("static type reference {recv_l} ({ev})"), None);
                             return;
@@ -668,6 +903,11 @@ impl<'a> FileResolver<'a> {
             if !seen.insert(s.sym.id.clone()) {
                 continue;
             }
+            for p in self.index.parts_of(x) {
+                if p != x {
+                    stack.push(p);
+                }
+            }
             let resolved = self.index.bases.get(&s.sym.id).cloned().unwrap_or_default();
             if s.sym.bases.len() > resolved.len() {
                 return true;
@@ -690,17 +930,17 @@ impl<'a> FileResolver<'a> {
                 None => return Chain::Unknown,
             }
         } else if let Some(rt) = &r.root_type {
-            match self.index.resolve_type(rt, self.file) {
-                Resolved::One(t, c, _) => (t, c, 1),
-                Resolved::None => return Chain::External,
-                Resolved::Many(_) => return Chain::Unknown,
+            match self.ref_type(rt, r, 0) {
+                TypeOf::Project(t, c, _) => (t, c, 1),
+                TypeOf::External => return Chain::External,
+                TypeOf::Unknown => return Chain::Unknown,
             }
         } else if upper(segs[0]) {
             // Longest namespace-qualified prefix naming a project type (`Game.Core.Foo.Bar`).
             let mut found = None;
             for k in (1..=segs.len()).rev() {
                 if k == 1 {
-                    if let Resolved::One(t, c, _) = self.index.resolve_type(segs[0], self.file) {
+                    if let Resolved::One(t, c, _) = self.ty(segs[0], r) {
                         found = Some((t, c, 1));
                     }
                 } else {
@@ -740,7 +980,7 @@ impl<'a> FileResolver<'a> {
                 Some(m) => {
                     let ms = &self.index.syms[m];
                     let Some(ty) = ms.sym.type_ref.clone() else { return Chain::Unknown };
-                    match self.index.resolve_type(&ty, &ms.file) {
+                    match self.index.resolve_type_ns(&ty, &ms.file, ms.sym.namespace.as_deref()) {
                         Resolved::One(t, c, _) => {
                             cur = t;
                             conf = conf.weakest(c);
@@ -819,14 +1059,14 @@ impl<'a> FileResolver<'a> {
             match self.index.resolve_value(&r.name, file, &r.enclosing) {
                 Resolved::One(t, c, ev) => self.emit_call(r, t, c, format!("JSX <{}> {ev}", r.name), "jsx-resolver"),
                 _ => {
-                    if let Resolved::One(t, c, ev) = self.index.resolve_type(&r.name, file) {
+                    if let Resolved::One(t, c, ev) = self.ty(&r.name, r) {
                         self.emit_call(r, t, c, format!("JSX <{}> {ev}", r.name), "jsx-resolver");
                     }
                 }
             }
             return;
         }
-        match self.index.resolve_type(&r.name, file) {
+        match self.ty(&r.name, r) {
             Resolved::One(t, c, ev) => self.emit_call(r, t, c, format!("new {} ({ev})", r.name), "call-resolver"),
             Resolved::Many(c) if c.len() <= MAX_AMBIGUOUS => {
                 self.emit_unresolved_call(r, &r.name.clone(), format!("{} candidate types named {}", c.len(), r.name), &c);
@@ -843,7 +1083,7 @@ impl<'a> FileResolver<'a> {
         if !r.catch_types.is_empty() {
             meta["try"] = json!(r.catch_types);
         }
-        match self.index.resolve_type(&r.name, self.file) {
+        match self.ty(&r.name, r) {
             Resolved::One(t, c, ev) => {
                 let e = Edge::new(
                     &r.enclosing,
@@ -902,8 +1142,8 @@ impl<'a> FileResolver<'a> {
                         None
                     }
                 });
-                match typed.map(|t| self.index.resolve_type(&t, file)) {
-                    Some(Resolved::One(t, c, ev)) => self
+                match typed.map(|t| self.ref_type(&t, r, 0)) {
+                    Some(TypeOf::Project(t, c, ev)) => self
                         .index
                         .members_named(t, &r.name)
                         .into_iter()

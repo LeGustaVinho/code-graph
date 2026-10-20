@@ -666,6 +666,7 @@ pub fn literal_graph(literals: &[LiteralRow], max_nodes: usize) -> (Vec<(String,
             params: None,
             body_hash: String::new(),
             namespace: None,
+            modifiers: Vec::new(),
         };
         nodes.push((first.file.clone(), sym));
         let mut seen = HashSet::new();

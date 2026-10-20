@@ -159,6 +159,10 @@ pub struct Symbol {
     /// Hash of the symbol's token stream without comments/whitespace.
     pub body_hash: String,
     pub namespace: Option<String>,
+    /// Declaration modifiers that change resolution (`virtual`, `override`, `sealed`, `new`,
+    /// `partial`, `extern`, `required`, `file`, `readonly`, `explicit:IFoo`, `extension`).
+    #[serde(default)]
+    pub modifiers: Vec<String>,
 }
 
 impl Symbol {
@@ -181,6 +185,9 @@ pub enum RefKind {
     Catch,
     Read,
     Write,
+    /// A type named in code without calling it: `typeof(T)`, attributes `[T]`, generic
+    /// arguments of `GetComponent<T>()`, type annotations.
+    TypeUse,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -218,6 +225,8 @@ pub enum ImportKind {
     SideEffect,
     Using,
     UsingStatic,
+    /// C# 10 `global using X;`: visible from every file of the project.
+    GlobalUsing,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

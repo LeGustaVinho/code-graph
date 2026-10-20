@@ -141,6 +141,77 @@ const UNITY_HOOK_ATTRS: &[&str] = &[
     "DrawGizmo",
 ];
 
+/// LINQ / collection methods whose lambda parameter is an element of the receiver.
+const ELEMENT_LAMBDA_METHODS: &[&str] = &[
+    "Where",
+    "Select",
+    "SelectMany",
+    "Any",
+    "All",
+    "First",
+    "FirstOrDefault",
+    "Last",
+    "LastOrDefault",
+    "Single",
+    "SingleOrDefault",
+    "OrderBy",
+    "OrderByDescending",
+    "ThenBy",
+    "ThenByDescending",
+    "GroupBy",
+    "ToDictionary",
+    "ToLookup",
+    "Count",
+    "Sum",
+    "Max",
+    "Min",
+    "Average",
+    "MaxBy",
+    "MinBy",
+    "DistinctBy",
+    "TakeWhile",
+    "SkipWhile",
+    "ForEach",
+    "Find",
+    "FindAll",
+    "FindIndex",
+    "FindLast",
+    "Exists",
+    "RemoveAll",
+    "TrueForAll",
+    "ConvertAll",
+    "Aggregate",
+];
+
+/// Generic factory / lookup methods returning their type argument (`GetComponent<T>()`).
+const GENERIC_FACTORIES: &[&str] = &[
+    "GetComponent",
+    "GetComponentInChildren",
+    "GetComponentInParent",
+    "AddComponent",
+    "FindObjectOfType",
+    "FindAnyObjectByType",
+    "FindFirstObjectByType",
+    "Instantiate",
+    "Load",
+    "LoadAsset",
+    "CreateInstance",
+    "GetService",
+    "GetRequiredService",
+    "GetKeyedService",
+    "GetRequiredKeyedService",
+    "Resolve",
+    "Get",
+    "Create",
+];
+
+/// Generic lookups returning an array of their type argument (`GetComponents<T>()`).
+const GENERIC_ARRAY_FACTORIES: &[&str] =
+    &["GetComponents", "GetComponentsInChildren", "GetComponentsInParent", "FindObjectsOfType", "FindObjectsByType", "LoadAll"];
+
+/// Declaration modifiers kept on symbols (resolution / reachability depend on them).
+const KEPT_MODIFIERS: &[&str] = &["virtual", "override", "sealed", "new", "partial", "extern", "required", "file", "readonly", "unsafe"];
+
 fn uses_unity(ctx: &Ctx) -> bool {
     ctx.facts.imports.iter().any(|i| i.module.starts_with("UnityEngine") || i.module.starts_with("UnityEditor"))
 }
@@ -176,6 +247,7 @@ fn visit_container(ctx: &mut Ctx, node: Node) {
             "class_declaration" | "struct_declaration" | "interface_declaration" | "record_declaration" | "enum_declaration" => {
                 visit_type(ctx, ch, None)
             }
+            "delegate_declaration" => visit_delegate(ctx, ch, "internal"),
             "global_statement" => {
                 let m = &mut ctx.facts.symbols[0];
                 if !m.is_entrypoint {
@@ -193,6 +265,7 @@ fn visit_container(ctx: &mut Ctx, node: Node) {
 fn using(ctx: &mut Ctx, node: Node) {
     let text = ctx.text(node);
     let is_static = text.contains("static ");
+    let is_global = text.trim_start().starts_with("global ");
     let alias = node.child_by_field_name("name");
     let mut target = None;
     for ch in named_children(node) {
@@ -208,7 +281,13 @@ fn using(ctx: &mut Ctx, node: Node) {
             module,
             imported: None,
             local: alias.map(|a| ctx.text(a).to_string()),
-            kind: if is_static { ImportKind::UsingStatic } else { ImportKind::Using },
+            kind: if is_static {
+                ImportKind::UsingStatic
+            } else if is_global && alias.is_none() {
+                ImportKind::GlobalUsing
+            } else {
+                ImportKind::Using
+            },
             line: line_of(node),
         });
     }
@@ -234,11 +313,79 @@ fn mods_attrs(ctx: &Ctx, node: Node) -> (Vec<String>, Vec<String>) {
     (mods, attrs)
 }
 
+/// Records attribute string arguments as literals and attribute classes / `typeof(T)`
+/// arguments as type uses (under the current scope).
 fn record_attr_literals(ctx: &mut Ctx, node: Node) {
     for ch in named_children(node) {
         if ch.kind() == "attribute_list" {
             collect_strings(ctx, ch);
+            for a in named_children(ch) {
+                if a.kind() != "attribute" {
+                    continue;
+                }
+                if let Some(n) = a.child_by_field_name("name") {
+                    let name = clean_type(ctx.text(n));
+                    ctx.push_ref(RefKind::TypeUse, &name, None, None, None, line_of(a), Some("attribute".into()));
+                }
+                collect_typeofs(ctx, a);
+            }
         }
+    }
+}
+
+fn collect_typeofs(ctx: &mut Ctx, node: Node) {
+    if node.kind() == "typeof_expression" {
+        if let Some(t) = node.child_by_field_name("type") {
+            let ty = clean_type(ctx.text(t));
+            ctx.push_ref(RefKind::TypeUse, &ty, None, None, None, line_of(node), Some("typeof".into()));
+        }
+        return;
+    }
+    for ch in named_children(node) {
+        collect_typeofs(ctx, ch);
+    }
+}
+
+fn kept_modifiers(mods: &[String]) -> Vec<String> {
+    mods.iter().filter(|m| KEPT_MODIFIERS.contains(&m.as_str())).cloned().collect()
+}
+
+/// `<T, U>` plus `where T : IFoo` → { T: Some(IFoo), U: None }.
+fn type_params(ctx: &Ctx, node: Node) -> (String, HashMap<String, Option<String>>) {
+    let mut map = HashMap::new();
+    let mut text = String::new();
+    for ch in named_children(node) {
+        match ch.kind() {
+            "type_parameter_list" => {
+                text = ctx.text(ch).to_string();
+                for tp in named_children(ch) {
+                    if let Some(n) = tp.child_by_field_name("name") {
+                        map.insert(ctx.text(n).to_string(), None);
+                    }
+                }
+            }
+            "type_parameter_constraints_clause" => {
+                let target = named_children(ch).into_iter().find(|c| c.kind() == "identifier").map(|n| ctx.text(n).to_string());
+                let bound = named_children(ch)
+                    .into_iter()
+                    .filter(|c| c.kind() == "type_parameter_constraint")
+                    .find_map(|c| c.child_by_field_name("type"))
+                    .map(|t| ctx.text(t).to_string());
+                if let Some(t) = target {
+                    map.insert(t, bound);
+                }
+            }
+            _ => {}
+        }
+    }
+    (text, map)
+}
+
+fn subst(map: &HashMap<String, Option<String>>, ty: Option<String>) -> Option<String> {
+    let t = ty?;
+    match map.get(&clean_type(&t)) {
+        Some(bound) => bound.clone(),
+        None => Some(t),
     }
 }
 
@@ -293,15 +440,24 @@ fn visit_type(ctx: &mut Ctx, node: Node, outer: Option<&ClassInfo>) {
         _ => SymbolKind::Class,
     };
     let (mods, attrs) = mods_attrs(ctx, node);
-    let mut bases = Vec::new();
+    let mut bases: Vec<String> = Vec::new();
     let mut primary_params: Vec<(String, Option<String>)> = Vec::new();
+    // C# 12 `class D(int x) : B(x)`: arguments passed to the base constructor.
+    let mut base_args: Option<(String, Node)> = None;
     for ch in named_children(node) {
         match ch.kind() {
             "base_list" => {
                 for b in named_children(ch) {
                     let t = if b.kind() == "primary_constructor_base_type" {
+                        if let Some(args) = named_children(b).into_iter().find(|c| c.kind() == "argument_list") {
+                            let bn = b.named_child(0).map(|x| clean_type(ctx.text(x))).unwrap_or_default();
+                            base_args = Some((bn, args));
+                        }
                         b.named_child(0).map(|x| ctx.text(x).to_string()).unwrap_or_default()
                     } else if b.kind() == "argument_list" {
+                        if let Some(last) = bases.last() {
+                            base_args = Some((clean_type(last), b));
+                        }
                         continue;
                     } else {
                         ctx.text(b).to_string()
@@ -332,7 +488,7 @@ fn visit_type(ctx: &mut Ctx, node: Node, outer: Option<&ClassInfo>) {
         "enum_declaration" => "enum",
         _ => "class",
     };
-    let tparams = node.child_by_field_name("type_parameters").map(|t| ctx.text(t).to_string()).unwrap_or_default();
+    let (tparams, tparam_map) = type_params(ctx, node);
     let mut signature = format!("{keyword} {name}{tparams}");
     if !primary_params.is_empty() {
         let ps: Vec<String> =
@@ -354,6 +510,7 @@ fn visit_type(ctx: &mut Ctx, node: Node, outer: Option<&ClassInfo>) {
     sym.docstring = doc_comment(node, ctx.src);
     sym.bases = bases.clone();
     sym.body_hash = token_hash(node, ctx.src);
+    sym.modifiers = kept_modifiers(&mods);
     let route_prefix = attrs.iter().find(|a| attr_name(a) == "Route").and_then(|a| attr_string_arg(a));
     let is_controller = name.ends_with("Controller")
         || attrs.iter().any(|a| matches!(attr_name(a), "ApiController" | "Controller"))
@@ -364,7 +521,7 @@ fn visit_type(ctx: &mut Ctx, node: Node, outer: Option<&ClassInfo>) {
     // Collect field / property types for receiver inference.
     let mut fields: HashMap<String, Option<String>> = HashMap::new();
     for (n, t) in &primary_params {
-        fields.insert(n.clone(), t.clone());
+        fields.insert(n.clone(), subst(&tparam_map, t.clone()));
     }
     let body = node.child_by_field_name("body");
     if let Some(body) = body {
@@ -372,7 +529,7 @@ fn visit_type(ctx: &mut Ctx, node: Node, outer: Option<&ClassInfo>) {
             match m.kind() {
                 "field_declaration" | "event_field_declaration" => {
                     if let Some(vd) = named_children(m).into_iter().find(|c| c.kind() == "variable_declaration") {
-                        let ty = vd.child_by_field_name("type").map(|t| ctx.text(t).to_string());
+                        let ty = subst(&tparam_map, vd.child_by_field_name("type").map(|t| ctx.text(t).to_string()));
                         for d in named_children(vd) {
                             if d.kind() == "variable_declarator" {
                                 if let Some(n) = declarator_name(d) {
@@ -382,9 +539,9 @@ fn visit_type(ctx: &mut Ctx, node: Node, outer: Option<&ClassInfo>) {
                         }
                     }
                 }
-                "property_declaration" => {
+                "property_declaration" | "event_declaration" => {
                     if let Some(n) = m.child_by_field_name("name") {
-                        let ty = m.child_by_field_name("type").map(|t| ctx.text(t).to_string());
+                        let ty = subst(&tparam_map, m.child_by_field_name("type").map(|t| ctx.text(t).to_string()));
                         fields.insert(ctx.text(n).to_string(), ty);
                     }
                 }
@@ -393,8 +550,38 @@ fn visit_type(ctx: &mut Ctx, node: Node, outer: Option<&ClassInfo>) {
         }
     }
 
-    ctx.push_scope(Scope { symbol_id: id.clone(), kind: Some(kind), qname: qname.clone(), fields, ..Default::default() });
+    ctx.push_scope(Scope {
+        symbol_id: id.clone(),
+        kind: Some(kind),
+        qname: qname.clone(),
+        fields,
+        tparams: tparam_map,
+        ..Default::default()
+    });
     record_attr_literals(ctx, node);
+    // Positional records expose their parameters as public init-only properties.
+    if node.kind() == "record_declaration" {
+        for p in named_children(node).into_iter().filter(|c| c.kind() == "parameter_list") {
+            for param in named_children(p).into_iter().filter(|c| c.kind() == "parameter") {
+                let Some(n) = param.child_by_field_name("name") else { continue };
+                let pn = ctx.text(n).to_string();
+                let ty = param.child_by_field_name("type").map(|t| ctx.text(t).to_string());
+                let mut s = NewSymbol::new(SymbolKind::Property, &pn, ctx.child_qname(&pn), line_of(param), end_line_of(param));
+                s.signature = format!("{} {pn} {{ get; init; }}", ty.clone().unwrap_or_default());
+                s.type_ref = ty;
+                s.visibility = "public".into();
+                s.is_exported = true;
+                s.body_hash = token_hash(param, ctx.src);
+                ctx.add_symbol(s);
+            }
+        }
+    }
+    // `class D(int x) : B(x)` calls B's constructor.
+    if let Some((base, args)) = base_args {
+        let argc = Some(count_args(args));
+        ctx.push_ref(RefKind::Call, &base, Some("base".into()), None, argc, line_of(args), None);
+        walk(ctx, args);
+    }
     let info = ClassInfo { name: name.clone(), kind: Some(kind), route_prefix, is_controller, bases };
     if let Some(body) = body {
         if kind == SymbolKind::Enum {
@@ -423,9 +610,11 @@ fn visit_type(ctx: &mut Ctx, node: Node, outer: Option<&ClassInfo>) {
                         visit_type(ctx, m, Some(&info))
                     }
                     "operator_declaration" | "conversion_operator_declaration" | "indexer_declaration" | "destructor_declaration" => {
-                        // Not modelled as symbols, but their bodies still produce references.
-                        walk(ctx, m);
+                        let member_name = special_member_name(ctx, m, &name);
+                        visit_callable_as(ctx, m, SymbolKind::Method, &info, Some(member_name));
                     }
+                    "event_declaration" => visit_event(ctx, m, &info),
+                    "delegate_declaration" => visit_delegate(ctx, m, "private"),
                     _ => {}
                 }
             }
@@ -457,9 +646,10 @@ fn declarator_value(d: Node) -> Option<Node> {
 fn visit_field(ctx: &mut Ctx, node: Node, cls: &ClassInfo) {
     let (mods, attrs) = mods_attrs(ctx, node);
     let Some(vd) = named_children(node).into_iter().find(|c| c.kind() == "variable_declaration") else { return };
-    let ty = vd.child_by_field_name("type").map(|t| ctx.text(t).to_string());
+    let ty = ctx.subst_tparam(vd.child_by_field_name("type").map(|t| ctx.text(t).to_string()));
     let is_const = mods.iter().any(|m| m == "const");
     let default_vis = if cls.kind == Some(SymbolKind::Interface) { "public" } else { "private" };
+    let mut first = true;
     for d in named_children(vd) {
         if d.kind() != "variable_declarator" {
             continue;
@@ -484,13 +674,112 @@ fn visit_field(ctx: &mut Ctx, node: Node, cls: &ClassInfo) {
         s.visibility = visibility(&mods, default_vis);
         s.is_static = is_const || mods.iter().any(|m| m == "static");
         s.attrs = attrs.clone();
+        s.modifiers = kept_modifiers(&mods);
         s.body_hash = token_hash(d, ctx.src);
         let id = ctx.add_symbol(s);
-        if let Some(v) = value {
-            ctx.push_scope(Scope { symbol_id: id, qname: ctx.child_qname(&name), ..Default::default() });
-            walk(ctx, v);
-            ctx.pop_scope();
+        ctx.push_scope(Scope { symbol_id: id, qname: ctx.child_qname(&name), ..Default::default() });
+        if first {
+            // `[ContextMenuItem("…", "Method")]`, `[OnValueChanged("M")]`, `[SerializeField]`.
+            record_attr_literals(ctx, node);
+            first = false;
         }
+        if let Some(v) = value {
+            match (v.kind(), &ty) {
+                ("implicit_object_creation_expression", Some(t)) => implicit_new(ctx, v, t),
+                _ => walk(ctx, v),
+            }
+        }
+        ctx.pop_scope();
+    }
+}
+
+/// Name of operators, conversions, indexers and finalizers (`operator +`, `implicit operator int`,
+/// `this[]`, `~Repo`).
+fn special_member_name(ctx: &Ctx, node: Node, class: &str) -> String {
+    match node.kind() {
+        "operator_declaration" => {
+            let op = node.child_by_field_name("operator").map(|o| ctx.text(o).to_string()).unwrap_or_default();
+            format!("operator {op}")
+        }
+        "conversion_operator_declaration" => {
+            let mut c = node.walk();
+            let kw = node.children(&mut c).find(|ch| matches!(ch.kind(), "implicit" | "explicit")).map(|k| k.kind()).unwrap_or("implicit");
+            let ty = node.child_by_field_name("type").map(|t| ctx.text(t).to_string()).unwrap_or_default();
+            format!("{kw} operator {ty}")
+        }
+        "indexer_declaration" => "this[]".to_string(),
+        _ => format!("~{class}"),
+    }
+}
+
+/// `event Action Changed { add { … } remove { … } }`.
+fn visit_event(ctx: &mut Ctx, node: Node, cls: &ClassInfo) {
+    let Some(n) = node.child_by_field_name("name") else { return };
+    let name = ctx.text(n).to_string();
+    let (mods, attrs) = mods_attrs(ctx, node);
+    let ty = node.child_by_field_name("type").map(|t| ctx.text(t).to_string());
+    let default_vis = if cls.kind == Some(SymbolKind::Interface) { "public" } else { "private" };
+    let mut s = NewSymbol::new(SymbolKind::Field, &name, ctx.child_qname(&name), line_of(node), end_line_of(node));
+    s.signature = format!("event {} {name} {{ add; remove; }}", ty.clone().unwrap_or_default());
+    s.type_ref = ty;
+    s.visibility = visibility(&mods, default_vis);
+    s.is_static = mods.iter().any(|m| m == "static");
+    s.attrs = attrs;
+    s.modifiers = kept_modifiers(&mods);
+    s.body_hash = token_hash(node, ctx.src);
+    let id = ctx.add_symbol(s);
+    ctx.push_scope(Scope {
+        symbol_id: id,
+        kind: Some(SymbolKind::Field),
+        qname: ctx.child_qname(&name),
+        is_function: true,
+        ..Default::default()
+    });
+    ctx.declare_local("value", None);
+    if let Some(acc) = node.child_by_field_name("accessors") {
+        walk_accessors(ctx, acc);
+    }
+    ctx.pop_scope();
+}
+
+/// `public delegate void Handler(int x);` is a type.
+fn visit_delegate(ctx: &mut Ctx, node: Node, default_vis: &str) {
+    let Some(n) = node.child_by_field_name("name") else { return };
+    let name = ctx.text(n).to_string();
+    let (mods, attrs) = mods_attrs(ctx, node);
+    let (params, ptext, _) = parse_params(ctx, node.child_by_field_name("parameters"));
+    let ret = node.child_by_field_name("type").map(|t| ctx.text(t).to_string()).unwrap_or_default();
+    let mut s = NewSymbol::new(SymbolKind::TypeAlias, &name, ctx.child_qname(&name), line_of(node), end_line_of(node));
+    s.signature = format!("delegate {ret} {name}({ptext})");
+    s.visibility = visibility(&mods, default_vis);
+    s.is_exported = s.visibility == "public" || s.visibility == "internal";
+    s.type_ref = Some(ret);
+    s.params = Some(params);
+    s.attrs = attrs;
+    s.body_hash = token_hash(node, ctx.src);
+    ctx.add_symbol(s);
+}
+
+fn walk_accessors(ctx: &mut Ctx, accessors: Node) {
+    for acc in named_children(accessors) {
+        for body in named_children(acc) {
+            if matches!(body.kind(), "block" | "arrow_expression_clause") {
+                walk(ctx, body);
+            }
+        }
+    }
+}
+
+/// Target-typed `new(…)` whose type comes from the declaration (`Foo f = new(1);`).
+fn implicit_new(ctx: &mut Ctx, node: Node, ty: &str) {
+    let args = named_children(node).into_iter().find(|c| c.kind() == "argument_list");
+    let argc = args.map(count_args).or(Some(0));
+    ctx.push_ref(RefKind::New, &clean_type(ty), None, None, argc, line_of(node), None);
+    if let Some(a) = args {
+        walk(ctx, a);
+    }
+    if let Some(init) = named_children(node).into_iter().find(|c| c.kind() == "initializer_expression") {
+        initializer(ctx, init, ty);
     }
 }
 
@@ -522,6 +811,7 @@ fn visit_property(ctx: &mut Ctx, node: Node, cls: &ClassInfo) {
     s.is_static = mods.iter().any(|m| m == "static");
     s.is_abstract = mods.iter().any(|m| m == "abstract");
     s.attrs = attrs;
+    s.modifiers = kept_modifiers(&mods);
     s.docstring = doc_comment(node, ctx.src);
     s.body_hash = token_hash(node, ctx.src);
     s.complexity = cyclomatic(node, ctx.src, ctx.lang);
@@ -535,6 +825,7 @@ fn visit_property(ctx: &mut Ctx, node: Node, cls: &ClassInfo) {
         is_function: true,
         ..Default::default()
     });
+    ctx.declare_local("value", None);
     record_attr_literals(ctx, node);
     for ch in named_children(node) {
         match ch.kind() {
@@ -626,30 +917,90 @@ fn parse_params(ctx: &Ctx, node: Option<Node>) -> (ParamInfo, String, Vec<(Strin
 }
 
 fn visit_callable(ctx: &mut Ctx, node: Node, kind: SymbolKind, cls: &ClassInfo) {
-    let name = node.child_by_field_name("name").map(|n| ctx.text(n).to_string()).unwrap_or_else(|| cls.name.clone());
+    visit_callable_as(ctx, node, kind, cls, None)
+}
+
+/// Methods, constructors, operators, conversions, indexers and finalizers.
+fn visit_callable_as(ctx: &mut Ctx, node: Node, kind: SymbolKind, cls: &ClassInfo, name_override: Option<String>) {
+    let name =
+        name_override.or_else(|| node.child_by_field_name("name").map(|n| ctx.text(n).to_string())).unwrap_or_else(|| cls.name.clone());
     let (mods, attrs) = mods_attrs(ctx, node);
+    let (tparams, tparam_map) = type_params(ctx, node);
     let (params, ptext, locals) = parse_params(ctx, node.child_by_field_name("parameters"));
     let ret = node.child_by_field_name("returns").or_else(|| node.child_by_field_name("type")).map(|t| ctx.text(t).to_string());
-    let tparams = node.child_by_field_name("type_parameters").map(|t| ctx.text(t).to_string()).unwrap_or_default();
     let body = node.child_by_field_name("body");
-    let arrow = named_children(node).into_iter().find(|c| c.kind() == "arrow_expression_clause");
-    let mut s = NewSymbol::new(kind, &name, ctx.child_qname(&name), line_of(node), end_line_of(node));
+    let arrow = named_children(node).into_iter().find(|c| c.kind() == "arrow_expression_clause" && Some(*c) != body);
+    // `void IRepo.Save()`: explicit interface implementation.
+    let explicit = named_children(node)
+        .into_iter()
+        .find(|c| c.kind() == "explicit_interface_specifier")
+        .map(|e| ctx.text(e).trim().trim_end_matches('.').trim().to_string());
+    let qname = match &explicit {
+        Some(i) => ctx.child_qname(&format!("{i}.{name}")),
+        None => ctx.child_qname(&name),
+    };
+    let mut s = NewSymbol::new(kind, &name, qname.clone(), line_of(node), end_line_of(node));
     s.signature = match &ret {
         Some(r) => format!("{name}{tparams}({ptext}): {r}"),
         None => format!("{name}{tparams}({ptext})"),
     };
     let is_interface = cls.kind == Some(SymbolKind::Interface);
-    s.visibility = visibility(&mods, if is_interface { "public" } else { "private" });
+    s.visibility = visibility(&mods, if is_interface || explicit.is_some() { "public" } else { "private" });
     s.is_static = mods.iter().any(|m| m == "static");
     s.is_async = mods.iter().any(|m| m == "async");
-    s.is_abstract = mods.iter().any(|m| m == "abstract") || (body.is_none() && arrow.is_none());
+    // Interface members without a body are abstract; `extern` / `partial` declarations are not.
+    let bodyless = body.is_none() && arrow.is_none() && node.child_by_field_name("accessors").is_none();
+    s.is_abstract = mods.iter().any(|m| m == "abstract") || (bodyless && is_interface);
     s.is_exported = s.visibility == "public";
+    s.modifiers = kept_modifiers(&mods);
+    if let Some(i) = &explicit {
+        s.modifiers.push(format!("explicit:{}", clean_type(i)));
+    }
+    if let Some(t) = this_param_type(ctx, node.child_by_field_name("parameters")) {
+        s.modifiers.push(format!("extension:{}", clean_type(&t)));
+    }
     s.type_ref = ret.clone();
     s.params = Some(params);
     s.docstring = doc_comment(node, ctx.src);
     s.complexity = cyclomatic(node, ctx.src, ctx.lang);
     s.body_hash = token_hash(node, ctx.src);
-    s.is_test = attrs.iter().any(|a| matches!(attr_name(a), "Fact" | "Theory" | "Test" | "TestMethod" | "TestCase" | "DataTestMethod"));
+    s.is_test = attrs.iter().any(|a| {
+        matches!(
+            attr_name(a),
+            "Fact"
+                | "Theory"
+                | "Test"
+                | "TestMethod"
+                | "TestCase"
+                | "TestCaseSource"
+                | "DataTestMethod"
+                | "SkippableFact"
+                | "SkippableTheory"
+                | "UnityTest"
+        )
+    });
+    // Framework-invoked fixture hooks.
+    if let Some(h) = attrs.iter().map(|a| attr_name(a)).find(|a| {
+        matches!(
+            *a,
+            "SetUp"
+                | "TearDown"
+                | "OneTimeSetUp"
+                | "OneTimeTearDown"
+                | "TestInitialize"
+                | "TestCleanup"
+                | "ClassInitialize"
+                | "ClassCleanup"
+                | "AssemblyInitialize"
+                | "AssemblyCleanup"
+                | "UnitySetUp"
+                | "UnityTearDown"
+                | "GlobalSetup"
+        )
+    }) {
+        s.is_entrypoint = true;
+        s.entry_kind = Some(format!("test hook [{h}]"));
+    }
 
     // Routing / entrypoints.
     let mut http_method: Option<String> = None;
@@ -709,10 +1060,13 @@ fn visit_callable(ctx: &mut Ctx, node: Node, kind: SymbolKind, cls: &ClassInfo) 
         ctx.facts.global_handlers.push(GlobalHandler { handler: id.clone(), exception: "*".into(), framework: "aspnet".into(), line });
     }
 
-    let mut scope = Scope { symbol_id: id, kind: Some(kind), qname: ctx.child_qname(&name), is_function: true, ..Default::default() };
+    let mut scope = Scope { symbol_id: id, kind: Some(kind), qname, is_function: true, ..Default::default() };
     for (n, t) in locals {
+        let t = subst(&tparam_map, t);
+        let t = ctx.subst_tparam(t);
         scope.locals.insert(n, t);
     }
+    scope.tparams = tparam_map;
     ctx.push_scope(scope);
     record_attr_literals(ctx, node);
     // Parameter attributes like [FromBody] do not matter; default values may hold literals.
@@ -727,6 +1081,21 @@ fn visit_callable(ctx: &mut Ctx, node: Node, kind: SymbolKind, cls: &ClassInfo) 
     }
     for ch in named_children(node) {
         if ch.kind() == "constructor_initializer" {
+            // `: this(…)` / `: base(…)` chains to another constructor.
+            let mut c = ch.walk();
+            let kw = ch.children(&mut c).find(|k| matches!(k.kind(), "this" | "base")).map(|k| k.kind());
+            let args = named_children(ch).into_iter().find(|a| a.kind() == "argument_list");
+            let argc = args.map(count_args).or(Some(0));
+            match kw {
+                Some("this") => ctx.push_ref(RefKind::Call, &cls.name, None, None, argc, line_of(ch), None),
+                Some("base") => {
+                    if let Some(b) = cls.bases.first() {
+                        let b = clean_type(b);
+                        ctx.push_ref(RefKind::Call, &b, Some("base".into()), None, argc, line_of(ch), None);
+                    }
+                }
+                _ => {}
+            }
             walk(ctx, ch);
         }
     }
@@ -736,7 +1105,23 @@ fn visit_callable(ctx: &mut Ctx, node: Node, kind: SymbolKind, cls: &ClassInfo) 
     if let Some(a) = arrow {
         walk(ctx, a);
     }
+    if let Some(acc) = node.child_by_field_name("accessors") {
+        ctx.declare_local("value", None);
+        walk_accessors(ctx, acc);
+    }
     ctx.pop_scope();
+}
+
+/// Type of the `this` parameter of an extension method.
+fn this_param_type(ctx: &Ctx, params: Option<Node>) -> Option<String> {
+    let first = named_children(params?).into_iter().find(|p| p.kind() == "parameter")?;
+    let mut c = first.walk();
+    let is_this = first.children(&mut c).any(|ch| ch.kind() == "this" || (ch.kind() == "modifier" && ctx.text(ch).trim() == "this"))
+        || ctx.text(first).trim_start().starts_with("this ");
+    if !is_this {
+        return None;
+    }
+    first.child_by_field_name("type").map(|t| ctx.text(t).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -746,23 +1131,7 @@ fn visit_callable(ctx: &mut Ctx, node: Node, kind: SymbolKind, cls: &ClassInfo) 
 fn walk(ctx: &mut Ctx, node: Node) {
     match node.kind() {
         "variable_declaration" => local_decl(ctx, node),
-        "local_function_statement" => {
-            if let Some(n) = node.child_by_field_name("name") {
-                let name = ctx.text(n).to_string();
-                ctx.declare_local(&name, None);
-            }
-            if let Some(p) = node.child_by_field_name("parameters") {
-                let (_, _, locals) = parse_params(ctx, Some(p));
-                for (n, t) in locals {
-                    ctx.declare_local(&n, t);
-                }
-            }
-            for ch in named_children(node) {
-                if matches!(ch.kind(), "block" | "arrow_expression_clause") {
-                    walk(ctx, ch);
-                }
-            }
-        }
+        "local_function_statement" => local_function(ctx, node),
         "invocation_expression" => call(ctx, node),
         "object_creation_expression" => new_expr(ctx, node),
         "throw_statement" | "throw_expression" => throw(ctx, node),
@@ -800,7 +1169,13 @@ fn walk(ctx: &mut Ctx, node: Node) {
                     let cls = ctx.class_name();
                     ctx.push_ref(RefKind::Read, &n, Some("this".into()), cls, None, line_of(node), None);
                 }
-                (Some(e), _) => walk(ctx, e),
+                (Some(e), Some(n)) => {
+                    // `order.Total`, `Color.Red`, `Config.MaxItems`: a member read on a receiver.
+                    let (rtext, rtype) = receiver_info(ctx, e);
+                    ctx.push_ref(RefKind::Read, &n, Some(rtext), rtype, None, line_of(node), None);
+                    walk(ctx, e);
+                }
+                (Some(e), None) => walk(ctx, e),
                 _ => {}
             }
         }
@@ -810,21 +1185,25 @@ fn walk(ctx: &mut Ctx, node: Node) {
             walk_children(ctx, node);
         }
         "lambda_expression" | "anonymous_method_expression" => {
+            // `orders.Where(o => …)`: the single parameter is an element of the receiver.
+            let hint = ctx.lambda_hint.take();
             if let Some(p) = node.child_by_field_name("parameters") {
                 if p.kind() == "parameter_list" {
                     let (_, _, locals) = parse_params(ctx, Some(p));
+                    let single = locals.len() == 1;
                     for (n, t) in locals {
+                        let t = t.or_else(|| if single { hint.clone() } else { None });
                         ctx.declare_local(&n, t);
                     }
                 } else {
                     let n = ctx.text(p).to_string();
-                    ctx.declare_local(&n, None);
+                    ctx.declare_local(&n, hint.clone());
                 }
             }
             for ch in named_children(node) {
                 if ch.kind() == "implicit_parameter" || ch.kind() == "identifier" && Some(ch) != node.child_by_field_name("body") {
                     let n = ctx.text(ch).to_string();
-                    ctx.declare_local(&n, None);
+                    ctx.declare_local(&n, hint.clone());
                 }
             }
             if let Some(b) = node.child_by_field_name("body") {
@@ -833,10 +1212,19 @@ fn walk(ctx: &mut Ctx, node: Node) {
         }
         "foreach_statement" => {
             if let Some(l) = node.child_by_field_name("left") {
-                let ty = node.child_by_field_name("type").map(|t| ctx.text(t).to_string()).filter(|t| t != "var");
+                let declared = node.child_by_field_name("type").map(|t| ctx.text(t).to_string()).filter(|t| t != "var");
+                // `foreach (var o in orders)`: the element type of the collection.
+                let ty = declared.or_else(|| {
+                    let r = node.child_by_field_name("right")?;
+                    let (_, coll) = receiver_info(ctx, r);
+                    element_type(&coll?)
+                });
+                let ty = ctx.subst_tparam(ty);
                 if l.kind() == "identifier" {
                     let n = ctx.text(l).to_string();
                     ctx.declare_local(&n, ty);
+                } else {
+                    declare_pattern(ctx, l);
                 }
             }
             if let Some(r) = node.child_by_field_name("right") {
@@ -859,6 +1247,16 @@ fn walk(ctx: &mut Ctx, node: Node) {
                 ctx.declare_local(&name, node.child_by_field_name("type").map(|t| ctx.text(t).to_string()));
             }
         }
+        // `o is Order { Paid: true } p`: `p` is an Order; property sub-patterns are not reads.
+        "recursive_pattern" => {
+            let ty = node.child_by_field_name("type").map(|t| ctx.text(t).to_string());
+            if let Some(n) = named_children(node).into_iter().rev().find(|c| c.kind() == "identifier") {
+                let name = ctx.text(n).to_string();
+                ctx.declare_local(&name, ty);
+            }
+        }
+        "typeof_expression" => collect_typeofs(ctx, node),
+        "implicit_object_creation_expression" => walk_children(ctx, node),
         "string_literal" | "verbatim_string_literal" | "raw_string_literal" => {
             let v = string_value(node, ctx.src);
             ctx.push_literal(&v, "string", node);
@@ -877,7 +1275,6 @@ fn walk(ctx: &mut Ctx, node: Node) {
         | "predefined_type"
         | "qualified_name"
         | "generic_name"
-        | "typeof_expression"
         | "parameter_list"
         | "comment"
         | "class_declaration"
@@ -933,27 +1330,119 @@ fn read_ident(ctx: &mut Ctx, node: Node) {
     }
 }
 
+/// Static type of an expression when it can be told from syntax; member accesses and calls
+/// produce a deferred marker (see `member_type_marker`) resolved against declarations later.
 fn infer_expr_type(ctx: &Ctx, value: Node) -> Option<String> {
+    infer_type(ctx, value, false)
+}
+
+fn infer_type(ctx: &Ctx, value: Node, awaited: bool) -> Option<String> {
     match value.kind() {
         "object_creation_expression" => value.child_by_field_name("type").map(|t| ctx.text(t).to_string()),
         "cast_expression" => value.child_by_field_name("type").map(|t| ctx.text(t).to_string()),
-        "await_expression" => value.named_child(0).and_then(|v| infer_expr_type(ctx, v)),
+        "as_expression" => value.child_by_field_name("right").map(|t| ctx.text(t).to_string()),
+        "parenthesized_expression" => value.named_child(0).and_then(|v| infer_type(ctx, v, awaited)),
+        "await_expression" => value.named_child(0).and_then(|v| infer_type(ctx, v, true)),
+        "this" => ctx.class_name(),
+        "identifier" => {
+            let n = ctx.text(value);
+            ctx.var_type(n).or_else(|| (n.chars().next().is_some_and(|c| c.is_ascii_uppercase())).then(|| n.to_string()))
+        }
+        "element_access_expression" => {
+            let (_, coll) = receiver_info(ctx, value.child_by_field_name("expression")?);
+            element_type(&coll?)
+        }
         "invocation_expression" => {
-            // GetRequiredService<T>() / GetService<T>()
             let f = value.child_by_field_name("function")?;
-            let t = ctx.text(f);
-            if t.contains("GetRequiredService<") || t.contains("GetService<") {
-                generic_args(t).into_iter().next()
-            } else {
-                None
+            let (name, recv, generic) = call_parts(ctx, f);
+            // `GetComponent<T>()`, `GetService<T>()`, `Resources.Load<T>()`.
+            if let Some(g) = generic.as_deref().map(generic_args).and_then(|a| (a.len() == 1).then(|| a[0].clone())) {
+                if GENERIC_FACTORIES.contains(&name.as_str()) {
+                    return Some(g);
+                }
+                if GENERIC_ARRAY_FACTORIES.contains(&name.as_str()) {
+                    return Some(format!("{g}[]"));
+                }
             }
+            let owner = match recv {
+                None => Some(String::new()),
+                Some(r) => infer_type(ctx, r, false),
+            }?;
+            Some(member_type_marker(Some(&owner), &name, awaited))
+        }
+        "member_access_expression" => {
+            let name = value.child_by_field_name("name").map(|n| ctx.text(n).to_string())?;
+            let owner = infer_type(ctx, value.child_by_field_name("expression")?, false)?;
+            Some(member_type_marker(Some(&owner), &name, awaited))
         }
         _ => None,
     }
 }
 
+/// (method name, receiver node, generic arguments text) of a call's `function` node.
+fn call_parts<'t>(ctx: &Ctx, func: Node<'t>) -> (String, Option<Node<'t>>, Option<String>) {
+    let generic = |n: Node| -> (String, Option<String>) {
+        if n.kind() == "generic_name" {
+            let id = named_children(n).into_iter().find(|c| c.kind() == "identifier");
+            let ta = named_children(n).into_iter().find(|c| c.kind() == "type_argument_list");
+            (id.map(|i| ctx.text(i).to_string()).unwrap_or_default(), ta.map(|t| ctx.text(t).to_string()))
+        } else {
+            (ctx.text(n).to_string(), None)
+        }
+    };
+    match func.kind() {
+        "identifier" | "generic_name" => {
+            let (n, g) = generic(func);
+            (n, None, g)
+        }
+        "member_access_expression" => {
+            let (n, g) = func.child_by_field_name("name").map(generic).unwrap_or_default();
+            (n, func.child_by_field_name("expression"), g)
+        }
+        "conditional_access_expression" => {
+            let binding = named_children(func).into_iter().find(|c| c.kind() == "member_binding_expression");
+            let (n, g) = binding.and_then(|b| b.child_by_field_name("name")).map(generic).unwrap_or_default();
+            (n, func.child_by_field_name("condition"), g)
+        }
+        _ => (last_segment(ctx.text(func)).to_string(), None, None),
+    }
+}
+
+/// `int Local(int a) => a;` is a function nested in its method.
+fn local_function(ctx: &mut Ctx, node: Node) {
+    let Some(n) = node.child_by_field_name("name") else { return };
+    let name = ctx.text(n).to_string();
+    let (tparams, tparam_map) = type_params(ctx, node);
+    let (params, ptext, locals) = parse_params(ctx, node.child_by_field_name("parameters"));
+    let ret = node.child_by_field_name("type").map(|t| ctx.text(t).to_string());
+    let mut s = NewSymbol::new(SymbolKind::Function, &name, ctx.child_qname(&name), line_of(node), end_line_of(node));
+    s.signature = match &ret {
+        Some(r) => format!("{name}{tparams}({ptext}): {r}"),
+        None => format!("{name}{tparams}({ptext})"),
+    };
+    s.visibility = "private".into();
+    s.type_ref = ret;
+    s.params = Some(params);
+    s.complexity = cyclomatic(node, ctx.src, ctx.lang);
+    s.body_hash = token_hash(node, ctx.src);
+    let id = ctx.add_symbol(s);
+    let mut scope =
+        Scope { symbol_id: id, kind: Some(SymbolKind::Function), qname: ctx.child_qname(&name), is_function: true, ..Default::default() };
+    for (n, t) in locals {
+        scope.locals.insert(n, subst(&tparam_map, t));
+    }
+    scope.tparams = tparam_map;
+    ctx.push_scope(scope);
+    for ch in named_children(node) {
+        if matches!(ch.kind(), "block" | "arrow_expression_clause") {
+            walk(ctx, ch);
+        }
+    }
+    ctx.pop_scope();
+}
+
 fn local_decl(ctx: &mut Ctx, vd: Node) {
-    let ty = vd.child_by_field_name("type").map(|t| ctx.text(t).to_string()).filter(|t| t != "var");
+    let ty = ctx.subst_tparam(vd.child_by_field_name("type").map(|t| ctx.text(t).to_string()).filter(|t| t != "var"));
     for d in named_children(vd) {
         if d.kind() != "variable_declarator" {
             continue;
@@ -972,6 +1461,12 @@ fn local_decl(ctx: &mut Ctx, vd: Node) {
         let value = declarator_value(d);
         let inferred = ty.clone().or_else(|| value.and_then(|v| infer_expr_type(ctx, v)));
         ctx.declare_local(&name, inferred);
+        if let (Some(v), Some(t)) = (value, &ty) {
+            if v.kind() == "implicit_object_creation_expression" {
+                implicit_new(ctx, v, t);
+                continue;
+            }
+        }
         if let Some(v) = value {
             // `var g = app.MapGroup("/api/orders")`
             if v.kind() == "invocation_expression" {
@@ -1029,7 +1524,8 @@ fn receiver_info(ctx: &Ctx, r: Node) -> (String, Option<String>) {
             }
         }
         "object_creation_expression" => r.child_by_field_name("type").map(|t| ctx.text(t).to_string()),
-        _ => None,
+        // Calls, awaits, element accesses, casts: typed from syntax or a deferred member type.
+        _ => infer_expr_type(ctx, r),
     };
     let ty = if text == "this" { ctx.class_name() } else { ty };
     (text, ty)
@@ -1045,6 +1541,13 @@ fn call(ctx: &mut Ctx, node: Node) {
     let line = line_of(node);
     // `nameof(X)` is a compile-time string, not a call nor a use of X as a value.
     if func.kind() == "identifier" && ctx.text(func) == "nameof" {
+        return;
+    }
+    // Invoking a local delegate (`Action cb = …; cb();`) is not a call to a declared symbol.
+    if func.kind() == "identifier" && ctx.is_local(ctx.text(func)) {
+        if let Some(a) = args {
+            walk(ctx, a);
+        }
         return;
     }
     let (name, recv_node, generic): (String, Option<Node>, Option<String>) = match func.kind() {
@@ -1094,6 +1597,17 @@ fn call(ctx: &mut Ctx, node: Node) {
 
     let mut skip_args: Vec<Node> = Vec::new();
     special_call(ctx, &name, receiver.as_deref(), rtype.as_deref(), generic.as_deref(), args, line, &mut skip_args);
+    // `GetComponent<Foo>()`, `AddComponent<Foo>()`: the type argument is a used type.
+    if let Some(g) = generic.as_deref() {
+        if GENERIC_FACTORIES.contains(&name.as_str()) || GENERIC_ARRAY_FACTORIES.contains(&name.as_str()) {
+            for a in generic_args(g) {
+                let t = clean_type(&a);
+                ctx.push_ref(RefKind::TypeUse, &t, None, None, None, line, Some(format!("{name}<{t}>")));
+            }
+        }
+    }
+    // `orders.Where(o => o.Paid)`: lambda parameters are elements of the receiver.
+    let hint = if ELEMENT_LAMBDA_METHODS.contains(&name.as_str()) { rtype.as_deref().and_then(element_type) } else { None };
 
     ctx.push_ref(RefKind::Call, &name, receiver.clone(), rtype, argc, line, generic.map(|g| collapse_ws(&g)));
     if let Some(r) = recv_node {
@@ -1104,7 +1618,9 @@ fn call(ctx: &mut Ctx, node: Node) {
             if skip_args.contains(&arg) {
                 continue;
             }
+            ctx.lambda_hint = hint.clone();
             walk(ctx, arg);
+            ctx.lambda_hint = None;
         }
     }
 }

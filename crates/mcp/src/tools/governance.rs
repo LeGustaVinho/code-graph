@@ -36,8 +36,10 @@ pub fn get_complexity_hotspots(ctx: &Ctx, p: HotspotParams) -> ToolResult {
         NODE_COLS.split(", ").map(|c| format!("n.{c}")).collect::<Vec<_>>().join(", ")
     );
     let mut st = ctx.conn.prepare(&sql)?;
-    let mut rows: Vec<(Node, i64)> =
-        st.query_map(params![min, p.module], |r| Ok((node_from_row(r)?, r.get::<_, i64>(28)?)))?.flatten().collect();
+    let mut rows: Vec<(Node, i64)> = st
+        .query_map(params![min, p.module], |r| Ok((node_from_row(r)?, r.get::<_, i64>(codegraph_graph::store::NODE_COLS_LEN)?)))?
+        .flatten()
+        .collect();
     let risk = |n: &Node, fan_in: i64| n.sym.complexity as f64 * (1.0 + (1.0 + fan_in as f64).ln());
     rows.sort_by(|a, b| {
         b.0.sym

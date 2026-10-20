@@ -5,7 +5,7 @@
 
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 const TABLES: &[&str] = &[
     "file_meta",
@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS node (
     params                TEXT,
     body_hash             TEXT,
     namespace             TEXT,
+    modifiers             TEXT,
     derived               INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS node_file   ON node(file_path);

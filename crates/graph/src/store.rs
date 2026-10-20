@@ -33,7 +33,10 @@ impl Node {
 
 pub const NODE_COLS: &str = "id, file_path, kind, name, qualified_name, signature, start_line, end_line, language, capabilities, \
     cyclomatic_complexity, is_entrypoint, entry_kind, is_test, parent_id, visibility, is_exported, is_static, is_async, \
-    is_abstract, docstring, attrs, bases, type_ref, value_text, params, body_hash, namespace";
+    is_abstract, docstring, attrs, bases, type_ref, value_text, params, body_hash, namespace, modifiers";
+
+/// Number of columns in [`NODE_COLS`]: extra columns selected after them start at this index.
+pub const NODE_COLS_LEN: usize = 29;
 
 fn json_vec(s: Option<String>) -> Vec<String> {
     s.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
@@ -70,6 +73,7 @@ pub fn node_from_row(r: &Row) -> rusqlite::Result<Node> {
         params,
         body_hash: r.get::<_, Option<String>>(26)?.unwrap_or_default(),
         namespace: r.get(27)?,
+        modifiers: json_vec(r.get(28)?),
     };
     Ok(Node { file_path: r.get(1)?, language: r.get::<_, Option<String>>(8)?.unwrap_or_default(), sym })
 }
@@ -129,9 +133,10 @@ pub fn insert_node(tx: &Transaction, file: &str, lang: &str, s: &Symbol, derived
     let mut stmt = tx.prepare_cached(
         "INSERT OR REPLACE INTO node (id, file_path, kind, orig_kind, name, qualified_name, signature, start_line, end_line, language, \
          capabilities, cyclomatic_complexity, is_entrypoint, entry_kind, is_test, parent_id, visibility, is_exported, is_static, \
-         is_async, is_abstract, docstring, attrs, bases, type_ref, value_text, params, body_hash, namespace, derived, rid) \
-         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+         is_async, is_abstract, docstring, attrs, bases, type_ref, value_text, params, body_hash, namespace, derived, rid, modifiers) \
+         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
     )?;
+    let modifiers = if s.modifiers.is_empty() { None } else { serde_json::to_string(&s.modifiers).ok() };
     let caps = serde_json::to_string(&s.capabilities.iter().collect::<Vec<_>>()).unwrap_or_default();
     let attrs = if s.attrs.is_empty() { None } else { serde_json::to_string(&s.attrs).ok() };
     let bases = if s.bases.is_empty() { None } else { serde_json::to_string(&s.bases).ok() };
@@ -167,6 +172,7 @@ pub fn insert_node(tx: &Transaction, file: &str, lang: &str, s: &Symbol, derived
         s.namespace,
         derived,
         rid,
+        modifiers,
     ])?;
     Ok(())
 }
