@@ -43,7 +43,8 @@ pub struct SymbolIndex {
     /// JS/TS file path without extension → file.
     pub js_paths: HashMap<String, String>,
     pub imports: HashMap<String, Vec<Import>>,
-    pub file_namespace: HashMap<String, String>,
+    /// Every namespace declared in a file (a file may hold several namespace blocks).
+    pub file_namespace: HashMap<String, Vec<String>>,
     /// type id → resolved base type ids (with confidence).
     pub bases: HashMap<String, Vec<(String, Confidence)>>,
     /// type id → subtypes / implementations.
@@ -132,7 +133,10 @@ impl SymbolIndex {
                 idx.children.entry(p.clone()).or_default().push(i);
             }
             if let Some(ns) = &s.sym.namespace {
-                idx.file_namespace.entry(s.file.clone()).or_insert_with(|| ns.clone());
+                let list = idx.file_namespace.entry(s.file.clone()).or_default();
+                if !list.contains(ns) {
+                    list.push(ns.clone());
+                }
             }
         }
         for (file, reg) in di {
@@ -459,11 +463,13 @@ impl SymbolIndex {
         }
         if family == "dotnet" {
             let mut visible_ns: Vec<String> = Vec::new();
-            if let Some(ns) = self.file_namespace.get(from_file) {
+            for ns in self.file_namespace.get(from_file).map(|v| v.as_slice()).unwrap_or(&[]) {
                 // A namespace sees its own types and its parents'.
                 let mut cur = ns.as_str();
                 loop {
-                    visible_ns.push(cur.to_string());
+                    if !visible_ns.iter().any(|v| v == cur) {
+                        visible_ns.push(cur.to_string());
+                    }
                     match cur.rfind('.') {
                         Some(i) => cur = &cur[..i],
                         None => break,

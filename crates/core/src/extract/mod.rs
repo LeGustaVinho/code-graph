@@ -626,12 +626,17 @@ pub fn module_qname_for(path: &str, lang: Language) -> String {
 pub fn is_test_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
+    // C# test classes are `FooTests.cs` / `FooTest.cs`: the capital T marks a word boundary,
+    // so `Latest.cs` or `Contest.cs` are not tests.
+    let orig_name = path.rsplit('/').next().unwrap_or(path);
+    let cs_test =
+        orig_name.ends_with("Tests.cs") || orig_name.ends_with("Test.cs") || name.ends_with("_tests.cs") || name.ends_with("_test.cs");
     name.contains(".test.")
         || name.contains(".spec.")
+        || name.contains("-spec.")
         || name.starts_with("test_")
         || name.ends_with("_test.py")
-        || name.ends_with("tests.cs")
-        || name.ends_with("test.cs")
+        || cs_test
         || lower.contains("/__tests__/")
         || lower.starts_with("__tests__/")
         || lower.contains(".tests/")

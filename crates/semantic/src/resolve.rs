@@ -110,9 +110,9 @@ const MAX_AMBIGUOUS: usize = 12;
 
 /// Language keyword / primitive types that can appear as static call receivers.
 const BUILTIN_TYPES: &[&str] = &[
-    "string", "int", "long", "short", "byte", "sbyte", "uint", "ulong", "ushort", "float", "double", "decimal", "bool", "char",
-    "object", "nint", "nuint", "dynamic", "Math", "Mathf", "String", "Int32", "Int64", "Boolean", "Double", "Single", "Object",
-    "Array", "Number", "JSON", "Promise", "console", "str", "dict", "list", "len",
+    "string", "int", "long", "short", "byte", "sbyte", "uint", "ulong", "ushort", "float", "double", "decimal", "bool", "char", "object",
+    "nint", "nuint", "dynamic", "Math", "Mathf", "String", "Int32", "Int64", "Boolean", "Double", "Single", "Object", "Array", "Number",
+    "JSON", "Promise", "console", "str", "dict", "list", "len",
 ];
 
 enum Chain {
@@ -310,11 +310,17 @@ impl<'a> FileResolver<'a> {
         let mut target = t;
         let mut evidence = evidence;
         if self.index.syms[t].sym.kind.is_type() {
+            // Static constructors (type initialisers) are never the target of `new`.
             let ctors: Vec<usize> = self
                 .index
                 .children
                 .get(&self.index.syms[t].sym.id)
-                .map(|kids| kids.iter().copied().filter(|k| self.index.syms[*k].sym.kind == SymbolKind::Constructor).collect())
+                .map(|kids| {
+                    kids.iter()
+                        .copied()
+                        .filter(|k| self.index.syms[*k].sym.kind == SymbolKind::Constructor && !self.index.syms[*k].sym.is_static)
+                        .collect()
+                })
                 .unwrap_or_default();
             let ctor = ctors
                 .iter()
@@ -414,13 +420,23 @@ impl<'a> FileResolver<'a> {
                 let sym = format!("{tname}.{method}");
                 // Production code never dispatches to test doubles: if exactly one candidate is
                 // a real implementation, link it (inferred) and name the excluded doubles.
-                let caller_is_test = self.index.get(&r.enclosing).map(|s| s.sym.is_test || codegraph_core::extract::is_test_path(&s.file)).unwrap_or(false);
+                let caller_is_test =
+                    self.index.get(&r.enclosing).map(|s| s.sym.is_test || codegraph_core::extract::is_test_path(&s.file)).unwrap_or(false);
                 if !caller_is_test {
                     let (doubles, real): (Vec<usize>, Vec<usize>) = targets.iter().partition(|t| self.is_test_double(**t));
                     if real.len() == 1 && !doubles.is_empty() {
-                        let owner = |i: usize| self.index.get(self.index.syms[i].sym.parent_id.as_deref().unwrap_or("")).map(|p| p.sym.name.clone()).unwrap_or_default();
+                        let owner = |i: usize| {
+                            self.index
+                                .get(self.index.syms[i].sym.parent_id.as_deref().unwrap_or(""))
+                                .map(|p| p.sym.name.clone())
+                                .unwrap_or_default()
+                        };
                         let excluded: Vec<String> = doubles.iter().map(|d| owner(*d)).collect();
-                        let ev = format!("single production implementation {} of {tname} (test doubles excluded: {})", owner(real[0]), excluded.join(", "));
+                        let ev = format!(
+                            "single production implementation {} of {tname} (test doubles excluded: {})",
+                            owner(real[0]),
+                            excluded.join(", ")
+                        );
                         self.emit_call(r, real[0], Confidence::Inferred, ev, "dispatch-resolver");
                         return;
                     }
@@ -523,7 +539,10 @@ impl<'a> FileResolver<'a> {
                     return;
                 }
                 // Members inherited from an external base (`gameObject.SetActive`, `transform.position`).
-                if r.receiver_type.is_none() && r.root_type.is_none() && head.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false) {
+                if r.receiver_type.is_none()
+                    && r.root_type.is_none()
+                    && head.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false)
+                {
                     if let Some(t) = self.enclosing_type(&r.enclosing) {
                         if self.index.members_named(t, head).is_empty()
                             && self.has_external_base(t)
@@ -616,8 +635,17 @@ impl<'a> FileResolver<'a> {
             _ => None,
         };
         let Some(m) = target else { return false };
-        let e = Edge::new(&r.enclosing, self.file, Some(self.target(m)), relation::CALLS, Confidence::Exact, format!("method reference {} passed as delegate/callback", r.name), "call-resolver", r.line)
-            .with_meta(json!({ "delegate": true }));
+        let e = Edge::new(
+            &r.enclosing,
+            self.file,
+            Some(self.target(m)),
+            relation::CALLS,
+            Confidence::Exact,
+            format!("method reference {} passed as delegate/callback", r.name),
+            "call-resolver",
+            r.line,
+        )
+        .with_meta(json!({ "delegate": true }));
         self.push(e);
         true
     }

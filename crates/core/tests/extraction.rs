@@ -166,3 +166,9 @@ fn malformed_sources_do_not_panic() {
         assert_eq!(f.symbols[0].kind, SymbolKind::Module);
     }
 }
+
+#[test]
+fn csharp_expression_bodied_property_is_walked_once() {
+    let f = extract_file("P.cs", Language::CSharp, "class P { string T => \"edge-title\"; }");
+    assert_eq!(f.literals.iter().filter(|l| l.value == "edge-title").count(), 1, "{:?}", f.literals);
+}

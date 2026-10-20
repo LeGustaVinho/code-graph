@@ -155,7 +155,10 @@ fn visit_container(ctx: &mut Ctx, node: Node) {
         match ch.kind() {
             "using_directive" => using(ctx, ch),
             "namespace_declaration" | "file_scoped_namespace_declaration" => {
-                let name = ch.child_by_field_name("name").map(|n| ctx.text(n).to_string()).unwrap_or_default();
+                let short = ch.child_by_field_name("name").map(|n| ctx.text(n).to_string()).unwrap_or_default();
+                // `namespace A { namespace B { … } }` declares `A.B`.
+                let parent = ctx.scopes[0].qname.clone();
+                let name = if parent.is_empty() { short } else { format!("{parent}.{short}") };
                 if ctx.facts.namespace.is_none() {
                     ctx.facts.namespace = Some(name.clone());
                 }
@@ -170,12 +173,9 @@ fn visit_container(ctx: &mut Ctx, node: Node) {
                     ctx.facts.namespace = saved_ns;
                 }
             }
-            "class_declaration"
-            | "struct_declaration"
-            | "interface_declaration"
-            | "record_declaration"
-            | "record_struct_declaration"
-            | "enum_declaration" => visit_type(ctx, ch, None),
+            "class_declaration" | "struct_declaration" | "interface_declaration" | "record_declaration" | "enum_declaration" => {
+                visit_type(ctx, ch, None)
+            }
             "global_statement" => {
                 let m = &mut ctx.facts.symbols[0];
                 if !m.is_entrypoint {
@@ -279,9 +279,16 @@ fn attr_string_arg(attr: &str) -> Option<String> {
 fn visit_type(ctx: &mut Ctx, node: Node, outer: Option<&ClassInfo>) {
     let Some(name_node) = node.child_by_field_name("name") else { return };
     let name = ctx.text(name_node).to_string();
+    // Grammar 0.23 parses `record struct` as a `record_declaration` with a `struct` token.
+    let record_struct = node.kind() == "record_declaration" && {
+        let mut c = node.walk();
+        let r = node.children(&mut c).any(|ch| !ch.is_named() && ch.kind() == "struct");
+        r
+    };
     let kind = match node.kind() {
         "interface_declaration" => SymbolKind::Interface,
-        "struct_declaration" | "record_struct_declaration" => SymbolKind::Struct,
+        "struct_declaration" => SymbolKind::Struct,
+        "record_declaration" if record_struct => SymbolKind::Struct,
         "enum_declaration" => SymbolKind::Enum,
         _ => SymbolKind::Class,
     };
@@ -320,7 +327,8 @@ fn visit_type(ctx: &mut Ctx, node: Node, outer: Option<&ClassInfo>) {
     let keyword = match node.kind() {
         "interface_declaration" => "interface",
         "struct_declaration" => "struct",
-        "record_declaration" | "record_struct_declaration" => "record",
+        "record_declaration" if record_struct => "record struct",
+        "record_declaration" => "record",
         "enum_declaration" => "enum",
         _ => "class",
     };
@@ -411,12 +419,9 @@ fn visit_type(ctx: &mut Ctx, node: Node, outer: Option<&ClassInfo>) {
                     "constructor_declaration" => visit_callable(ctx, m, SymbolKind::Constructor, &info),
                     "property_declaration" => visit_property(ctx, m, &info),
                     "field_declaration" | "event_field_declaration" => visit_field(ctx, m, &info),
-                    "class_declaration"
-                    | "struct_declaration"
-                    | "interface_declaration"
-                    | "record_declaration"
-                    | "record_struct_declaration"
-                    | "enum_declaration" => visit_type(ctx, m, Some(&info)),
+                    "class_declaration" | "struct_declaration" | "interface_declaration" | "record_declaration" | "enum_declaration" => {
+                        visit_type(ctx, m, Some(&info))
+                    }
                     "operator_declaration" | "conversion_operator_declaration" | "indexer_declaration" | "destructor_declaration" => {
                         // Not modelled as symbols, but their bodies still produce references.
                         walk(ctx, m);
@@ -542,7 +547,8 @@ fn visit_property(ctx: &mut Ctx, node: Node, cls: &ClassInfo) {
                     }
                 }
             }
-            "arrow_expression_clause" => walk(ctx, ch),
+            // `string Name => …;` exposes its body as the `value` field, walked below.
+            "arrow_expression_clause" if Some(ch) != value => walk(ctx, ch),
             _ => {}
         }
     }
@@ -556,7 +562,32 @@ fn parse_params(ctx: &Ctx, node: Option<Node>) -> (ParamInfo, String, Vec<(Strin
     let Some(node) = node else { return (ParamInfo::default(), String::new(), Vec::new()) };
     let mut list = Vec::new();
     let mut locals = Vec::new();
-    for p in named_children(node) {
+    // `params T[] xs` is not wrapped in a `parameter` node: its `params` token, `type` and
+    // `name` sit directly in the parameter list.
+    let mut in_params = false;
+    let mut params_ty: Option<String> = None;
+    let mut c = node.walk();
+    let kids: Vec<(Option<&str>, Node)> =
+        node.children(&mut c).enumerate().map(|(i, ch)| (node.field_name_for_child(i as u32), ch)).collect();
+    for (field, p) in kids {
+        if !p.is_named() && p.kind() == "params" {
+            in_params = true;
+            params_ty = None;
+            continue;
+        }
+        if in_params && p.kind() != "parameter" {
+            match field {
+                Some("type") => params_ty = Some(ctx.text(p).to_string()),
+                Some("name") => {
+                    let name = ctx.text(p).to_string();
+                    locals.push((name.clone(), params_ty.clone()));
+                    list.push(Param { name, ty: params_ty.take(), optional: false, variadic: true });
+                    in_params = false;
+                }
+                _ => {}
+            }
+            continue;
+        }
         if p.kind() != "parameter" {
             continue;
         }
@@ -565,22 +596,25 @@ fn parse_params(ctx: &Ctx, node: Option<Node>) -> (ParamInfo, String, Vec<(Strin
         let text = ctx.text(p);
         let mut is_this = false;
         let mut variadic = false;
-        for ch in named_children(p) {
-            if matches!(ch.kind(), "modifier" | "parameter_modifier") {
-                match ctx.text(ch).trim() {
+        let mut optional = false;
+        let mut pc = p.walk();
+        for ch in p.children(&mut pc) {
+            match ch.kind() {
+                "modifier" | "parameter_modifier" => match ctx.text(ch).trim() {
                     "this" => is_this = true,
                     "params" => variadic = true,
                     _ => {}
-                }
+                },
+                "this" => is_this = true,
+                "params" => variadic = true,
+                // A default value (not an `=` inside an attribute argument).
+                "equals_value_clause" => optional = true,
+                _ => {}
             }
         }
         if text.trim_start().starts_with("this ") {
             is_this = true;
         }
-        if text.trim_start().starts_with("params ") {
-            variadic = true;
-        }
-        let optional = text.contains('=');
         locals.push((name.clone(), ty.clone()));
         if is_this {
             continue;
@@ -797,7 +831,7 @@ fn walk(ctx: &mut Ctx, node: Node) {
                 walk(ctx, b);
             }
         }
-        "foreach_statement" | "for_each_statement" => {
+        "foreach_statement" => {
             if let Some(l) = node.child_by_field_name("left") {
                 let ty = node.child_by_field_name("type").map(|t| ctx.text(t).to_string()).filter(|t| t != "var");
                 if l.kind() == "identifier" {
@@ -887,8 +921,7 @@ fn read_ident(ctx: &mut Ctx, node: Node) {
             | "attribute"
             | "type_parameter"
             | "label_statement"
-            | "goto_statement"
-            | "nameof_expression" => return,
+            | "goto_statement" => return,
             _ => {}
         }
     }
@@ -925,6 +958,15 @@ fn local_decl(ctx: &mut Ctx, vd: Node) {
         if d.kind() != "variable_declarator" {
             continue;
         }
+        // `var (a, b) = Compute();`
+        if let Some(tp) = named_children(d).into_iter().find(|c| c.kind() == "tuple_pattern") {
+            declare_pattern(ctx, tp);
+            if let Some(v) = named_children(d).into_iter().rev().find(|c| *c != tp) {
+                let v = if v.kind() == "equals_value_clause" { v.named_child(0).unwrap_or(v) } else { v };
+                walk(ctx, v);
+            }
+            continue;
+        }
         let Some(n) = declarator_name(d) else { continue };
         let name = ctx.text(n).to_string();
         let value = declarator_value(d);
@@ -952,6 +994,19 @@ fn local_decl(ctx: &mut Ctx, vd: Node) {
                 }
             }
             walk(ctx, v);
+        }
+    }
+}
+
+/// Declares every name bound by a (possibly nested) tuple / positional pattern.
+fn declare_pattern(ctx: &mut Ctx, node: Node) {
+    for ch in named_children(node) {
+        match ch.kind() {
+            "identifier" => {
+                let n = ctx.text(ch).to_string();
+                ctx.declare_local(&n, None);
+            }
+            _ => declare_pattern(ctx, ch),
         }
     }
 }
@@ -988,8 +1043,27 @@ fn call(ctx: &mut Ctx, node: Node) {
     let args = node.child_by_field_name("arguments");
     let argc = args.map(count_args);
     let line = line_of(node);
+    // `nameof(X)` is a compile-time string, not a call nor a use of X as a value.
+    if func.kind() == "identifier" && ctx.text(func) == "nameof" {
+        return;
+    }
     let (name, recv_node, generic): (String, Option<Node>, Option<String>) = match func.kind() {
         "identifier" => (ctx.text(func).to_string(), None, None),
+        // `a?.M()`: the receiver is the condition, the member sits in the binding expression.
+        "conditional_access_expression" => {
+            let binding = named_children(func).into_iter().find(|c| c.kind() == "member_binding_expression");
+            let n = binding.and_then(|b| b.child_by_field_name("name"));
+            let (nm, g) = match n {
+                Some(n) if n.kind() == "generic_name" => {
+                    let id = named_children(n).into_iter().find(|c| c.kind() == "identifier");
+                    let ta = named_children(n).into_iter().find(|c| c.kind() == "type_argument_list");
+                    (id.map(|i| ctx.text(i).to_string()).unwrap_or_default(), ta.map(|t| ctx.text(t).to_string()))
+                }
+                Some(n) => (ctx.text(n).to_string(), None),
+                None => (last_segment(ctx.text(func)).to_string(), None),
+            };
+            (nm, func.child_by_field_name("condition"), g)
+        }
         "generic_name" => {
             let id = named_children(func).into_iter().find(|c| c.kind() == "identifier");
             let ta = named_children(func).into_iter().find(|c| c.kind() == "type_argument_list");
@@ -1278,7 +1352,28 @@ fn new_expr(ctx: &mut Ctx, node: Node) {
         walk(ctx, a);
     }
     if let Some(init) = node.child_by_field_name("initializer") {
-        walk(ctx, init);
+        initializer(ctx, init, &ty);
+    }
+}
+
+/// `new Order { Name = n, Lines = { … } }`: member assignments write members of the created
+/// type, never fields of the enclosing class that happen to share the name.
+fn initializer(ctx: &mut Ctx, init: Node, ty: &str) {
+    let owner = clean_type(ty);
+    for ch in named_children(init) {
+        if ch.kind() == "assignment_expression" && !owner.is_empty() {
+            if let Some(left) = ch.child_by_field_name("left").filter(|l| l.kind() == "identifier") {
+                let name = ctx.text(left).to_string();
+                let line = line_of(left);
+                ctx.push_ref(RefKind::Write, &name, Some(owner.clone()), Some(owner.clone()), None, line, None);
+                ctx.push_mutation(&format!("{owner}.{name}"), "object_field", line);
+                if let Some(right) = ch.child_by_field_name("right") {
+                    walk(ctx, right);
+                }
+                continue;
+            }
+        }
+        walk(ctx, ch);
     }
 }
 
