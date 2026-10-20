@@ -483,6 +483,12 @@ impl SymbolIndex {
     /// Like [`resolve_type`], seen from namespace `ns` (C#: the namespace of the referencing
     /// symbol; files may hold several namespace blocks). `None` = every namespace of the file.
     pub fn resolve_type_ns(&self, raw: &str, from_file: &str, ns: Option<&str>) -> Resolved {
+        self.resolve_type_inner(raw, from_file, ns, true)
+    }
+
+    /// `aliases = false` once a `using Alias = X.Y;` has been followed: `using Debug =
+    /// UnityEngine.Debug;` would otherwise resolve `Debug` through itself forever.
+    fn resolve_type_inner(&self, raw: &str, from_file: &str, ns: Option<&str>, aliases: bool) -> Resolved {
         let cleaned = clean_type(raw);
         if cleaned.is_empty() {
             return Resolved::None;
@@ -508,7 +514,7 @@ impl SymbolIndex {
                     }
                 }
             }
-            return self.resolve_type_ns(last, from_file, ns);
+            return self.resolve_type_inner(last, from_file, ns, aliases);
         }
         let name = cleaned.as_str();
         let mut cands: Vec<usize> = self
@@ -529,12 +535,12 @@ impl SymbolIndex {
             }
         }
         // C# `using Alias = Some.Type;` names a type that has no declaration of its own.
-        if family == "dotnet" {
+        if family == "dotnet" && aliases {
             if let Some(target) = self.imports.get(from_file).and_then(|imps| {
                 imps.iter().find(|i| i.kind == ImportKind::Using && i.local.as_deref() == Some(name)).map(|i| i.module.clone())
             }) {
                 if target != name {
-                    return self.resolve_type_ns(&target, from_file, ns);
+                    return self.resolve_type_inner(&target, from_file, ns, false);
                 }
             }
         }
@@ -570,7 +576,10 @@ impl SymbolIndex {
                     if i.kind == ImportKind::Using {
                         if let Some(alias) = &i.local {
                             if alias == name {
-                                return self.resolve_type_ns(&i.module, from_file, ns);
+                                if aliases {
+                                    return self.resolve_type_inner(&i.module, from_file, ns, false);
+                                }
+                                continue;
                             }
                         } else {
                             usings.push(i.module.clone());
