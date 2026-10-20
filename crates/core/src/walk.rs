@@ -213,6 +213,11 @@ fn globs(patterns: &[String]) -> GlobSet {
 
 /// Walks `root` and returns every indexable source file.
 pub fn discover(root: &Path) -> Vec<SourceFile> {
+    discover_counting(root, &std::sync::atomic::AtomicUsize::new(0))
+}
+
+/// [`discover`], counting files found into `found` as the walk goes (progress display).
+pub fn discover_counting(root: &Path, found: &std::sync::atomic::AtomicUsize) -> Vec<SourceFile> {
     let rules = std::sync::Arc::new(IgnoreRules::load(root));
     let filter_rules = rules.clone();
     let filter_root = root.to_path_buf();
@@ -241,6 +246,7 @@ pub fn discover(root: &Path) -> Vec<SourceFile> {
         if meta.len() > MAX_FILE_BYTES {
             continue;
         }
+        found.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         out.push(SourceFile {
             abs_path: path.to_path_buf(),
             rel_path: normalize_rel(root, path),

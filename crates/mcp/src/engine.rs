@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use codegraph_core::lang::Language;
 use codegraph_core::walk::{normalize_rel, IgnoreRules};
-use codegraph_graph::{index_paths, index_project, stale_files, IndexOptions, IndexStats};
+use codegraph_graph::{index_paths_with, index_project_with, stale_files, IndexOptions, IndexStats, Progress, ProgressSnapshot};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::Connection;
 use serde::Serialize;
@@ -50,6 +50,8 @@ pub struct Engine {
     pub reindexing: AtomicBool,
     pub pending: AtomicUsize,
     pub last_stats: Mutex<Option<IndexStats>>,
+    /// Stage and counts of the running (or last) indexing run.
+    pub progress: Arc<Progress>,
 }
 
 #[derive(Serialize)]
@@ -60,14 +62,21 @@ pub struct EngineStatus {
     pub pending_files: usize,
     pub stale_files: Vec<String>,
     pub stats: codegraph_graph::query::GraphStats,
+    /// Present while re-indexing.
+    pub progress: Option<ProgressSnapshot>,
 }
 
 impl Engine {
     /// Opens the database and brings the index up to date.
     pub fn open(root: &Path) -> Result<Arc<Engine>> {
+        Engine::open_with(root, Arc::new(Progress::new()))
+    }
+
+    /// [`Engine::open`], reporting the initial indexing run to `progress`.
+    pub fn open_with(root: &Path, progress: Arc<Progress>) -> Result<Arc<Engine>> {
         let root = codegraph_graph::canonical_root(root);
         let mut conn = codegraph_graph::open(&root)?;
-        let stats = index_project(&root, &mut conn, IndexOptions::default())?;
+        let stats = index_project_with(&root, &mut conn, IndexOptions::default(), &progress)?;
         tracing::info!(
             "indexed {} files ({} parsed, {} unchanged) in {} ms",
             stats.files_total,
@@ -86,6 +95,7 @@ impl Engine {
             reindexing: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
             last_stats: Mutex::new(Some(stats)),
+            progress,
         }))
     }
 
@@ -171,7 +181,7 @@ impl Engine {
         self.reindexing.store(true, Ordering::SeqCst);
         let res = {
             let mut conn = self.writer.lock().unwrap();
-            index_paths(&self.root, &mut conn, paths)
+            index_paths_with(&self.root, &mut conn, paths, &self.progress)
         };
         self.reindexing.store(false, Ordering::SeqCst);
         self.pending.store(0, Ordering::SeqCst);
@@ -185,7 +195,7 @@ impl Engine {
         self.reindexing.store(true, Ordering::SeqCst);
         let res = {
             let mut conn = self.writer.lock().unwrap();
-            index_project(&self.root, &mut conn, IndexOptions { rebuild })
+            index_project_with(&self.root, &mut conn, IndexOptions { rebuild }, &self.progress)
         };
         self.reindexing.store(false, Ordering::SeqCst);
         if let Ok(s) = &res {
@@ -201,10 +211,12 @@ impl Engine {
         } else {
             stale_files(&self.root, &conn, None).unwrap_or_default()
         };
+        let reindexing = self.reindexing.load(Ordering::SeqCst);
         Ok(EngineStatus {
             root: self.root.display().to_string(),
             watching: self.is_watching(),
-            reindexing: self.reindexing.load(Ordering::SeqCst),
+            reindexing,
+            progress: reindexing.then(|| self.progress.snapshot()),
             pending_files: self.pending.load(Ordering::SeqCst),
             stale_files: stale,
             stats: codegraph_graph::query::stats(&conn)?,

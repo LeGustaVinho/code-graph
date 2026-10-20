@@ -2,6 +2,7 @@
 //! mode with FTS5 trigram indexes, plus the incremental indexer.
 
 pub mod indexer;
+pub mod progress;
 pub mod query;
 pub mod schema;
 pub mod store;
@@ -11,7 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 
-pub use indexer::{index_paths, index_project, stale_files, IndexOptions, IndexStats};
+pub use indexer::{index_paths, index_paths_with, index_project, index_project_with, stale_files, IndexOptions, IndexStats};
+pub use progress::{Progress, ProgressSnapshot, Stage};
 pub use store::{EdgeRow, Node};
 
 pub const DB_DIR: &str = ".codegraph";

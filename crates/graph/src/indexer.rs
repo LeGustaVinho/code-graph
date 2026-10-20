@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use codegraph_core::walk::{discover, mtime_of, SourceFile};
+use codegraph_core::walk::{discover, discover_counting, mtime_of, SourceFile};
 use codegraph_core::{extract_file, DiRegistration, FileFacts, GlobalHandler, HttpCall, Import, ImportKind, Language, RouteDecl};
 use codegraph_semantic::global::{self, CallRow, HandlerRow, HttpCallRow, LiteralRow, RouteRow, ThrowRow};
 use codegraph_semantic::index::{IndexedSymbol, SymbolIndex};
@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use rusqlite::{params, params_from_iter, Connection, Transaction};
 use serde::Serialize;
 
+use crate::progress::{Progress, Stage};
 use crate::store::{self, node_from_row, StoredFacts, NODE_COLS};
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -51,7 +52,24 @@ pub fn now_ms() -> i64 {
 
 /// Indexes the whole project incrementally.
 pub fn index_project(root: &Path, conn: &mut Connection, opts: IndexOptions) -> Result<IndexStats> {
-    let files = discover(root);
+    index_project_with(root, conn, opts, &Progress::new())
+}
+
+/// [`index_project`], reporting each stage to `progress` (read from other threads).
+pub fn index_project_with(root: &Path, conn: &mut Connection, opts: IndexOptions, progress: &Progress) -> Result<IndexStats> {
+    progress.begin(Stage::Discover, 0);
+    let files = {
+        let found = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            let walk = s.spawn(|| discover_counting(root, &found));
+            while !walk.is_finished() {
+                progress.set_done(found.load(std::sync::atomic::Ordering::Relaxed));
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            walk.join().unwrap_or_default()
+        })
+    };
+    progress.set_done(files.len());
     let on_disk: HashSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
     let known: Vec<String> = {
         let mut st = conn.prepare("SELECT file_path FROM file_meta")?;
@@ -64,13 +82,20 @@ pub fn index_project(root: &Path, conn: &mut Connection, opts: IndexOptions) -> 
     if crate::store::get_meta(conn, "extractor_version").as_deref() != Some(codegraph_core::EXTRACTOR_VERSION) {
         opts.rebuild = true;
     }
-    let stats = run(root, conn, files, removed, opts)?;
+    let stats = run(root, conn, files, removed, opts, progress);
+    progress.begin(Stage::Done, 0);
+    let stats = stats?;
     crate::store::set_meta(conn, "extractor_version", codegraph_core::EXTRACTOR_VERSION)?;
     Ok(stats)
 }
 
 /// Re-indexes only the given relative paths (freshness micro-reindex).
 pub fn index_paths(root: &Path, conn: &mut Connection, rel_paths: &[String]) -> Result<IndexStats> {
+    index_paths_with(root, conn, rel_paths, &Progress::new())
+}
+
+/// [`index_paths`], reporting each stage to `progress`.
+pub fn index_paths_with(root: &Path, conn: &mut Connection, rel_paths: &[String], progress: &Progress) -> Result<IndexStats> {
     let mut candidates = Vec::new();
     let mut removed = Vec::new();
     // Same rules as discovery: .gitignore / .ignore / .codegraphignore, build and engine folders.
@@ -95,7 +120,9 @@ pub fn index_paths(root: &Path, conn: &mut Connection, rel_paths: &[String]) -> 
             _ => removed.push(rel.clone()),
         }
     }
-    run(root, conn, candidates, removed, IndexOptions::default())
+    let stats = run(root, conn, candidates, removed, IndexOptions::default(), progress);
+    progress.begin(Stage::Done, 0);
+    stats
 }
 
 /// Files whose mtime/size differ from the index (no hashing), plus deleted files.
@@ -157,7 +184,14 @@ struct Parsed {
     facts: std::result::Result<FileFacts, String>,
 }
 
-fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed: Vec<String>, opts: IndexOptions) -> Result<IndexStats> {
+fn run(
+    root: &Path,
+    conn: &mut Connection,
+    candidates: Vec<SourceFile>,
+    removed: Vec<String>,
+    opts: IndexOptions,
+    progress: &Progress,
+) -> Result<IndexStats> {
     let t0 = Instant::now();
     let _ = root;
     let mut stats = IndexStats { files_scanned: candidates.len(), files_removed: removed.len(), ..Default::default() };
@@ -181,9 +215,11 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
     stats.files_unchanged = stats.files_scanned - to_hash.len();
 
     // 2. Parallel Blake3 hashing + 3. parallel parsing of modified files.
+    progress.begin(Stage::Read, to_hash.len());
     let results: Vec<(SourceFile, String, Option<Vec<u8>>)> = to_hash
         .into_par_iter()
         .filter_map(|f| {
+            progress.tick();
             let bytes = std::fs::read(&f.abs_path).ok()?;
             let hash = codegraph_core::hash::content_hash(&bytes);
             Some((f, hash, Some(bytes)))
@@ -198,6 +234,7 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
         }
     }
     stats.files_unchanged += touched.len();
+    progress.begin(Stage::Parse, to_parse.len());
     let parsed: Vec<Parsed> = extraction_pool().install(|| {
         to_parse
             .into_par_iter()
@@ -207,6 +244,7 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
                 let lang = f.language;
                 let facts =
                     catch_unwind(AssertUnwindSafe(|| extract_file(&rel, lang, &text))).map_err(|_| "extractor panicked".to_string());
+                progress.tick();
                 Parsed { file: f, hash, facts }
             })
             .collect()
@@ -216,6 +254,10 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
 
     tracing::debug!("hash+parse: {} ms", t0.elapsed().as_millis());
     let now = now_ms();
+    // Deleting the old rows of already indexed files costs about as much as inserting
+    // (a `--rebuild` deletes everything); a first index has nothing to delete.
+    let indexed_before = parsed.iter().filter(|p| meta.contains_key(&p.file.rel_path)).count() + removed.len();
+    progress.begin(Stage::Store, indexed_before + parsed.len() + removed.len());
     let tx = conn.transaction()?;
     for (f, _) in &touched {
         tx.execute("UPDATE file_meta SET last_mtime = ?1, size = ?2 WHERE file_path = ?3", params![f.mtime, f.size as i64, f.rel_path])?;
@@ -235,11 +277,15 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
     let tp = Instant::now();
     for f in &changed {
         store::delete_file_rows(&tx, f)?;
+        if meta.contains_key(f) {
+            progress.tick();
+        }
     }
     tracing::debug!("delete: {} ms", tp.elapsed().as_millis());
     let tp = Instant::now();
     for f in &removed {
         tx.execute("DELETE FROM file_meta WHERE file_path = ?1", [f])?;
+        progress.tick();
     }
     let mut new_names: BTreeSet<String> = BTreeSet::new();
     let mut has_di = false;
@@ -252,6 +298,7 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
                 store::insert_file_facts(&tx, facts, &p.hash, p.file.mtime, p.file.size, now)?;
                 new_names.extend(facts.symbols.iter().map(|s| s.name.clone()));
                 has_di |= !facts.di.is_empty();
+                progress.tick();
             }
             Err(e) => {
                 stats.parse_errors += 1;
@@ -259,6 +306,7 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
                     "INSERT OR REPLACE INTO file_meta (file_path, content_hash, last_mtime, size, last_indexed_at, status, language, line_count, error, facts) VALUES (?1, ?2, ?3, ?4, ?5, 'error', ?6, 0, ?7, NULL)",
                     params![p.file.rel_path, p.hash, p.file.mtime, p.file.size as i64, now, p.file.language.as_str(), e],
                 )?;
+                progress.tick();
             }
         }
     }
@@ -303,6 +351,7 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
 
     tracing::debug!("cascade: {} ms ({} affected)", tp.elapsed().as_millis(), affected.len());
     // 5. Semantic resolution of affected files.
+    progress.begin(Stage::Resolve, affected.len());
     let tp = Instant::now();
     let mut index = load_index(&tx)?;
     if !index.js_paths.is_empty() {
@@ -331,7 +380,14 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
             facts.push((f.clone(), sf));
         }
     }
-    let edges: Vec<Edge> = facts.par_iter().flat_map_iter(|(f, sf)| resolve::resolve_file(&index, f, &sf.refs)).collect();
+    let edges: Vec<Edge> = facts
+        .par_iter()
+        .flat_map_iter(|(f, sf)| {
+            let e = resolve::resolve_file(&index, f, &sf.refs);
+            progress.tick();
+            e
+        })
+        .collect();
     for e in &edges {
         store::insert_edge(&tx, e)?;
     }
@@ -339,9 +395,11 @@ fn run(root: &Path, conn: &mut Connection, candidates: Vec<SourceFile>, removed:
     tracing::debug!("resolve+insert {} edges: {} ms", edges.len(), tp.elapsed().as_millis());
     // 6. Project-wide derived relations.
     let tp = Instant::now();
-    recompute_global(&tx, &index)?;
+    progress.begin(Stage::Link, GLOBAL_STEPS);
+    recompute_global(&tx, &index, progress)?;
     tracing::debug!("global: {} ms", tp.elapsed().as_millis());
     let tp = Instant::now();
+    progress.begin(Stage::Save, 0);
     store::set_meta(&tx, "last_indexed_at", &now.to_string())?;
     tx.commit()?;
     tracing::debug!("commit: {} ms", tp.elapsed().as_millis());
@@ -466,7 +524,10 @@ fn load_call_rows(tx: &Transaction) -> Result<Vec<CallRow>> {
     Ok(rows.flatten().collect())
 }
 
-fn recompute_global(tx: &Transaction, index: &SymbolIndex) -> Result<()> {
+/// Progress steps of [`recompute_global`].
+const GLOBAL_STEPS: usize = 7;
+
+fn recompute_global(tx: &Transaction, index: &SymbolIndex, progress: &Progress) -> Result<()> {
     tx.execute_batch(
         "DELETE FROM edge WHERE derived = 1;
          DELETE FROM node WHERE derived = 1;
@@ -490,6 +551,7 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex) -> Result<()> {
     // Dependency injection.
     edges.extend(global::di_edges(index));
     tracing::debug!("  di: {} ms", tg.elapsed().as_millis());
+    progress.tick();
     let tg = Instant::now();
 
     // Fullstack routes.
@@ -541,12 +603,14 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex) -> Result<()> {
     };
     edges.extend(global::http_edges(index, &resolved, &calls));
     tracing::debug!("  http: {} ms", tg.elapsed().as_millis());
+    progress.tick();
     let tg = Instant::now();
 
     // Tests and error flow (both derived from the per-file CALLS / THROWS edges).
     let call_rows = load_call_rows(tx)?;
     edges.extend(global::test_edges(index, &call_rows));
     tracing::debug!("  tests: {} ms", tg.elapsed().as_millis());
+    progress.tick();
     let tg = Instant::now();
     let throws: Vec<ThrowRow> = {
         let mut st = tx.prepare(
@@ -588,6 +652,7 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex) -> Result<()> {
     };
     edges.extend(global::caught_by_edges(index, &throws, &call_rows, &handlers));
     tracing::debug!("  caught_by: {} ms", tg.elapsed().as_millis());
+    progress.tick();
     let tg = Instant::now();
 
     // Shared literals.
@@ -609,6 +674,7 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex) -> Result<()> {
     }
     edges.extend(lit_edges);
     tracing::debug!("  literals: {} ms", tg.elapsed().as_millis());
+    progress.tick();
     let tg = Instant::now();
 
     for e in &edges {
@@ -616,10 +682,12 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex) -> Result<()> {
     }
 
     tracing::debug!("  insert {} derived edges: {} ms", edges.len(), tg.elapsed().as_millis());
+    progress.tick();
     let tg = Instant::now();
     // Data models / ERD.
     let (models, fields) = models::extract_models(index);
     tracing::debug!("  models: {} ms", tg.elapsed().as_millis());
+    progress.tick();
     {
         let mut st =
             tx.prepare_cached("INSERT OR REPLACE INTO data_model (model_node_id, name, framework, table_name) VALUES (?1, ?2, ?3, ?4)")?;

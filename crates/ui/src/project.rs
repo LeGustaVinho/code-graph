@@ -11,6 +11,7 @@ use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use codegraph_graph::Progress;
 use codegraph_mcp::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -27,6 +28,8 @@ struct Opening {
     path: PathBuf,
     started: Instant,
     error: Option<String>,
+    /// Live stage and counts of the indexing run (drives the progress bar).
+    progress: Arc<Progress>,
 }
 
 pub type AppState = Arc<AppCtx>;
@@ -137,12 +140,14 @@ fn dir_name(p: &Path) -> String {
 /// Open project, in-flight open, recent projects and handy starting folders.
 pub async fn project_info(State(ctx): State<AppState>) -> Json<Value> {
     let open = ctx.engine().map(|e| json!({ "root": display_path(&e.root), "name": dir_name(&e.root) }));
-    let opening = ctx
-        .opening
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|o| json!({ "path": display_path(&o.path), "elapsed_ms": o.started.elapsed().as_millis() as u64, "error": o.error }));
+    let opening = ctx.opening.lock().unwrap().as_ref().map(|o| {
+        json!({
+            "path": display_path(&o.path),
+            "elapsed_ms": o.started.elapsed().as_millis() as u64,
+            "error": o.error,
+            "progress": o.progress.snapshot(),
+        })
+    });
     let recent: Vec<Value> = load_recent()
         .into_iter()
         .map(|r| {
@@ -225,27 +230,36 @@ pub struct OpenReq {
 
 /// Starts indexing `path` in the background; the project switches over when done.
 pub async fn open_project(State(ctx): State<AppState>, Json(req): Json<OpenReq>) -> Result<Json<Value>, ApiError> {
-    let dir = PathBuf::from(req.path.trim());
+    let shown = begin_open(&ctx, PathBuf::from(req.path.trim()))?;
+    Ok(Json(json!({ "opening": shown })))
+}
+
+/// Indexes `dir` on a blocking thread while the page shows its progress, then makes it the
+/// open project. Must run inside the Tokio runtime.
+pub fn begin_open(ctx: &AppState, dir: PathBuf) -> Result<String, ApiError> {
     if !dir.is_dir() {
         return Err(ApiError(format!("{} is not a folder", dir.display())));
     }
+    let progress = Arc::new(Progress::new());
     {
         let mut op = ctx.opening.lock().unwrap();
         if op.as_ref().is_some_and(|o| o.error.is_none()) {
             return Err(ApiError("another project is still being opened".into()));
         }
-        *op = Some(Opening { path: dir.clone(), started: Instant::now(), error: None });
+        *op = Some(Opening { path: dir.clone(), started: Instant::now(), error: None, progress: progress.clone() });
     }
     let bg = ctx.clone();
     let shown = display_path(&dir);
+    tracing::info!("indexing {shown} …");
     tokio::spawn(async move {
         let path = dir.clone();
-        let res = tokio::task::spawn_blocking(move || Engine::open(&path)).await;
+        let started = Instant::now();
+        let res = tokio::task::spawn_blocking(move || Engine::open_with(&path, progress)).await;
         match res {
             Ok(Ok(engine)) => {
                 engine.start_watcher();
                 remember(&engine.root);
-                tracing::info!("opened project {}", engine.root.display());
+                tracing::info!("opened project {} in {:.1} s", display_path(&engine.root), started.elapsed().as_secs_f32());
                 *bg.engine.write().unwrap() = Some(engine);
                 *bg.opening.lock().unwrap() = None;
             }
@@ -253,7 +267,7 @@ pub async fn open_project(State(ctx): State<AppState>, Json(req): Json<OpenReq>)
             Err(e) => set_error(&bg, e.to_string()),
         }
     });
-    Ok(Json(json!({ "opening": shown })))
+    Ok(shown)
 }
 
 fn set_error(ctx: &AppCtx, msg: String) {

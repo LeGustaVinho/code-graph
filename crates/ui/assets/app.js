@@ -320,8 +320,29 @@
     $("#legend").classList.toggle("collapsed", store.get("legendCollapsed", false));
   }
 
+  /** "Step 4 of 7 · Storing symbols", "650 of 1,446" for an indexing progress snapshot. */
+  function progressLabels(p) {
+    const stage = t("progress." + (p?.stage || "idle"));
+    const step = p?.step ? t("progress.step", { i: p.step, n: p.steps }) + " · " : "";
+    let count = "";
+    if (p?.stage === "discover") count = t("progress.found", { n: num(p.done) });
+    else if (p?.total) count = t("progress.count", { d: num(Math.min(p.done, p.total)), t: num(p.total) });
+    return { title: step + stage, count };
+  }
+
+  /** Thin bar under the top bar while the open project re-indexes. */
+  function renderIndexBar(p) {
+    const bar = $("#index-bar");
+    bar.hidden = !p;
+    if (!p) return;
+    bar.classList.toggle("indeterminate", !p.total && p.stage !== "save");
+    bar.querySelector(".fill").style.width = `${p.percent}%`;
+    bar.title = `${progressLabels(p).title} ${Math.round(p.percent)}%`;
+  }
+
   function renderStatus() {
     const s = state.status;
+    renderIndexBar(s?.reindexing ? s.progress : null);
     const pill = $("#status");
     const text = pill.querySelector(".status-text");
     if (!s) {
@@ -331,7 +352,9 @@
     }
     if (s.reindexing) {
       pill.className = "status-pill busy";
-      text.textContent = t("status.reindexing", { n: s.pending_files || "" });
+      text.textContent = s.progress?.percent != null
+        ? t("status.reindexingPct", { p: Math.round(s.progress.percent) })
+        : t("status.reindexing", { n: s.pending_files || "" });
     } else if (s.stale_files.length) {
       pill.className = "status-pill stale";
       text.textContent = t("status.pending", { n: s.stale_files.length });
@@ -1885,13 +1908,16 @@
     const btn = $("#btn-reindex");
     btn.classList.add("spin");
     toast(t("toast.reindexing"));
+    const poll = setInterval(() => api("/api/status").then((s) => { state.status = s; renderStatus(); }).catch(() => {}), 400);
     try {
       const r = await api("/api/reindex", { method: "POST" });
+      clearInterval(poll);
       toast(t("toast.reindexed", { n: r.files_parsed, ms: r.duration_ms }));
       await pollStatus();
     } catch (e) {
       toast(e.message, "error");
     } finally {
+      clearInterval(poll);
       btn.classList.remove("spin");
     }
   }
@@ -2228,13 +2254,27 @@
       return;
     }
     const name = op.path.split("/").filter(Boolean).pop() || op.path;
-    pickerBody.innerHTML = `<div class="pk-progress">
-      <div class="pk-spinner"></div>
-      <div class="pk-progress-title">${esc(t("picker.opening", { p: name }))}</div>
-      <div class="sub mono">${esc(op.path)}</div>
-      <div class="sub">${esc(t("picker.elapsed", { s: Math.round(op.elapsed_ms / 1000) }))}</div>
-      <div class="sub">${esc(t("picker.openingHint"))}</div></div>`;
-    pk.timer = setTimeout(watchOpening, 700);
+    // Built once, then updated in place so the bar animates between polls.
+    if (pickerBody.querySelector(".pk-progress")?.dataset.path !== op.path) {
+      pickerBody.innerHTML = `<div class="pk-progress" data-path="${esc(op.path)}">
+        <div class="pk-progress-title">${esc(t("picker.opening", { p: name }))}</div>
+        <div class="sub mono">${esc(op.path)}</div>
+        <div class="pk-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"><div class="fill"></div></div>
+        <div class="pk-bar-row"><span class="stage"></span><span class="pct"></span></div>
+        <div class="pk-bar-row"><span class="count"></span><span class="elapsed"></span></div>
+        <div class="sub">${esc(t("picker.openingHint"))}</div></div>`;
+    }
+    const p = op.progress || { stage: "idle", percent: 0, done: 0, total: 0 };
+    const labels = progressLabels(p);
+    const bar = pickerBody.querySelector(".pk-bar");
+    bar.classList.toggle("indeterminate", p.stage === "idle" || p.stage === "discover");
+    bar.querySelector(".fill").style.width = `${p.percent}%`;
+    bar.setAttribute("aria-valuenow", String(Math.round(p.percent)));
+    pickerBody.querySelector(".pk-bar-row .stage").textContent = labels.title;
+    pickerBody.querySelector(".pk-bar-row .pct").textContent = `${Math.round(p.percent)}%`;
+    pickerBody.querySelector(".pk-bar-row .count").textContent = labels.count;
+    pickerBody.querySelector(".pk-bar-row .elapsed").textContent = t("picker.elapsed", { s: Math.round(op.elapsed_ms / 1000) });
+    pk.timer = setTimeout(watchOpening, 400);
   }
 
   picker.addEventListener("click", (ev) => {

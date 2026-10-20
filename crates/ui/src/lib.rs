@@ -6,6 +6,7 @@ mod tree;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,7 +39,19 @@ pub async fn serve(engine: Option<Arc<Engine>>, addr: SocketAddr) -> Result<()> 
 
 /// Same as [`serve`] on an already bound listener (lets callers pick a free port).
 pub async fn serve_on(engine: Option<Arc<Engine>>, listener: tokio::net::TcpListener) -> Result<()> {
-    let ctx = AppCtx::new(engine);
+    serve_ctx(AppCtx::new(engine), listener).await
+}
+
+/// Serves at once and indexes `root` in the background: the page shows a progress bar
+/// until the project is ready (a first index of a large project takes a while).
+pub async fn serve_opening(root: PathBuf, addr: SocketAddr) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let ctx = AppCtx::new(None);
+    project::begin_open(&ctx, root).map_err(|e| anyhow::anyhow!(e.0))?;
+    serve_ctx(ctx, listener).await
+}
+
+async fn serve_ctx(ctx: project::AppState, listener: tokio::net::TcpListener) -> Result<()> {
     // Background freshness loop: re-index files reported by the watcher.
     let bg = ctx.clone();
     tokio::spawn(async move {

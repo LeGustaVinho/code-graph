@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use codegraph_core::lang::{parse, Language};
-use codegraph_graph::{index_project, IndexOptions};
+use codegraph_graph::{index_project_with, IndexOptions, Progress, Stage};
 use codegraph_mcp::Engine;
 
 #[derive(Parser)]
@@ -118,7 +118,10 @@ fn main() -> Result<()> {
             init_logging("warn");
             let root = root_or_cwd(path)?;
             let mut conn = codegraph_graph::open(&root)?;
-            let stats = index_project(&root, &mut conn, IndexOptions { rebuild })?;
+            let progress = Progress::new();
+            let show = !json && std::io::IsTerminal::is_terminal(&std::io::stderr());
+            let stats =
+                with_terminal_progress(&progress, show, || index_project_with(&root, &mut conn, IndexOptions { rebuild }, &progress))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             } else {
@@ -158,17 +161,14 @@ fn main() -> Result<()> {
         Cmd::Ui { path, port, host, no_open } => {
             init_logging("info");
             let root = root_or_cwd(path)?;
-            eprintln!("Indexing {} …", root.display());
-            let engine = Engine::open(&root)?;
-            engine.start_watcher();
             let addr: SocketAddr = format!("{host}:{port}").parse().context("invalid host/port")?;
             let url = format!("http://{}:{port}", if host == "0.0.0.0" { "localhost" } else { host.as_str() });
-            eprintln!("CodeGraph Explorer: {url}");
+            eprintln!("CodeGraph Explorer: {url} (indexing {} — progress is shown in the browser)", root.display());
             if !no_open {
                 open_browser(&url);
             }
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-            rt.block_on(codegraph_ui::serve(Some(engine), addr))?;
+            rt.block_on(codegraph_ui::serve_opening(root, addr))?;
         }
         Cmd::Query { tool, args, root } => {
             init_logging("warn");
@@ -240,6 +240,58 @@ fn launcher() -> Result<()> {
         }
         codegraph_ui::serve_on(None, listener).await
     })
+}
+
+/// Runs `work` while redrawing a one-line progress bar on stderr (when `show`).
+fn with_terminal_progress<T>(progress: &Progress, show: bool, work: impl FnOnce() -> T) -> T {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    if !show {
+        return work();
+    }
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let mut last = String::new();
+            while !finished.load(Ordering::Relaxed) {
+                let line = progress_line(progress);
+                if line != last {
+                    eprint!("\r{line:<78}");
+                    let _ = std::io::stderr().flush();
+                    last = line;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            eprint!("\r{:<78}\r", "");
+        });
+        let out = work();
+        finished.store(true, Ordering::Relaxed);
+        out
+    })
+}
+
+fn progress_line(progress: &Progress) -> String {
+    let p = progress.snapshot();
+    let label = match p.stage {
+        Stage::Idle => "Starting",
+        Stage::Discover => "Scanning files",
+        Stage::Read => "Reading files",
+        Stage::Parse => "Parsing",
+        Stage::Store => "Storing symbols",
+        Stage::Resolve => "Resolving references",
+        Stage::Link => "Linking project",
+        Stage::Save => "Saving",
+        Stage::Done => "Done",
+    };
+    const WIDTH: usize = 24;
+    let filled = ((p.percent / 100.0) * WIDTH as f32).round() as usize;
+    let bar = format!("{}{}", "█".repeat(filled.min(WIDTH)), "░".repeat(WIDTH - filled.min(WIDTH)));
+    let count = match (p.stage, p.total) {
+        (Stage::Discover, _) => format!(" {} found", p.done),
+        (_, 0) => String::new(),
+        (_, t) => format!(" {}/{t}", p.done.min(t)),
+    };
+    format!("{bar} {:>3.0}%  {label}{count}", p.percent)
 }
 
 fn dump(n: tree_sitter::Node, src: &str, depth: usize, field: Option<&str>) {
