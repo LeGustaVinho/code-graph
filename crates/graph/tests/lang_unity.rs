@@ -65,6 +65,8 @@ fn runtime_code_never_links_into_editor_code() {
     let c = &f.conn;
     assert!(edge(c, "Player.Start", "EditorUtil.SetTarget", "CALLS").is_none(), "Editor folder");
     assert!(edge(c, "Player.Start", "ToolHelper.Warp", "CALLS").is_none(), "Editor-only asmdef");
+    // `GetComponent<Button>().onClick.AddListener(…)` is an engine call (Button is external).
+    assert!(edge(c, "Player.Start", "LifecycleObserver.AddListener", "CALLS").is_none(), "{:?}", targets(c, "Player.Start", "CALLS"));
 }
 
 #[test]

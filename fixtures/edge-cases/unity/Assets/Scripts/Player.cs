@@ -26,6 +26,7 @@ namespace Game
             var level = UnityEngine.PlayerPrefs.GetInt("level", 0);
             transform.DOMove(1f).SetTarget(this);
             transform.Find("x").Warp();
+            GetComponent<UnityEngine.UI.Button>().onClick.AddListener(Fire);
         }
 
         public void Review()
@@ -53,6 +54,12 @@ namespace Game
     public class Rigid : UnityEngine.MonoBehaviour
     {
         public void Push() { }
+    }
+
+    // A project method sharing a name with an engine API must not capture engine calls.
+    public class LifecycleObserver
+    {
+        public void AddListener(System.Action a) { }
     }
 
     [UnityEngine.RequireComponent(typeof(Rigid))]

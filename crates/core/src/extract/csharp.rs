@@ -1486,7 +1486,8 @@ fn receiver_info(ctx: &Ctx, r: Node) -> (String, Option<String>) {
             let n = r.child_by_field_name("name").map(|n| ctx.text(n).to_string());
             match (e, n) {
                 (Some(e), Some(n)) if ctx.text(e) == "this" => ctx.field_type(&n),
-                _ => None,
+                // `GetComponent<Button>().onClick`: a deferred member type of a typed head.
+                _ => infer_expr_type(ctx, r),
             }
         }
         "object_creation_expression" => r.child_by_field_name("type").map(|t| ctx.text(t).to_string()),
