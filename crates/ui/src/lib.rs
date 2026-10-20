@@ -1,6 +1,7 @@
 //! Local Graph Explorer: an Axum HTTP server serving an embedded single-page app
 //! (Cytoscape.js) plus a small JSON API over the code graph.
 
+mod project;
 mod tree;
 
 use std::collections::{HashMap, HashSet};
@@ -10,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -19,6 +20,7 @@ use codegraph_graph::query;
 use codegraph_graph::store::{edge_from_row, EdgeRow, EDGE_COLS};
 use codegraph_graph::Node;
 use codegraph_mcp::Engine;
+use project::{AppCtx, Eng};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -27,17 +29,25 @@ use serde_json::{json, Value};
 #[folder = "assets/"]
 struct Assets;
 
-type AppState = Arc<Engine>;
+/// Serves the explorer. Without an engine it starts in launcher mode: the page lets
+/// people pick a folder, which is then indexed and opened (projects can be switched later).
+pub async fn serve(engine: Option<Arc<Engine>>, addr: SocketAddr) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    serve_on(engine, listener).await
+}
 
-pub async fn serve(engine: Arc<Engine>, addr: SocketAddr) -> Result<()> {
+/// Same as [`serve`] on an already bound listener (lets callers pick a free port).
+pub async fn serve_on(engine: Option<Arc<Engine>>, listener: tokio::net::TcpListener) -> Result<()> {
+    let ctx = AppCtx::new(engine);
     // Background freshness loop: re-index files reported by the watcher.
-    let bg = engine.clone();
+    let bg = ctx.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(800)).await;
-            if bg.pending_dirty() > 0 || !bg.is_watching() {
-                let e = bg.clone();
-                let _ = tokio::task::spawn_blocking(move || e.ensure_fresh(&[])).await;
+            if let Some(e) = bg.engine() {
+                if e.pending_dirty() > 0 || !e.is_watching() {
+                    let _ = tokio::task::spawn_blocking(move || e.ensure_fresh(&[])).await;
+                }
             }
         }
     });
@@ -52,10 +62,13 @@ pub async fn serve(engine: Arc<Engine>, addr: SocketAddr) -> Result<()> {
         .route("/api/rollup", post(rollup))
         .route("/api/tool/{name}", post(run_tool))
         .route("/api/reindex", post(reindex))
+        .route("/api/project", get(project::project_info))
+        .route("/api/project/open", post(project::open_project))
+        .route("/api/project/forget", post(project::forget_project))
+        .route("/api/fs", get(project::list_dirs))
         .fallback(static_handler)
-        .with_state(engine);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("Graph Explorer listening on http://{addr}");
+        .with_state(ctx);
+    tracing::info!("Graph Explorer listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -111,7 +124,7 @@ async fn static_handler(uri: Uri) -> Response {
     }
 }
 
-async fn status(State(engine): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn status(Eng(engine): Eng) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let st = engine.status()?;
         Ok(Json(serde_json::to_value(st)?))
@@ -184,7 +197,7 @@ struct SearchQ {
     limit: Option<usize>,
 }
 
-async fn search(State(engine): State<AppState>, Query(q): Query<SearchQ>) -> Result<Json<Value>, ApiError> {
+async fn search(Eng(engine): Eng, Query(q): Query<SearchQ>) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let conn = engine.reader()?;
         let (rows, total) = query::search(&conn, &q.q, q.kind.as_deref(), q.limit.unwrap_or(30), false)?;
@@ -215,7 +228,7 @@ const DEFAULT_RELATIONS: &[&str] = &[
     "USES_LITERAL",
 ];
 
-async fn graph(State(engine): State<AppState>, Query(q): Query<GraphQ>) -> Result<Json<Value>, ApiError> {
+async fn graph(Eng(engine): Eng, Query(q): Query<GraphQ>) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let conn = engine.reader()?;
         let rels: Vec<String> = q
@@ -327,7 +340,7 @@ struct TreeQ {
 }
 
 /// Children of a hierarchy item (roots when `id` is empty), plus the item's ancestor path.
-async fn tree_children(State(engine): State<AppState>, Query(q): Query<TreeQ>) -> Result<Json<Value>, ApiError> {
+async fn tree_children(Eng(engine): Eng, Query(q): Query<TreeQ>) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let conn = engine.reader()?;
         let tree = tree::get(&conn)?;
@@ -376,7 +389,7 @@ struct RollupReq {
 }
 
 /// Relations aggregated onto the currently visible hierarchy items.
-async fn rollup(State(engine): State<AppState>, Json(req): Json<RollupReq>) -> Result<Json<Value>, ApiError> {
+async fn rollup(Eng(engine): Eng, Json(req): Json<RollupReq>) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let conn = engine.reader()?;
         let tree = tree::get(&conn)?;
@@ -389,7 +402,7 @@ async fn rollup(State(engine): State<AppState>, Json(req): Json<RollupReq>) -> R
     .await
 }
 
-async fn node_detail(State(engine): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+async fn node_detail(Eng(engine): Eng, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let conn = engine.reader()?;
         let Some(n) = query::node(&conn, &id)? else {
@@ -445,7 +458,7 @@ async fn node_detail(State(engine): State<AppState>, Path(id): Path<String>) -> 
     .await
 }
 
-async fn run_tool(State(engine): State<AppState>, Path(name): Path<String>, Json(args): Json<Value>) -> Result<Json<Value>, ApiError> {
+async fn run_tool(Eng(engine): Eng, Path(name): Path<String>, Json(args): Json<Value>) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let (text, is_error) = codegraph_mcp::call_tool(&engine, &name, args);
         Ok(Json(json!({ "text": text, "isError": is_error })))
@@ -453,7 +466,7 @@ async fn run_tool(State(engine): State<AppState>, Path(name): Path<String>, Json
     .await
 }
 
-async fn reindex(State(engine): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn reindex(Eng(engine): Eng) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let stats = engine.reindex_all(false)?;
         Ok(Json(serde_json::to_value(stats)?))
@@ -462,7 +475,7 @@ async fn reindex(State(engine): State<AppState>) -> Result<Json<Value>, ApiError
 }
 
 /// Dashboard data: graph statistics plus the lists used by the sidebar views.
-async fn overview(State(engine): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn overview(Eng(engine): Eng) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let conn = engine.reader()?;
         let status = engine.status()?;
@@ -540,7 +553,7 @@ async fn overview(State(engine): State<AppState>) -> Result<Json<Value>, ApiErro
 }
 
 /// Source lines of a symbol (read from disk; the freshness loop keeps ranges current).
-async fn source(State(engine): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+async fn source(Eng(engine): Eng, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
     blocking(move || {
         let conn = engine.reader()?;
         let Some(n) = query::node(&conn, &id)? else {

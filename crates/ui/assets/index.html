@@ -34,6 +34,7 @@
         <div class="status-pill" id="status" role="status">
           <span class="dot"></span><span class="status-text" data-i18n="status.connecting">Connecting…</span>
         </div>
+        <button class="icon-btn" id="btn-project" data-i18n-title="picker.switch"><i data-icon="folder"></i></button>
         <button class="icon-btn" id="btn-reindex" data-i18n-title="cmd.reindex"><i data-icon="refresh"></i></button>
         <div class="select-wrap" data-i18n-title="lang.label">
           <i data-icon="globe"></i>
@@ -140,6 +141,20 @@
         <span><kbd class="kbd">↵</kbd> <span data-i18n="palette.hintOpen">open</span></span>
         <span><kbd class="kbd">Esc</kbd> <span data-i18n="palette.hintClose">close</span></span>
       </div>
+    </div>
+  </div>
+
+  <div class="picker-backdrop" id="picker" hidden>
+    <div class="picker" role="dialog" aria-modal="true" aria-labelledby="picker-title">
+      <div class="picker-head">
+        <span class="brand-mark"><i data-icon="logo" data-size="18"></i></span>
+        <div class="picker-head-text">
+          <h2 id="picker-title" data-i18n="picker.title">Open a project</h2>
+          <p data-i18n="picker.subtitle">Choose a project folder to index and explore.</p>
+        </div>
+        <button class="icon-btn" id="picker-close" data-i18n-title="insp.close"><i data-icon="x"></i></button>
+      </div>
+      <div class="picker-body" id="picker-body"></div>
     </div>
   </div>
 

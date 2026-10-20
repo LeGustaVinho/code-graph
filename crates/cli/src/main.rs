@@ -10,10 +10,15 @@ use codegraph_graph::{index_project, IndexOptions};
 use codegraph_mcp::Engine;
 
 #[derive(Parser)]
-#[command(name = "codegraph", version, about = "Deep semantic code graph: indexer, MCP server (stdio) and local graph explorer")]
+#[command(
+    name = "codegraph",
+    version,
+    about = "Deep semantic code graph: indexer, MCP server (stdio) and local graph explorer",
+    after_help = "Run without a command to open the Graph Explorer and pick a project folder in the browser."
+)]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -94,12 +99,21 @@ fn root_or_cwd(p: Option<PathBuf>) -> Result<PathBuf> {
 fn init_logging(default: &str) {
     let filter =
         tracing_subscriber::EnvFilter::try_from_env("CODEGRAPH_LOG").unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).with_target(false).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        // The classic Windows console (e.g. a double-clicked .exe) prints ANSI codes verbatim.
+        .with_ansi(!cfg!(windows) && std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .try_init();
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.cmd {
+    let Some(cmd) = cli.cmd else {
+        return launcher();
+    };
+    match cmd {
         Cmd::Index { path, rebuild, json } => {
             init_logging("warn");
             let root = root_or_cwd(path)?;
@@ -149,7 +163,7 @@ fn main() -> Result<()> {
                 open_browser(&url);
             }
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-            rt.block_on(codegraph_ui::serve(engine, addr))?;
+            rt.block_on(codegraph_ui::serve(Some(engine), addr))?;
         }
         Cmd::Query { tool, args, root } => {
             init_logging("warn");
@@ -194,6 +208,33 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// No command (e.g. the executable was double-clicked): serve the explorer without a
+/// project on the first free local port and let the browser page pick the folder.
+fn launcher() -> Result<()> {
+    init_logging("info");
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(async {
+        let mut listener = None;
+        for port in 4321..4341 {
+            if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                listener = Some(l);
+                break;
+            }
+        }
+        let listener = match listener {
+            Some(l) => l,
+            None => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.context("no free local port")?,
+        };
+        let url = format!("http://localhost:{}", listener.local_addr()?.port());
+        eprintln!("CodeGraph Explorer: {url}");
+        eprintln!("Choose a project folder in the browser. Keep this window open; close it (or press Ctrl+C) to stop.");
+        if std::env::var_os("CODEGRAPH_NO_OPEN").is_none() {
+            open_browser(&url);
+        }
+        codegraph_ui::serve_on(None, listener).await
+    })
 }
 
 fn dump(n: tree_sitter::Node, src: &str, depth: usize, field: Option<&str>) {

@@ -42,6 +42,17 @@
         "CODEGRAPH_UI_DEV": "crates/ui/assets"
       },
       "port": 4323
+    },
+    {
+      "name": "codegraph-launcher",
+      "runtimeExecutable": "target/debug/codegraph.exe",
+      "runtimeArgs": [],
+      "env": {
+        "CODEGRAPH_UI_DEV": "crates/ui/assets",
+        "CODEGRAPH_NO_OPEN": "1",
+        "CODEGRAPH_CONFIG_DIR": "target/launcher-config"
+      },
+      "port": 4321
     }
   ]
 }

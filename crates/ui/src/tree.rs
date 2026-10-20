@@ -365,7 +365,12 @@ static CACHE: OnceLock<Mutex<Cached>> = OnceLock::new();
 
 pub fn get(conn: &Connection) -> rusqlite::Result<Arc<Tree>> {
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM node", [], |r| r.get(0))?;
-    let stamp = format!("{}#{count}", codegraph_graph::store::get_meta(conn, "last_indexed_at").unwrap_or_default());
+    // Keyed by database too: the explorer can switch projects at runtime.
+    let stamp = format!(
+        "{}#{}#{count}",
+        conn.path().unwrap_or_default(),
+        codegraph_graph::store::get_meta(conn, "last_indexed_at").unwrap_or_default()
+    );
     let cell = CACHE.get_or_init(|| Mutex::new(None));
     if let Some((s, t)) = cell.lock().unwrap().as_ref() {
         if *s == stamp {

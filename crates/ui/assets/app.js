@@ -2041,14 +2041,225 @@
   });
   new ResizeObserver(() => cy.resize()).observe($("#cy"));
 
+  // ------------------------------------------------------------------ project picker
+  // Lets people open (or switch to) a project folder: recent projects, a folder
+  // browser and a path field. The server indexes the folder, then the page reloads.
+  const picker = $("#picker");
+  const pickerBody = $("#picker-body");
+  const pk = { info: null, path: null, listing: null, error: "", timer: 0, required: false };
+
+  async function openPicker({ required = false } = {}) {
+    pk.required = required;
+    $("#picker-close").hidden = required;
+    picker.hidden = false;
+    try {
+      pk.info = await api("/api/project");
+    } catch (e) {
+      pk.error = e.message;
+    }
+    if (pk.info?.opening) return watchOpening();
+    if (pk.path === null) {
+      const open = pk.info?.open?.root;
+      const recent = pk.info?.recent?.find((r) => r.exists)?.path;
+      const home = pk.info?.places?.find((p) => p.key === "home")?.path;
+      pk.path = parentOf(open || recent) ?? home ?? "";
+    }
+    await browse(pk.path);
+    $("#picker-path")?.focus();
+  }
+
+  function closePicker() {
+    if (pk.required) return;
+    picker.hidden = true;
+    clearTimeout(pk.timer);
+  }
+
+  /** Parent folder of a "/"-separated path ("D:/a/b" → "D:/a", "D:/a" → "D:/"). */
+  function parentOf(p) {
+    if (!p) return null;
+    const s = p.replace(/\/+$/, "");
+    const i = s.lastIndexOf("/");
+    if (i < 0) return null;
+    return s.indexOf("/") === i ? s.slice(0, i + 1) : s.slice(0, i);
+  }
+
+  async function browse(path) {
+    pk.path = path;
+    try {
+      pk.listing = await api(`/api/fs?path=${encodeURIComponent(path)}`);
+      pk.error = "";
+    } catch (e) {
+      pk.listing = null;
+      pk.error = e.message;
+    }
+    renderPicker();
+  }
+
+  /** Breadcrumb segments with the path each one opens. */
+  function crumbsFor(path) {
+    if (!path) return [];
+    const absolute = path.startsWith("/");
+    const parts = path.split("/").filter(Boolean);
+    let acc = absolute ? "" : null;
+    return parts.map((p, i) => {
+      acc = acc === null ? p + "/" : `${acc}${acc.endsWith("/") ? "" : "/"}${p}`;
+      if (absolute && i === 0) acc = "/" + p;
+      return { name: p, path: acc };
+    });
+  }
+
+  function renderPicker() {
+    const info = pk.info || {};
+    const l = pk.listing;
+    const recent = (info.recent || [])
+      .map((r) => `<div class="pk-item ${r.exists ? "" : "missing"}" ${r.exists ? `data-pk-open="${esc(r.path)}"` : ""} title="${esc(r.path)}">
+          <span class="pk-icon">${icon("folder", 16)}</span>
+          <div class="main"><div class="title">${esc(r.name)}</div><div class="sub">${esc(r.path)}</div></div>
+          <span class="meta">${r.exists ? esc(relTime(r.last_opened * 1000)) : esc(t("picker.missing"))}</span>
+          <button class="icon-btn sm" data-pk-forget="${esc(r.path)}" title="${esc(t("picker.forget"))}">${icon("x", 13)}</button>
+        </div>`)
+      .join("");
+    const places = (info.places || [])
+      .map((p) => `<button class="pk-place" data-pk-browse="${esc(p.path)}" title="${esc(p.path)}">${icon(p.key === "cwd" ? "target" : "folder", 14)}<span>${esc(t("place." + p.key))}</span></button>`)
+      .join("");
+    const crumbs = [`<button class="crumb" data-pk-browse="">${esc(t("picker.drives"))}</button>`]
+      .concat(crumbsFor(l?.path || "").map((c) => `<span class="crumb-sep">${icon("chevron", 12)}</span><button class="crumb" data-pk-browse="${esc(c.path)}">${esc(c.name)}</button>`))
+      .join("");
+    const entries = l
+      ? l.entries
+          .map((e) => `<div class="pk-item" data-pk-browse="${esc(e.path)}" title="${esc(e.path)}">
+              <span class="pk-icon">${icon("folder", 16)}</span>
+              <div class="main"><div class="title">${esc(e.name)}</div></div>
+              ${e.indexed ? `<span class="pk-badge">${esc(t("picker.indexed"))}</span>` : ""}
+              <button class="btn sm" data-pk-open="${esc(e.path)}">${esc(t("picker.open"))}</button>
+            </div>`)
+          .join("")
+      : "";
+    const here = l && l.path;
+    pickerBody.innerHTML = `
+      <form class="pk-path" id="pk-form">
+        <input class="text-input" id="picker-path" autocomplete="off" spellcheck="false" placeholder="${esc(t("picker.pathPlaceholder"))}" value="${esc(l?.path || "")}" />
+        <button class="btn primary" type="submit">${icon("entry", 14)}${esc(t("picker.open"))}</button>
+      </form>
+      ${pk.error ? `<div class="pk-error">${icon("alert", 14)}<span>${esc(pk.error)}</span></div>` : ""}
+      <div class="pk-cols">
+        <section class="pk-side">
+          <div class="section-title">${esc(t("picker.recent"))}</div>
+          <div class="pk-list">${recent || `<div class="empty-note">${esc(t("picker.noRecent"))}</div>`}</div>
+          <div class="section-title">${esc(t("picker.places"))}</div>
+          <div class="pk-places">${places}</div>
+        </section>
+        <section class="pk-browser">
+          <div class="pk-browser-head">
+            <div class="crumb-trail">${crumbs}</div>
+            ${here ? `<button class="btn primary sm" data-pk-open="${esc(l.path)}">${icon("check", 13)}${esc(t("picker.openThis"))}</button>` : ""}
+          </div>
+          <div class="pk-list scroll">${entries || `<div class="empty-note">${esc(t("picker.empty"))}</div>`}</div>
+          ${l?.truncated ? `<div class="empty-note">${esc(t("picker.truncated"))}</div>` : ""}
+          <div class="pk-hint">${esc(t("picker.hint"))}</div>
+        </section>
+      </div>`;
+    $("#pk-form").addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      const v = $("#picker-path").value.trim();
+      if (v) openProject(v);
+    });
+  }
+
+  async function openProject(path) {
+    try {
+      await api("/api/project/open", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) });
+      watchOpening();
+    } catch (e) {
+      pk.error = e.message;
+      renderPicker();
+    }
+  }
+
+  /** Shows indexing progress and reloads once the server has switched projects. */
+  async function watchOpening() {
+    clearTimeout(pk.timer);
+    let info;
+    try {
+      info = await api("/api/project");
+    } catch {
+      pk.timer = setTimeout(watchOpening, 1000);
+      return;
+    }
+    pk.info = info;
+    const op = info.opening;
+    if (!op) {
+      if (info.open) location.reload();
+      else renderPicker();
+      return;
+    }
+    if (op.error) {
+      pickerBody.innerHTML = `<div class="pk-progress">
+        <div class="pk-error">${icon("alert", 16)}<div><b>${esc(t("picker.failed"))}</b><div class="sub">${esc(op.path)}</div><div class="sub">${esc(op.error)}</div></div></div>
+        <div class="action-row"><button class="btn primary" data-pk-open="${esc(op.path)}">${esc(t("picker.retry"))}</button><button class="btn" data-pk-back>${esc(t("picker.back"))}</button></div></div>`;
+      return;
+    }
+    const name = op.path.split("/").filter(Boolean).pop() || op.path;
+    pickerBody.innerHTML = `<div class="pk-progress">
+      <div class="pk-spinner"></div>
+      <div class="pk-progress-title">${esc(t("picker.opening", { p: name }))}</div>
+      <div class="sub mono">${esc(op.path)}</div>
+      <div class="sub">${esc(t("picker.elapsed", { s: Math.round(op.elapsed_ms / 1000) }))}</div>
+      <div class="sub">${esc(t("picker.openingHint"))}</div></div>`;
+    pk.timer = setTimeout(watchOpening, 700);
+  }
+
+  picker.addEventListener("click", (ev) => {
+    const el = ev.target;
+    if (el === picker) return closePicker();
+    const forget = el.closest("[data-pk-forget]");
+    if (forget) {
+      ev.stopPropagation();
+      return api("/api/project/forget", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: forget.dataset.pkForget }) })
+        .then(() => api("/api/project"))
+        .then((i) => {
+          pk.info = i;
+          renderPicker();
+        })
+        .catch((e) => toast(e.message, "error"));
+    }
+    if (el.closest("[data-pk-back]")) {
+      pk.info = { ...pk.info, opening: null };
+      return browse(pk.path || "");
+    }
+    const open = el.closest("[data-pk-open]");
+    if (open) return openProject(open.dataset.pkOpen);
+    const nav = el.closest("[data-pk-browse]");
+    if (nav) return browse(nav.dataset.pkBrowse);
+  });
+  picker.addEventListener("dblclick", (ev) => {
+    const row = ev.target.closest(".pk-browser .pk-item[data-pk-browse]");
+    if (row) openProject(row.dataset.pkBrowse);
+  });
+  $("#picker-close").addEventListener("click", closePicker);
+  $("#btn-project").addEventListener("click", () => openPicker());
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape" && !picker.hidden) closePicker();
+  });
+
   // ------------------------------------------------------------------ boot
   hydrateIcons();
   renderThemeIcon();
   renderLangSelect();
   renderChrome();
   renderInspector();
-  loadOverview().then(() => (state.lastIndexed = state.status?.stats?.last_indexed_at ?? null));
-  loadStage();
-  setInterval(pollStatus, 1500);
-  setInterval(() => renderSidebar(), 30000);
+  api("/api/project")
+    .then((info) => {
+      if (!info.open) {
+        $("#project-name").textContent = t("picker.none");
+        $("#status").className = "status-pill";
+        $("#status .status-text").textContent = t("picker.none");
+        return openPicker({ required: true });
+      }
+      loadOverview().then(() => (state.lastIndexed = state.status?.stats?.last_indexed_at ?? null));
+      loadStage();
+      setInterval(pollStatus, 1500);
+      setInterval(() => renderSidebar(), 30000);
+    })
+    .catch((e) => toast(e.message, "error"));
 })();
