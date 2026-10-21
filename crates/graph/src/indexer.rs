@@ -442,6 +442,18 @@ fn write_and_resolve(root: &Path, conn: &mut Connection, stats: &mut IndexStats,
     if !index.js_paths.is_empty() {
         // tsconfig `paths` / `baseUrl` and workspace packages drive JS/TS module resolution.
         index.js = codegraph_semantic::jsconfig::load(root);
+        // Fastify `decorate('db', new Db())` facts (stored with the route prefixes).
+        let mut st = tx.prepare("SELECT prefix FROM route_prefix WHERE prefix LIKE 'decorate:%' ORDER BY file_path, prefix")?;
+        let rows: Vec<String> = st.query_map([], |r| r.get(0))?.flatten().collect();
+        for row in rows {
+            let mut parts = row.trim_start_matches("decorate:").splitn(3, '|');
+            if let (Some(owner), Some(member), Some(ty)) = (parts.next(), parts.next(), parts.next()) {
+                index.decorations.insert((owner.to_string(), member.to_string()), ty.to_string());
+            }
+        }
+        // Phaser scene keys, for `this.scene.get('UI')` receivers.
+        let rows = load_key_rows(&tx)?;
+        index.scene_keys = codegraph_semantic::phaser::scene_keys(&index, &rows);
     }
     if let Some(asm) = &assemblies.unity {
         // Editor-only assemblies (runtime code never resolves into them).
@@ -647,6 +659,23 @@ pub fn load_index(conn: &Connection, assembly_of: &dyn Fn(&str) -> String, root:
     Ok(SymbolIndex::build(syms, imports, di, assembly_of, rust_crates))
 }
 
+/// Scene keys, scene transitions and event emit / listen sites (stored as literals).
+fn load_key_rows(tx: &Transaction) -> Result<Vec<codegraph_semantic::phaser::KeyRow>> {
+    let mut st = tx.prepare(
+        "SELECT literal_type, literal_value, file_path, enclosing_node_id, line_number FROM literal_occurrence          WHERE literal_type IN ('scene-key', 'scene-ref', 'event-emit', 'event-listen') ORDER BY file_path, line_number, literal_value",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok(codegraph_semantic::phaser::KeyRow {
+            kind: r.get(0)?,
+            value: r.get(1)?,
+            file: r.get(2)?,
+            enclosing: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            line: r.get::<_, Option<u32>>(4)?.unwrap_or(0),
+        })
+    })?;
+    Ok(rows.flatten().collect())
+}
+
 fn load_call_rows(tx: &Transaction) -> Result<Vec<CallRow>> {
     let mut st = tx.prepare(
         "SELECT source_id, target_id, confidence, line_number, metadata, source_file FROM edge WHERE relation = 'CALLS' AND target_id IS NOT NULL \
@@ -681,8 +710,15 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex, progress: &Progress) 
          DELETE FROM data_model;
          DELETE FROM data_model_field;
          UPDATE node SET kind = orig_kind WHERE kind <> orig_kind;
-         UPDATE node SET is_entrypoint = 0, entry_kind = NULL WHERE entry_kind LIKE 'unity message %';",
+         UPDATE node SET is_entrypoint = 0, entry_kind = NULL WHERE entry_kind LIKE 'unity message %' OR entry_kind LIKE 'phaser %';",
     )?;
+    // Phaser hooks (`create`, `update`, `preUpdate`, …) and scenes, through real inheritance.
+    {
+        let mut st = tx.prepare_cached("UPDATE node SET is_entrypoint = 1, entry_kind = ?2 WHERE id = ?1 AND is_entrypoint = 0")?;
+        for (id, kind) in codegraph_semantic::phaser::entrypoints(index) {
+            st.execute(params![id, kind])?;
+        }
+    }
     // Unity messages (`Update`, `OnPointerClick`, …) confirmed through the real inheritance
     // chain: base classes may live in other files, so this is a project-wide property.
     {
@@ -747,7 +783,29 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex, progress: &Progress) 
         })?;
         rows.flatten().collect()
     };
-    edges.extend(global::http_edges(index, &resolved, &calls));
+    let http = global::http_edges(index, &resolved, &calls);
+    edges.extend(global::http_test_edges(index, &http));
+    let testids: Vec<global::TestIdRow> = {
+        let mut st = tx.prepare(
+            "SELECT literal_value, literal_type, file_path, enclosing_node_id, line_number FROM literal_occurrence              WHERE literal_type IN ('testid', 'testid-query') ORDER BY file_path, line_number, literal_value",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(global::TestIdRow {
+                value: r.get(0)?,
+                query: r.get::<_, String>(1)? == "testid-query",
+                file: r.get(2)?,
+                enclosing: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                line: r.get::<_, Option<u32>>(4)?.unwrap_or(0),
+            })
+        })?;
+        rows.flatten().collect()
+    };
+    edges.extend(global::testid_edges(index, &testids));
+    // Phaser scene transitions and event emit → listener flow.
+    let keys = load_key_rows(tx)?;
+    edges.extend(codegraph_semantic::phaser::scene_edges(index, &keys));
+    edges.extend(codegraph_semantic::phaser::event_edges(index, &keys));
+    edges.extend(http);
     tracing::debug!("  http: {} ms", tg.elapsed().as_millis());
     progress.tick();
     let tg = Instant::now();

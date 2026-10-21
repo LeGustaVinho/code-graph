@@ -1,6 +1,6 @@
 ---
 name: codegraph
-description: Read and navigate source code through the CodeGraph semantic index instead of opening whole files. Use whenever you need to read, explore, search or understand files CodeGraph supports — C# (.cs), TypeScript (.ts/.tsx/.mts/.cts, not .d.ts), JavaScript (.js/.jsx/.mjs/.cjs, not .min.js), Python (.py/.pyi), Rust (.rs), Prisma (.prisma) and config files (appsettings*.json, local.settings.json, .env, .env.*) — or to find symbols, callers/callees, usages, implementations, DI bindings, routes, data models, config keys, tests for a symbol, or the impact of a change. Prefer it over Read/cat/grep for these files.
+description: Read and navigate source code through the CodeGraph semantic index instead of opening whole files. Use whenever you need to read, explore, search or understand files CodeGraph supports — C# (.cs), TypeScript (.ts/.tsx/.mts/.cts, not .d.ts), JavaScript (.js/.jsx/.mjs/.cjs, not .min.js), Vue / Svelte components (.vue/.svelte), Python (.py/.pyi), Rust (.rs), Prisma (.prisma) and config files (appsettings*.json, local.settings.json, .env, .env.*) — or to find symbols, callers/callees, usages, implementations, DI bindings, routes, data models, config keys, tests for a symbol, or the impact of a change. Prefer it over Read/cat/grep for these files.
 ---
 
 # CodeGraph: read code through the graph
@@ -14,6 +14,7 @@ CodeGraph parses a repository into a semantic graph (symbols, calls, types, DI, 
 | C# (incl. Unity) | `.cs` |
 | TypeScript | `.ts` `.tsx` `.mts` `.cts` — **not** `.d.ts` |
 | JavaScript | `.js` `.jsx` `.mjs` `.cjs` — **not** `.min.js` |
+| Vue / Svelte | `.vue` `.svelte` (script blocks + the components and bindings the template uses) |
 | Python | `.py` `.pyi` |
 | Rust | `.rs` |
 | Prisma | `.prisma` |

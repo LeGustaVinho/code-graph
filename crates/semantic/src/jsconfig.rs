@@ -24,18 +24,50 @@ pub struct JsPackage {
     pub dir: String,
     /// `source` / `module` / `main` / `types` / `exports["."]` entry files.
     pub entries: Vec<String>,
+    /// `exports` subpaths: `utils` → `src/utils/index.ts`, `features/*` → `src/features/*`.
+    pub subpaths: Vec<(String, String)>,
+}
+
+/// Vite dev-server proxy of the app in `dir`: frontend calls to `prefix…` reach the backend
+/// (without the prefix when `strip`).
+#[derive(Clone, Debug, Default)]
+pub struct DevProxy {
+    pub dir: String,
+    pub prefix: String,
+    pub strip: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct JsProject {
     pub configs: Vec<TsPaths>,
     pub packages: Vec<JsPackage>,
+    pub proxies: Vec<DevProxy>,
+}
+
+fn governs(dir: &str, file: &str) -> bool {
+    dir.is_empty() || file.starts_with(&format!("{dir}/"))
 }
 
 impl JsProject {
     /// The config governing `file`: the one in the nearest enclosing directory.
     pub fn nearest(&self, file: &str) -> Option<&TsPaths> {
-        self.configs.iter().filter(|c| c.dir.is_empty() || file.starts_with(&format!("{}/", c.dir))).max_by_key(|c| c.dir.len())
+        self.governing(file).into_iter().next()
+    }
+
+    /// Every config enclosing `file`, nearest first (a Vite config in `web/` and the root
+    /// tsconfig both apply to `web/src/x.ts`).
+    pub fn governing(&self, file: &str) -> Vec<&TsPaths> {
+        let mut v: Vec<&TsPaths> = self.configs.iter().filter(|c| governs(&c.dir, file)).collect();
+        v.sort_by_key(|c| std::cmp::Reverse(c.dir.len()));
+        v
+    }
+
+    /// `url` as the backend sees it when `file`'s dev server proxies it (`/api/x` → `/x`).
+    pub fn proxied_url(&self, file: &str, url: &str) -> Option<String> {
+        self.proxies
+            .iter()
+            .filter(|p| p.strip && governs(&p.dir, file))
+            .find_map(|p| url.strip_prefix(&p.prefix).filter(|r| r.is_empty() || r.starts_with('/')).map(|r| format!("/{}", r.trim_start_matches('/'))))
     }
 }
 
@@ -68,6 +100,27 @@ pub fn load(root: &Path) -> JsProject {
             if let Some(p) = read_json(&root.join(&rel)).and_then(|v| package(&v, &dir)) {
                 project.packages.push(p);
             }
+        } else if codegraph_core::extract::vite::is_vite_config(&name) {
+            let Ok(src) = std::fs::read_to_string(root.join(&rel)) else { continue };
+            let vite = codegraph_core::extract::vite::parse_vite_config(&src);
+            let join = |p: &str| normalize_path(&if dir.is_empty() { p.to_string() } else { format!("{dir}/{p}") });
+            // `'@': 'src'` maps `@` and `@/…`; an alias ending in `/` only prefixes.
+            let mut paths = Vec::new();
+            for (alias, target) in &vite.aliases {
+                let t = join(target);
+                if let Some(a) = alias.strip_suffix('/') {
+                    paths.push((format!("{a}/*"), vec![format!("{t}/*")]));
+                } else {
+                    paths.push((alias.clone(), vec![t.clone()]));
+                    paths.push((format!("{alias}/*"), vec![format!("{t}/*")]));
+                }
+            }
+            match project.configs.iter_mut().find(|c| c.dir == dir) {
+                Some(c) => c.paths.extend(paths),
+                None if !paths.is_empty() => project.configs.push(TsPaths { dir: dir.clone(), base_url: None, paths }),
+                None => {}
+            }
+            project.proxies.extend(vite.proxies.into_iter().map(|p| DevProxy { dir: dir.clone(), prefix: p.prefix, strip: p.strip }));
         } else if let Some(cfg) = tsconfig(root, &rel, 0) {
             if cfg.base_url.is_some() || !cfg.paths.is_empty() {
                 project.configs.push(TsPaths { dir, ..cfg });
@@ -90,7 +143,11 @@ fn collect(root: &Path, dir: &Path, depth: usize, rules: &codegraph_core::walk::
             if !name.starts_with('.') && !rules.dir_ignored(&child) {
                 collect(root, &e.path(), depth + 1, rules, out);
             }
-        } else if name == "package.json" || name == "jsconfig.json" || (name.starts_with("tsconfig") && name.ends_with(".json")) {
+        } else if name == "package.json"
+            || name == "jsconfig.json"
+            || (name.starts_with("tsconfig") && name.ends_with(".json"))
+            || codegraph_core::extract::vite::is_vite_config(&name)
+        {
             let rel = e.path().strip_prefix(root).map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
             out.push(rel);
         }
@@ -151,17 +208,34 @@ fn package(v: &Value, dir: &str) -> Option<JsPackage> {
             entries.push(e.trim_start_matches("./").to_string());
         }
     }
-    if let Some(dot) = v.get("exports").and_then(|e| e.get(".").or(Some(e))) {
-        let mut stack = vec![dot];
-        while let Some(x) = stack.pop() {
-            match x {
-                Value::String(s) if s.starts_with("./") => entries.push(s.trim_start_matches("./").to_string()),
-                Value::Object(o) => stack.extend(o.values()),
-                _ => {}
+    let exports = v.get("exports");
+    let has_subpaths = exports.and_then(|e| e.as_object()).map(|o| o.keys().any(|k| k.starts_with("./") && k != "./")).unwrap_or(false);
+    // `"exports": { ".": …, "./utils": … }` or a bare conditions object / string for ".".
+    let dot = if has_subpaths { exports.and_then(|e| e.get(".")) } else { exports };
+    entries.extend(dot.map(export_targets).unwrap_or_default());
+    let mut subpaths = Vec::new();
+    if has_subpaths {
+        for (key, target) in exports.and_then(|e| e.as_object()).into_iter().flatten() {
+            if let (Some(sub), Some(t)) = (key.strip_prefix("./").filter(|k| !k.is_empty()), export_targets(target).into_iter().next()) {
+                subpaths.push((sub.to_string(), t));
             }
         }
     }
-    Some(JsPackage { name, dir: dir.to_string(), entries })
+    Some(JsPackage { name, dir: dir.to_string(), entries, subpaths })
+}
+
+/// Files an `exports` value points at (a path, or conditions: `{ types, import, default }`).
+fn export_targets(v: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![v];
+    while let Some(x) = stack.pop() {
+        match x {
+            Value::String(s) if s.starts_with("./") => out.push(s.trim_start_matches("./").to_string()),
+            Value::Object(o) => stack.extend(o.values().rev()),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -235,6 +309,19 @@ mod tests {
         let v: Value = serde_json::from_str(&strip_jsonc("{ // c\n \"a\": \"x//y\", /* b */ \"b\": [1, 2,], }")).unwrap();
         assert_eq!(v["a"], "x//y");
         assert_eq!(v["b"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn nearest_first_and_proxies() {
+        let p = JsProject {
+            configs: vec![TsPaths { dir: String::new(), ..Default::default() }, TsPaths { dir: "web".into(), ..Default::default() }],
+            packages: Vec::new(),
+            proxies: vec![DevProxy { dir: "web".into(), prefix: "/api".into(), strip: true }],
+        };
+        assert_eq!(p.governing("web/src/a.ts").iter().map(|c| c.dir.as_str()).collect::<Vec<_>>(), vec!["web", ""]);
+        assert_eq!(p.proxied_url("web/src/a.ts", "/api/users").as_deref(), Some("/users"));
+        assert_eq!(p.proxied_url("api/a.ts", "/api/users"), None);
+        assert_eq!(p.proxied_url("web/a.ts", "/apix"), None);
     }
 
     #[test]

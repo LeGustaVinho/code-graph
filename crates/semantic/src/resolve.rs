@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use codegraph_core::extract::clean_type;
+use codegraph_core::extract::{clean_type, element_type, is_array_type};
 use codegraph_core::{ImportKind, Language, RefKind, Reference, SymbolKind};
 use serde_json::json;
 
@@ -251,6 +251,19 @@ impl<'a> FileResolver<'a> {
         let module_id = self.index.syms[m].sym.id.clone();
         for imp in imps.clone() {
             if matches!(imp.kind, ImportKind::Using | ImportKind::UsingStatic) {
+                continue;
+            }
+            // Vite `import.meta.glob('./pages/*.tsx')`: every matching module is loaded.
+            if imp.module.contains('*') && self.lang != Language::Python && self.lang != Language::Rust {
+                for f in self.index.glob_js_files(self.file, &imp.module) {
+                    let t = self.index.exported_symbol(&f, "default", 0).or_else(|| self.index.module_of_file.get(&f).copied());
+                    if let Some(t) = t {
+                        let what = format!("import.meta.glob('{}')", imp.module);
+                        let e = Edge::new(&module_id, self.file, Some(self.target(t)), relation::IMPORTS, Confidence::Inferred, what, "import-linker", imp.line)
+                            .with_meta(json!({ "module": imp.module }));
+                        self.push(e);
+                    }
+                }
                 continue;
             }
             match self.index.resolve_module(self.file, &imp.module) {
@@ -586,6 +599,10 @@ impl<'a> FileResolver<'a> {
     /// recorded for `var x = repo.Find(id)` / `GetUser().Profile` / `(await svc.Load()).Name`.
     fn ref_type(&self, raw: &str, r: &Reference, depth: u32) -> TypeOf {
         let Some(rest) = raw.strip_prefix("@mt#") else {
+            // `users: User[]`: the receiver is the array (external), never a `User`.
+            if is_array_type(raw) {
+                return TypeOf::External;
+            }
             return match self.ty(raw, r) {
                 Resolved::One(t, c, ev) => TypeOf::Project(t, c, ev),
                 Resolved::None => TypeOf::External,
@@ -596,6 +613,11 @@ impl<'a> FileResolver<'a> {
             return TypeOf::Unknown;
         }
         let Some((owner_raw, member)) = rest.rsplit_once('#') else { return TypeOf::Unknown };
+        // `for (const o of this.orders)`: an element of the collection the member holds.
+        let (member, element) = match member.strip_suffix("!elem") {
+            Some(m) => (m, true),
+            None => (member, false),
+        };
         let (member, awaited) = match member.strip_suffix("!await") {
             Some(m) => (m, true),
             None => (member, false),
@@ -605,6 +627,13 @@ impl<'a> FileResolver<'a> {
             Some(m) => (m, true),
             None => (member, false),
         };
+        // Phaser `this.scene.get('UI')`: the scene class registered under that key.
+        if owner_raw == "@scene" {
+            return match self.index.scene_keys.get(member) {
+                Some(&t) => TypeOf::Project(t, Confidence::Inferred, format!("scene '{member}'")),
+                None => TypeOf::Unknown,
+            };
+        }
         // `@fn`: the declared return type of a free function visible from here.
         if owner_raw == "@fn" {
             let found = if self.lang == Language::Rust && member.contains("::") {
@@ -627,8 +656,14 @@ impl<'a> FileResolver<'a> {
             } else if awaited && matches!(clean_type(&ty).as_str(), "Promise" | "Task") {
                 ty = codegraph_core::extract::generic_args(&ty).into_iter().next().unwrap_or_default();
             }
+            if element {
+                ty = element_type(&ty).unwrap_or_default();
+            }
             if ty.is_empty() {
                 return TypeOf::Unknown;
+            }
+            if is_array_type(&ty) {
+                return TypeOf::External;
             }
             let file = fs.file.clone();
             return match self.index.resolve_type(&ty, &file) {
@@ -645,7 +680,14 @@ impl<'a> FileResolver<'a> {
         } else {
             match self.ref_type(owner_raw, r, depth + 1) {
                 TypeOf::Project(t, _, _) => t,
-                other => return other,
+                other => {
+                    // `fastify.db` on an external `FastifyInstance`: a `decorate('db', …)` member.
+                    let decorated = self.index.decorations.get(&(clean_type(owner_raw), member.to_string())).filter(|t| *t != "@fn");
+                    return match decorated.map(|t| (t.clone(), self.index.resolve_type(t, self.file))) {
+                        Some((t, Resolved::One(ty, c, _))) => TypeOf::Project(ty, c.weakest(Confidence::Inferred), format!("decorated {member}: {t}")),
+                        _ => other,
+                    };
+                }
             }
         };
         let found = self.index.members_named(owner, member).into_iter().find(|m| self.index.syms[*m].sym.type_ref.is_some());
@@ -665,7 +707,16 @@ impl<'a> FileResolver<'a> {
                 ty = codegraph_core::extract::generic_args(&ty).into_iter().next().unwrap_or_default();
             }
         }
-        if ty.is_empty() || matches!(clean_type(&ty).as_str(), "void" | "Task" | "ValueTask" | "Promise" | "UniTask" | "IEnumerator") {
+        if element {
+            match element_type(&ty) {
+                Some(e) => ty = e,
+                None => return TypeOf::Unknown,
+            }
+        }
+        if ty.is_empty()
+            || is_array_type(&ty)
+            || matches!(clean_type(&ty).as_str(), "void" | "Task" | "ValueTask" | "Promise" | "UniTask" | "IEnumerator")
+        {
             return TypeOf::External;
         }
         let file = ms.file.clone();
@@ -855,9 +906,28 @@ impl<'a> FileResolver<'a> {
                         }
                         TypeOf::Unknown => {}
                         TypeOf::External => {
+                            // `fastify.authenticate(…)`: a function attached with `decorate`.
+                            if self.index.decorations.get(&(clean_type(rt), r.name.clone())).map(|t| t == "@fn").unwrap_or(false) {
+                                // Declared by a plugin elsewhere, never imported where it is used.
+                                let attr = format!("decorate('{}')", r.name);
+                                let decl: Vec<usize> = self
+                                    .index
+                                    .by_name
+                                    .get(&r.name)
+                                    .into_iter()
+                                    .flatten()
+                                    .copied()
+                                    .filter(|i| self.index.syms[*i].sym.attrs.contains(&attr))
+                                    .collect();
+                                if let [f] = decl.as_slice() {
+                                    let how = format!("decorated function {}.{}", clean_type(rt), r.name);
+                                    self.emit_call(r, *f, Confidence::Inferred, how, "call-resolver");
+                                    return;
+                                }
+                            }
                             // External type (HttpClient, ILogger, Transform, ...): only project
                             // extension methods on it can be targets.
-                            if !rt.starts_with("@mt#") {
+                            if !rt.starts_with("@mt#") && !is_array_type(rt) {
                                 self.extension_call(r, None, rt);
                             }
                             return;

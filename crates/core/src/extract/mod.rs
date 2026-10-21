@@ -7,7 +7,9 @@ pub mod preprocessor;
 pub mod prisma;
 pub mod python;
 pub mod rust;
+pub mod sfc;
 pub mod typescript;
+pub mod vite;
 
 use std::collections::{BTreeSet, HashMap};
 use tree_sitter::Node;
@@ -76,19 +78,24 @@ fn extract_all_branches(path: &str, lang: Language, source: &str) -> FileFacts {
         // Conditional compilation: index every branch (see `preprocessor`).
         let layout = preprocessor::Layout::parse(source);
         if layout.has_directives() {
-            let mut facts = extract_source(path, lang, &layout.render(source, 0), line_count);
+            let mut facts = extract_source(path, lang, &layout.render(source, 0), line_count, None);
             for variant in 1..layout.variants() {
-                let alt = extract_source(path, lang, &layout.render(source, variant), line_count);
+                let alt = extract_source(path, lang, &layout.render(source, variant), line_count, None);
                 preprocessor::merge_variant(&mut facts, alt, &layout, variant);
             }
             preprocessor::tag_conditions(&mut facts, &layout);
             return facts;
         }
     }
-    extract_source(path, lang, source, line_count)
+    if let Some(kind) = sfc::sfc_kind(path) {
+        // Vue / Svelte: the script blocks are TypeScript, the markup is scanned afterwards.
+        let script = sfc::script_source(source);
+        return extract_source(path, lang, &script, line_count, Some((source, kind)));
+    }
+    extract_source(path, lang, source, line_count, None)
 }
 
-fn extract_source(path: &str, lang: Language, source: &str, line_count: u32) -> FileFacts {
+fn extract_source(path: &str, lang: Language, source: &str, line_count: u32, markup: Option<(&str, sfc::SfcKind)>) -> FileFacts {
     let mut ctx = Ctx::new(path, lang, source, line_count);
     match lang {
         Language::Prisma => prisma::extract(&mut ctx),
@@ -106,6 +113,9 @@ fn extract_source(path: &str, lang: Language, source: &str, line_count: u32) -> 
                     Language::Rust => rust::extract(&mut ctx, root),
                     _ => typescript::extract(&mut ctx, root),
                 }
+            }
+            if let Some((original, kind)) = markup {
+                sfc::extract_markup(&mut ctx, original, kind);
             }
         }
     }
@@ -478,7 +488,8 @@ impl<'a> Ctx<'a> {
                 return;
             }
         }
-        let receiver_type = receiver_type.map(|t| clean_type(&t)).filter(|t| !t.is_empty());
+        // An array receiver (`users: User[]`) is never typed as its element.
+        let receiver_type = receiver_type.map(|t| receiver_type_name(&t)).filter(|t| !t.is_empty());
         let root_type = match (&receiver, &receiver_type) {
             (Some(r), None) if r.contains('.') => {
                 let head = r.split(['.', '?', '[', '(', '!']).next().unwrap_or("").trim();
@@ -489,7 +500,7 @@ impl<'a> Ctx<'a> {
                 } else {
                     None
                 };
-                t.map(|t| clean_type(&t)).filter(|t| !t.is_empty())
+                t.map(|t| receiver_type_name(&t)).filter(|t| !t.is_empty())
             }
             _ => None,
         };
@@ -728,6 +739,26 @@ fn rust_pointee(t: &str) -> Option<String> {
     generic_args(t).into_iter().next()
 }
 
+/// Type of a receiver as recorded on a reference: [`clean_type`], except that arrays stay arrays.
+pub fn receiver_type_name(t: &str) -> String {
+    if is_array_type(t) {
+        "Array".into()
+    } else {
+        clean_type(t)
+    }
+}
+
+/// Array syntax (`User[]`, `readonly User[]`, `User[] | null`): the value is the array, so
+/// [`clean_type`] (which reduces it to `User`) must not be used to type a receiver.
+pub fn is_array_type(t: &str) -> bool {
+    let t = t.trim().trim_start_matches(':').trim();
+    if t.ends_with("[]") {
+        return true;
+    }
+    let first = t.split('|').map(str::trim).find(|p| !matches!(*p, "" | "null" | "undefined" | "None")).unwrap_or(t);
+    first.trim_start_matches("readonly ").trim_end_matches('?').trim().ends_with("[]")
+}
+
 /// Element type of a collection type: `List<Order>` / `Order[]` / `IEnumerable<Order>` → `Order`.
 pub fn element_type(t: &str) -> Option<String> {
     let t = strip_rust_indirection(t.trim().trim_end_matches('?'));
@@ -794,7 +825,8 @@ pub fn element_type(t: &str) -> Option<String> {
 /// Deferred type of a member access: resolved later from the declared type / return type of
 /// `member` on `owner` (`""` = the enclosing type). `await` unwraps `Task<T>` / `Promise<T>`.
 pub fn member_type_marker(owner: Option<&str>, member: &str, awaited: bool) -> String {
-    let owner = owner.map(clean_type).unwrap_or_default();
+    // `users.find(…)` on `User[]` is `Array.prototype.find`, never a member of `User`.
+    let owner = owner.map(|o| if is_array_type(o) { "Array".to_string() } else { clean_type(o) }).unwrap_or_default();
     format!("@mt#{owner}#{member}{}", if awaited { "!await" } else { "" })
 }
 

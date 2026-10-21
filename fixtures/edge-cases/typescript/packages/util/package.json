@@ -1,5 +1,12 @@
 {
   "name": "@acme/util",
   "version": "1.0.0",
-  "main": "src/index.ts"
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./fmt": {
+      "types": "./lib/format/main.ts",
+      "default": "./lib/format/main.ts"
+    }
+  }
 }

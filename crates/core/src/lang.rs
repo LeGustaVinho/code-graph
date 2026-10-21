@@ -61,6 +61,8 @@ impl Language {
                 }
             }
             "tsx" => Some(Language::Tsx),
+            // Single-file components: the `<script>` blocks are TypeScript (see `extract::sfc`).
+            "vue" | "svelte" => Some(Language::TypeScript),
             "js" | "jsx" | "mjs" | "cjs" => {
                 if name.ends_with(".min.js") {
                     None

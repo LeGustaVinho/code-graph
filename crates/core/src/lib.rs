@@ -7,6 +7,7 @@ pub mod extract;
 pub mod hash;
 pub mod lang;
 pub mod model;
+pub mod phaser;
 pub mod render;
 pub mod routes;
 pub mod tokens;

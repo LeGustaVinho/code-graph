@@ -371,7 +371,7 @@ pub fn resolve_file_arg(conn: &Connection, input: &str) -> Result<String, ToolEr
     let files = query::resolve_file(conn, input)?;
     match files.len() {
         0 => Err(ToolError::NotFound(format!(
-            "File '{input}' is not indexed (supported: .cs .ts .tsx .js .jsx .py .prisma, appsettings*.json, .env*)."
+            "File '{input}' is not indexed (supported: .cs .ts .tsx .mts .cts .js .jsx .mjs .cjs .vue .svelte .py .pyi .rs .prisma, appsettings*.json, .env*)."
         ))),
         1 => Ok(files.into_iter().next().unwrap()),
         _ => Err(ToolError::NotFound(format!("'{input}' matches several files:\n{}", files.join("\n")))),

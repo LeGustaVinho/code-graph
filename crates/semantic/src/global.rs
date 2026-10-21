@@ -129,22 +129,50 @@ pub fn resolve_route_handler(index: &SymbolIndex, file: &str, handler: &str) -> 
 }
 
 pub fn resolve_routes(index: &SymbolIndex, routes: &[RouteRow], prefixes: &[(String, String)]) -> Vec<ResolvedRoute> {
+    // `mount:<prefix>|<module>`: an imported router mounted with `app.use('/api', router)`.
+    let mut mounts: Vec<(String, String, String)> = Vec::new();
+    for (file, p) in prefixes {
+        if let Some((prefix, module)) = p.strip_prefix("mount:").and_then(|m| m.split_once('|')) {
+            if let Some((target, _)) = index.resolve_module(file, module) {
+                mounts.push((file.clone(), prefix.to_string(), target));
+            }
+        }
+    }
+    // `autoload:<prefix>|<dir>`: Fastify autoload serves each plugin under its folder names.
+    let autoloads: Vec<(String, String)> = prefixes
+        .iter()
+        .filter_map(|(_, p)| p.strip_prefix("autoload:")?.split_once('|').map(|(a, b)| (a.to_string(), b.to_string())))
+        .collect();
+    let prefixes: Vec<&(String, String)> = prefixes.iter().filter(|(_, p)| !is_fact_prefix(p)).collect();
     let mut out = Vec::new();
     for r in routes {
         let handler_id = resolve_route_handler(index, &r.file, &r.decl.handler);
-        let normalized = normalize_route(&r.decl.path);
-        out.push(ResolvedRoute {
-            file: r.file.clone(),
-            handler_id: handler_id.clone(),
-            http_method: r.decl.http_method.clone(),
-            path: r.decl.path.clone(),
-            normalized: normalized.clone(),
-            framework: r.decl.framework.clone(),
-            line: r.decl.line,
-        });
+        let server = matches!(r.decl.framework.as_str(), "express" | "fastify" | "koa" | "hono" | "restify");
+        let mut mounted = if server { mount_prefixes(&mounts, &r.file, 0) } else { Vec::new() };
+        if server {
+            for (prefix, dir) in &autoloads {
+                if let Some(rest) = r.file.strip_prefix(&format!("{dir}/")) {
+                    let folders = rest.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                    let full = join_mount(prefix, folders);
+                    mounted = if mounted.is_empty() { vec![full] } else { mounted.iter().map(|m| join_mount(&full, m)).collect() };
+                }
+            }
+        }
+        let paths = if mounted.is_empty() { vec![r.decl.path.clone()] } else { mounted.iter().map(|m| join_mount(m, &r.decl.path)).collect() };
+        for path in paths {
+            out.push(ResolvedRoute {
+                file: r.file.clone(),
+                handler_id: handler_id.clone(),
+                http_method: r.decl.http_method.clone(),
+                normalized: normalize_route(&path),
+                path,
+                framework: r.decl.framework.clone(),
+                line: r.decl.line,
+            });
+        }
         // Global prefixes (NestJS setGlobalPrefix) apply to routes of the same app (same top directory).
         if r.decl.framework == "nestjs" {
-            for (pfile, p) in prefixes {
+            for (pfile, p) in prefixes.iter().copied() {
                 if same_app(pfile, &r.file) {
                     let full = format!("/{}/{}", p.trim_matches('/'), r.decl.path.trim_start_matches('/'));
                     out.push(ResolvedRoute {
@@ -163,6 +191,40 @@ pub fn resolve_routes(index: &SymbolIndex, routes: &[RouteRow], prefixes: &[(Str
     out
 }
 
+/// `route_prefix` rows that carry other route facts (`mount:`, `autoload:`, `decorate:`).
+fn is_fact_prefix(p: &str) -> bool {
+    p.starts_with("mount:") || p.starts_with("autoload:") || p.starts_with("decorate:")
+}
+
+/// Mount prefixes of the routers in `file`, following routers mounted by mounted routers.
+fn mount_prefixes(mounts: &[(String, String, String)], file: &str, depth: u32) -> Vec<String> {
+    if depth > 6 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (from, prefix, _) in mounts.iter().filter(|(_, _, target)| target == file && depth < 6) {
+        let outer = mount_prefixes(mounts, from, depth + 1);
+        if outer.is_empty() {
+            out.push(prefix.clone());
+        } else {
+            out.extend(outer.iter().map(|o| join_mount(o, prefix)));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn join_mount(prefix: &str, path: &str) -> String {
+    let (p, s) = (prefix.trim_matches('/'), path.trim_start_matches('/'));
+    match (p.is_empty(), s.is_empty()) {
+        (true, true) => "/".into(),
+        (true, false) => format!("/{s}"),
+        (false, true) => format!("/{p}"),
+        (false, false) => format!("/{p}/{s}"),
+    }
+}
+
 fn same_app(a: &str, b: &str) -> bool {
     // Heuristic: share the directory that contains `src/`, or the first two path segments.
     let root = |p: &str| -> String {
@@ -175,7 +237,117 @@ fn same_app(a: &str, b: &str) -> bool {
 }
 
 fn methods_compatible(call: &str, route: &str) -> bool {
+    // Page visits (`page.goto`) only reach frontend pages, and API calls only API routes.
+    if call == "PAGE" || route == "PAGE" {
+        return call == route;
+    }
     call == route || route == "ANY" || call.is_empty() || route.is_empty()
+}
+
+/// Routes a call to `url` reaches: exact path matches, and suffix matches for URLs built on a
+/// base (`${API_BASE}/orders`) or deep enough to be unambiguous.
+fn match_routes<'r>(routes: &'r [ResolvedRoute], method: &str, url: &str) -> (Vec<&'r ResolvedRoute>, Vec<&'r ResolvedRoute>) {
+    let norm = normalize_route(url);
+    // `${API_BASE}/orders` → match on the suffix after leading parameters.
+    let (suffix_mode, needle) = if norm.starts_with("{}") {
+        let stripped: String = norm.split('/').skip_while(|s| *s == "{}").collect::<Vec<_>>().join("/");
+        (true, format!("/{stripped}"))
+    } else {
+        (false, norm.clone())
+    };
+    // `/` is too generic to match by suffix; only a visit to the home page matches it exactly.
+    if needle == "/" && (suffix_mode || method != "PAGE") {
+        return (Vec::new(), Vec::new());
+    }
+    let mut exact = Vec::new();
+    let mut suffix = Vec::new();
+    for r in routes {
+        if r.handler_id.is_empty() || !methods_compatible(method, &r.http_method) {
+            continue;
+        }
+        if !suffix_mode && r.normalized == needle {
+            exact.push(r);
+        } else if needle != "/" && r.normalized.ends_with(&needle) && (suffix_mode || needle.matches('/').count() >= 2) {
+            suffix.push(r);
+        }
+    }
+    (exact, suffix)
+}
+
+/// A `data-testid` (`testid`) or a test's `getByTestId` (`testid-query`) literal.
+#[derive(Clone, Debug)]
+pub struct TestIdRow {
+    pub value: String,
+    pub query: bool,
+    pub file: String,
+    pub enclosing: String,
+    pub line: u32,
+}
+
+/// `page.getByTestId('save')` in a test → the component rendering `data-testid="save"`.
+pub fn testid_edges(index: &SymbolIndex, rows: &[TestIdRow]) -> Vec<Edge> {
+    let mut targets: HashMap<&str, Vec<&TestIdRow>> = HashMap::new();
+    for r in rows.iter().filter(|r| !r.query) {
+        targets.entry(r.value.as_str()).or_default().push(r);
+    }
+    let is_test = |id: &str| index.get(id).map(|s| s.sym.is_test).unwrap_or(false);
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for q in rows.iter().filter(|r| r.query && is_test(&r.enclosing)) {
+        let cands = targets.get(q.value.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+        // A test id rendered in many places is a selector convention, not a link.
+        if cands.len() > 4 {
+            continue;
+        }
+        for t in cands.iter().filter(|t| !is_test(&t.enclosing)) {
+            if !seen.insert((q.enclosing.clone(), t.enclosing.clone())) {
+                continue;
+            }
+            out.push(
+                Edge::new(
+                    &q.enclosing,
+                    &q.file,
+                    Some((&t.enclosing, &t.file)),
+                    relation::TESTS,
+                    Confidence::Inferred,
+                    format!("getByTestId('{}') ↔ data-testid=\"{}\" ({}:{})", q.value, t.value, file_name(&t.file), t.line),
+                    "test-linker",
+                    q.line,
+                )
+                .derived(),
+            );
+        }
+    }
+    out
+}
+
+/// Tests that reach code over HTTP (`fastify.inject`, supertest, Playwright `request` /
+/// `page.goto`) test the route handler / page they reach.
+pub fn http_test_edges(index: &SymbolIndex, http: &[Edge]) -> Vec<Edge> {
+    let is_test = |id: &str| index.get(id).map(|s| s.sym.is_test).unwrap_or(false);
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for e in http.iter().filter(|e| e.relation == relation::HTTP_CALLS) {
+        let (Some(target), Some(tfile)) = (&e.target_id, &e.target_file) else { continue };
+        if !is_test(&e.source_id) || is_test(target) || !seen.insert((e.source_id.clone(), target.clone())) {
+            continue;
+        }
+        let name = index.get(target).map(|s| s.sym.name.clone()).unwrap_or_default();
+        out.push(
+            Edge::new(
+                &e.source_id,
+                &e.source_file,
+                Some((target, tfile)),
+                relation::TESTS,
+                e.confidence,
+                format!("test reaches {name} over HTTP ({})", e.evidence),
+                "test-linker",
+                e.line,
+            )
+            .derived(),
+        );
+    }
+    out
 }
 
 fn dedupe_routes(v: Vec<&ResolvedRoute>) -> Vec<&ResolvedRoute> {
@@ -186,30 +358,17 @@ fn dedupe_routes(v: Vec<&ResolvedRoute>) -> Vec<&ResolvedRoute> {
 pub fn http_edges(index: &SymbolIndex, routes: &[ResolvedRoute], calls: &[HttpCallRow]) -> Vec<Edge> {
     let mut out = Vec::new();
     for c in calls {
-        let norm = normalize_route(&c.call.url);
-        // `${API_BASE}/orders` → match on the suffix after leading parameters.
-        let (suffix_mode, needle) = if norm.starts_with("{}") {
-            let stripped: String = norm.split('/').skip_while(|s| *s == "{}").collect::<Vec<_>>().join("/");
-            (true, format!("/{stripped}"))
-        } else {
-            (false, norm.clone())
-        };
-        if needle == "/" {
-            continue;
-        }
+        // A Vite dev-server proxy that rewrites `/api/x` to `/x` is tried after the URL as written.
+        let mut urls = vec![c.call.url.clone()];
+        urls.extend(index.js.proxied_url(&c.file, &normalize_route(&c.call.url)));
         let call_family = index.family_of_file(&c.file);
-        let mut exact: Vec<&ResolvedRoute> = Vec::new();
-        let mut suffix: Vec<&ResolvedRoute> = Vec::new();
-        for r in routes {
-            if r.handler_id.is_empty() || !methods_compatible(&c.call.http_method, &r.http_method) {
-                continue;
-            }
-            if !suffix_mode && r.normalized == needle {
-                exact.push(r);
-            } else if r.normalized.ends_with(&needle) && (suffix_mode || needle.matches('/').count() >= 2) {
-                suffix.push(r);
-            }
-        }
+        let Some((exact, suffix)) = urls
+            .iter()
+            .map(|u| match_routes(routes, &c.call.http_method, u))
+            .find(|(e, s)| !e.is_empty() || !s.is_empty())
+        else {
+            continue;
+        };
         // Collapse duplicates (same handler via several prefixed variants).
         let exact = dedupe_routes(exact);
         let suffix = dedupe_routes(suffix);

@@ -126,9 +126,90 @@ fn nextjs_tests_and_routes() {
         let mut st = c.prepare("SELECT http_method || ' ' || path FROM api_route ORDER BY 1").unwrap();
         st.query_map([], |r| r.get(0)).unwrap().flatten().collect()
     };
-    for r in ["GET /items", "GET /health", "GET /cats/all"] {
+    for r in ["GET /items", "GET /health", "GET /cats/all", "PAGE /dashboard"] {
         assert!(routes.iter().any(|x| x == r), "{r} missing: {routes:?}");
     }
     assert_eq!(count(c, "SELECT COUNT(*) FROM file_meta WHERE file_path LIKE '%.d.mts'"), 0, ".d.mts is a declaration file");
     let _ = file_of(&f, "save");
+}
+
+#[test]
+fn exports_listed_before_their_declarations() {
+    let f = fixture();
+    let c = &f.conn;
+    assert_eq!(edge(c, "useHoisted", "early", "CALLS").as_deref(), Some("exact"), "{:?}", targets(c, "useHoisted", "CALLS"));
+    assert!(edge(c, "useHoisted", "other", "CALLS").is_some(), "export {{ other as renamed }}: {:?}", targets(c, "useHoisted", "CALLS"));
+    assert!(edge(c, "useHoisted", "Late.run", "CALLS").is_some(), "export default Late: {:?}", targets(c, "useHoisted", "CALLS"));
+}
+
+#[test]
+fn array_receivers_and_element_types() {
+    let f = fixture();
+    let c = &f.conn;
+    assert!(edge(c, "pickMembers", "Member.find", "CALLS").is_none(), "members.find is Array.prototype.find");
+    assert_eq!(edge(c, "pickMembers", "Member.ship", "CALLS").as_deref(), Some("exact"), "members.map(m => m.ship())");
+    assert_eq!(edge(c, "pickMembers", "Member.enroll", "CALLS").as_deref(), Some("exact"), "members.find(m => m.enroll())");
+    assert_eq!(edge(c, "Roster.each", "Member.ship", "CALLS").as_deref(), Some("exact"), "this.members.forEach(m => …)");
+    assert_eq!(edge(c, "Roster.each", "Member.enroll", "CALLS").as_deref(), Some("exact"), "for (const m of this.members)");
+}
+
+#[test]
+fn unannotated_return_types() {
+    let f = fixture();
+    let c = &f.conn;
+    assert_eq!(edge(c, "runEngine", "Engine.ignite", "CALLS").as_deref(), Some("exact"), "{:?}", targets(c, "runEngine", "CALLS"));
+}
+
+#[test]
+fn jsdoc_types_and_prototype_methods() {
+    let f = fixture();
+    let c = &f.conn;
+    assert_eq!(edge(c, "book", "Ledger.post", "CALLS").as_deref(), Some("exact"), "@param {{Ledger}}");
+    assert_eq!(edge(c, "flush", "Ledger.post", "CALLS").as_deref(), Some("exact"), "@type {{Ledger}}");
+    assert_eq!(sym(c, "Account.close").kind, "method");
+    assert_eq!(edge(c, "Account.close", "Account.audit", "CALLS").as_deref(), Some("exact"), "this.audit() in a prototype method");
+}
+
+#[test]
+fn express_router_mounts() {
+    let f = fixture();
+    let c = &f.conn;
+    let routes: Vec<String> = {
+        let mut st = c.prepare("SELECT http_method || ' ' || path FROM api_route ORDER BY 1").unwrap();
+        st.query_map([], |r| r.get(0)).unwrap().flatten().collect()
+    };
+    for r in ["GET /api/v2/status", "GET /api/members/:id", "GET /items"] {
+        assert!(routes.iter().any(|x| x == r), "{r} missing: {routes:?}");
+    }
+    assert!(!routes.iter().any(|x| x == "GET /status" || x == "GET /:id"), "mounted routes keep only their full path: {routes:?}");
+}
+
+#[test]
+fn vue_and_svelte_components() {
+    let f = fixture();
+    let c = &f.conn;
+    let dash = sym(c, "Dashboard");
+    assert!(dash.file.ends_with("Dashboard.vue") && dash.attrs.contains("export default"), "{dash:?}");
+    assert_eq!(edge(c, "Dashboard", "UserCard", "CALLS").as_deref(), Some("exact"), "<UserCard> / <user-card> in the template");
+    assert_eq!(edge(c, "Dashboard", "refresh", "CALLS").as_deref(), Some("exact"), "@click=\"refresh\"");
+    assert_eq!(edge(c, "Dashboard", "formatTotal", "CALLS").as_deref(), Some("exact"), "{{{{ formatTotal(total) }}}}");
+    assert!(edge(c, "Dashboard", "ready", "READS_VAR").is_some(), "v-if=\"ready\"");
+    assert!(callers(c, "unused", "CALLS").is_empty(), "only template uses count");
+    // Options API: methods are members of the component, called from the template and `this`.
+    assert_eq!(edge(c, "Options", "Options.save", "CALLS").as_deref(), Some("exact"));
+    assert_eq!(edge(c, "Options.save", "Options.persist", "CALLS").as_deref(), Some("exact"));
+    assert_eq!(sym(c, "Options.mounted").entry_kind, "vue lifecycle");
+    // Svelte markup.
+    assert_eq!(edge(c, "Counter", "increment", "CALLS").as_deref(), Some("exact"), "on:click={{increment}}");
+    assert!(syms(c, "Counter").iter().any(|s| s.file.ends_with("Counter.svelte")));
+    assert_eq!(edge(c, "Counter", "UserCard", "CALLS").as_deref(), Some("exact"));
+}
+
+#[test]
+fn lazy_components_super_calls_and_package_exports() {
+    let f = fixture();
+    let c = &f.conn;
+    assert_eq!(edge(c, "Shell2", "Panel", "CALLS").as_deref(), Some("exact"), "lazy(() => import('./Panel'))");
+    assert_eq!(edge(c, "Dog.speak", "Animal.speak", "CALLS").as_deref(), Some("exact"), "super.speak()");
+    assert_eq!(edge(c, "useFmt", "fmtFn", "CALLS").as_deref(), Some("exact"), "package.json exports subpath");
 }

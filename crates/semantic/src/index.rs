@@ -75,6 +75,11 @@ pub struct SymbolIndex {
     pub editor_dirs: Vec<String>,
     /// Unity: the C# files that are test code (`unity::apply_test_files`); None elsewhere.
     pub unity_test_files: Option<HashSet<String>>,
+    /// Fastify `decorate*` members: (FastifyInstance | FastifyRequest | FastifyReply, member) →
+    /// the decorated value's type (`@fn` for a decorated function). Set by the indexer.
+    pub decorations: HashMap<(String, String), String>,
+    /// Phaser scene key → scene class (`super('Game')`, `scene.add('Pause', PauseScene)`).
+    pub scene_keys: HashMap<String, usize>,
 }
 
 const JS_EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"];
@@ -86,6 +91,42 @@ fn strip_js_ext(path: &str) -> &str {
         }
     }
     path
+}
+
+/// `**` matches any number of path segments, `*` / `?` / `{a,b}` within one segment.
+fn glob_segments(pat: &[&str], segs: &[&str]) -> bool {
+    match pat.split_first() {
+        None => segs.is_empty(),
+        Some((&"**", rest)) => (0..=segs.len()).any(|i| glob_segments(rest, &segs[i..])),
+        Some((p, rest)) => !segs.is_empty() && glob_one(p, segs[0]) && glob_segments(rest, &segs[1..]),
+    }
+}
+
+fn glob_one(p: &str, s: &str) -> bool {
+    if let (Some(open), Some(close)) = (p.find('{'), p.find('}')) {
+        if open < close {
+            return p[open + 1..close].split(',').any(|alt| glob_one(&format!("{}{alt}{}", &p[..open], &p[close + 1..]), s));
+        }
+    }
+    let (p, s) = (p.as_bytes(), s.as_bytes());
+    let (mut pi, mut si, mut star, mut mark) = (0, 0, None, 0);
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            mark = si;
+            pi += 1;
+        } else if let Some(st) = star {
+            pi = st + 1;
+            mark += 1;
+            si = mark;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == b'*')
 }
 
 pub fn dirname(path: &str) -> &str {
@@ -149,6 +190,8 @@ impl SymbolIndex {
             js: Default::default(),
             editor_dirs: Vec::new(),
             unity_test_files: None,
+            decorations: HashMap::new(),
+            scene_keys: HashMap::new(),
         };
         for (i, s) in idx.syms.iter().enumerate() {
             idx.by_id.insert(s.sym.id.clone(), i);
@@ -479,8 +522,10 @@ impl SymbolIndex {
             let base = format!("{}/{}", dirname(from_file), spec);
             return try_base(&base).map(|f| (f, Confidence::Exact));
         }
-        // tsconfig / jsconfig `paths` and `baseUrl` of the config governing this file.
-        if let Some(cfg) = self.js.nearest(from_file) {
+        // tsconfig / jsconfig `paths` and `baseUrl`, Vite `resolve.alias`: the configs enclosing
+        // this file, nearest first.
+        let governing = self.js.governing(from_file);
+        for cfg in &governing {
             for (pattern, targets) in &cfg.paths {
                 if let Some(star) = crate::jsconfig::match_pattern(pattern, spec) {
                     for t in targets {
@@ -490,11 +535,11 @@ impl SymbolIndex {
                     }
                 }
             }
-            if let Some(base) = &cfg.base_url {
-                let cand = if base.is_empty() { spec.to_string() } else { format!("{base}/{spec}") };
-                if let Some(f) = try_base(&cand) {
-                    return Some((f, Confidence::Exact));
-                }
+        }
+        if let Some(base) = governing.iter().find_map(|c| c.base_url.as_ref()) {
+            let cand = if base.is_empty() { spec.to_string() } else { format!("{base}/{spec}") };
+            if let Some(f) = try_base(&cand) {
+                return Some((f, Confidence::Exact));
             }
         }
         // Workspace packages importing each other by name (`@acme/shared`, `@acme/shared/x`).
@@ -505,7 +550,11 @@ impl SymbolIndex {
             let cands: Vec<String> = if rest.is_empty() {
                 pkg.entries.iter().map(|e| join(e)).chain([join("src/index"), join("index")]).collect()
             } else {
-                vec![join(rest), join(&format!("src/{rest}"))]
+                // `exports` subpaths first (`"./utils": "./src/utils/index.ts"`, `"./*": "./src/*.ts"`).
+                let mapped = pkg.subpaths.iter().filter_map(|(pat, target)| {
+                    crate::jsconfig::match_pattern(pat, rest).map(|star| join(&target.replacen('*', star, 1)))
+                });
+                mapped.chain([join(rest), join(&format!("src/{rest}"))]).collect()
             };
             for c in cands {
                 if let Some(f) = try_base(&c) {
@@ -541,6 +590,32 @@ impl SymbolIndex {
             }
         }
         None
+    }
+
+    /// Indexed JS/TS files matching a Vite glob (`./pages/**/*.tsx`, `/src/views/*.vue`), sorted.
+    pub fn glob_js_files(&self, from_file: &str, pattern: &str) -> Vec<String> {
+        let (pattern, anchored) = match pattern.strip_prefix('/') {
+            // Root-relative (`/src/…`): the app root is not known, so match by suffix.
+            Some(rest) => (rest.to_string(), false),
+            None => (normalize_path(&format!("{}/{}", dirname(from_file), pattern)), true),
+        };
+        let pat: Vec<&str> = pattern.split('/').collect();
+        let mut out: Vec<String> = self
+            .js_paths
+            .values()
+            .filter(|f| {
+                let segs: Vec<&str> = f.split('/').collect();
+                if anchored {
+                    glob_segments(&pat, &segs)
+                } else {
+                    (0..segs.len()).any(|i| glob_segments(&pat, &segs[i..]))
+                }
+            })
+            .cloned()
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Resolves a Python module path (`app.services`, `.models`, `..x`) to a file.
@@ -988,4 +1063,17 @@ fn rust_key((crate_key, path): &(String, Vec<String>)) -> String {
 
 fn common_prefix_len(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vite_globs() {
+        assert!(glob_segments(&["src", "pages", "**", "*.tsx"], &["src", "pages", "a", "B.tsx"]));
+        assert!(glob_segments(&["src", "pages", "**", "*.tsx"], &["src", "pages", "B.tsx"]));
+        assert!(!glob_segments(&["src", "pages", "*.tsx"], &["src", "pages", "a", "B.tsx"]));
+        assert!(glob_one("*.{vue,tsx}", "Home.vue") && !glob_one("*.{vue,tsx}", "Home.ts"));
+    }
 }

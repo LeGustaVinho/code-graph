@@ -200,7 +200,11 @@ pub fn get_config_matrix(ctx: &Ctx, p: ConfigParams) -> ToolResult {
             item.push_str(&format!(" | defined only: {}", defs.join("; ")));
         } else {
             item.push_str(&format!(" | reads: {}", reads.join("; ")));
-            if defs.is_empty() {
+            if defs.is_empty() && (k.starts_with("asset:") || k.starts_with("anim:")) {
+                item.push_str(" | ⚠ never loaded / created (no `this.load.*` / `anims.create` defines it)");
+            } else if defs.is_empty() && k.starts_with("registry:") {
+                item.push_str(" | ⚠ read but never set in the registry");
+            } else if defs.is_empty() {
                 item.push_str(" | ⚠ not defined in config files (must come from the environment)");
             } else {
                 item.push_str(&format!(" | defined: {}", defs.join("; ")));

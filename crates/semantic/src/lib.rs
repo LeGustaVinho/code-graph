@@ -17,6 +17,7 @@ pub mod global;
 pub mod index;
 pub mod jsconfig;
 pub mod models;
+pub mod phaser;
 pub mod resolve;
 pub mod rustcrate;
 pub mod unity;

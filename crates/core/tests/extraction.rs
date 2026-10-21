@@ -173,3 +173,149 @@ fn csharp_expression_bodied_property_is_walked_once() {
     let f = extract_file("P.cs", Language::CSharp, "class P { string T => \"edge-title\"; }");
     assert_eq!(f.literals.iter().filter(|l| l.value == "edge-title").count(), 1, "{:?}", f.literals);
 }
+
+#[test]
+fn typescript_member_visibility_and_typed_catch() {
+    let src = "export class Svc {\n\
+                 constructor(public readonly name: string, protected repo: Repo, private x: X, readonly y: Y) {}\n\
+                 protected onClick = () => { this.repo.save(); };\n\
+                 static make = () => new Svc('a', r, x, y);\n\
+                 run() {\n\
+                   try { this.repo.save(); } catch (e: unknown) { log(e); }\n\
+                 }\n\
+               }\n";
+    let f = extract_file("src/svc.ts", Language::TypeScript, src);
+    let s = |n: &str| sym(&f, n);
+    for (field, vis) in [("Svc.name", "public"), ("Svc.repo", "protected"), ("Svc.x", "private"), ("Svc.y", "public")] {
+        assert_eq!(s(field).visibility, vis, "parameter property {field}");
+    }
+    assert_eq!(s("Svc.onClick").visibility, "protected", "arrow-function field keeps its accessibility");
+    assert!(!s("Svc.onClick").is_exported);
+    assert!(s("Svc.make").is_static);
+    let catch = f.refs.iter().find(|r| r.kind == RefKind::Catch).unwrap();
+    assert_eq!(catch.name, "*", "`catch (e: unknown)` catches everything");
+    let call = f.refs.iter().find(|r| r.kind == RefKind::Call && r.name == "save" && r.line == 6).unwrap();
+    assert_eq!(call.catch_types, vec!["*".to_string()]);
+}
+
+#[test]
+fn typescript_exports_before_hoisted_declarations() {
+    let src = "export { early, other as renamed };\n\
+               export default Late;\n\
+               function early() {}\n\
+               function other() {}\n\
+               class Late {}\n\
+               function helper() {}\n\
+               export = helper;\n";
+    let f = extract_file("src/hoisted.ts", Language::TypeScript, src);
+    assert!(sym(&f, "early").is_exported);
+    assert!(sym(&f, "other").modifiers.contains(&"export-as:renamed".to_string()), "{:?}", sym(&f, "other"));
+    assert!(sym(&f, "Late").attrs.contains(&"export default".to_string()));
+    assert!(sym(&f, "helper").is_exported, "`export = helper`");
+}
+
+#[test]
+fn typescript_type_params_names_and_guards() {
+    let src = "export interface Box<T> { value: T; other: Other }\n\
+               export type Mapped<T> = { [K in keyof T]: Wrap<T[K]> };\n\
+               export type Cond<T> = T extends Foo<infer U> ? U : Bar;\n\
+               export class C<T> { ['computed']() {} 'quoted'() {} get(x: T): T { return x; } }\n\
+               export const { a, b } = makeAB();\n\
+               export function isUser(x: unknown): x is User { return true; }\n";
+    let f = extract_file("src/t.ts", Language::TypeScript, src);
+    let uses: Vec<&str> = f.refs.iter().filter(|r| r.kind == RefKind::TypeUse).map(|r| r.name.as_str()).collect();
+    for tp in ["T", "K", "U"] {
+        assert!(!uses.contains(&tp), "type parameter {tp} is not a type use: {uses:?}");
+    }
+    for t in ["Other", "Wrap", "Foo", "Bar", "User"] {
+        assert!(uses.contains(&t), "{t} missing: {uses:?}");
+    }
+    assert_eq!(sym(&f, "C.computed").kind, SymbolKind::Method);
+    assert_eq!(sym(&f, "C.quoted").kind, SymbolKind::Method);
+    assert!(sym(&f, "a").is_exported && sym(&f, "b").is_exported, "export const {{ a, b }}");
+    assert_eq!(sym(&f, "isUser").type_ref.as_deref(), Some("boolean"), "type guard");
+}
+
+#[test]
+fn typescript_server_routes_by_type_and_options() {
+    let src = "import { Hono } from 'hono';\n\
+               import Fastify from 'fastify';\n\
+               const h = new Hono();\n\
+               const server = Fastify();\n\
+               h.get('/hono', (c) => c.text('ok'));\n\
+               server.route({ method: 'post', url: '/opts', handler: async (req) => { save(); } });\n";
+    let f = extract_file("src/s.ts", Language::TypeScript, src);
+    let routes: Vec<String> = f.routes.iter().map(|r| format!("{} {}", r.http_method, r.path)).collect();
+    assert!(routes.contains(&"GET /hono".to_string()), "{routes:?}");
+    assert!(routes.contains(&"POST /opts".to_string()), "{routes:?}");
+    assert_eq!(f.refs.iter().filter(|r| r.kind == RefKind::Call && r.name == "save").count(), 1, "handler walked once");
+}
+
+#[test]
+fn typescript_destructuring_promises_maps_and_hooks() {
+    let src = "export function Comp({ user, repo: r }: Props, m: Map<string, Order>, rec: Record<string, Order>) {\n\
+                 user.save(); r.list(); m.get('a').ship(); rec['k'].ship(); m.forEach((o) => o.pack());\n\
+                 loadUser().then((u) => u.greet()); (<Order>x).ship();\n\
+                 const [state] = useState<User | null>(null); state.save();\n\
+                 const ref = useRef<Editor>(null); ref.current.focus();\n\
+                 const svc = moduleRef.get(UsersService); svc.find();\n\
+               }\n";
+    let f = extract_file("src/c.ts", Language::TypeScript, src);
+    let rtype = |name: &str, recv: &str| {
+        f.refs
+            .iter()
+            .find(|r| r.kind == RefKind::Call && r.name == name && r.receiver.as_deref() == Some(recv))
+            .and_then(|r| r.receiver_type.clone())
+            .unwrap_or_else(|| panic!("{recv}.{name}() missing"))
+    };
+    assert_eq!(rtype("save", "user"), "@mt#Props#user");
+    assert_eq!(rtype("list", "r"), "@mt#Props#repo");
+    assert_eq!(rtype("ship", "m.get('a')"), "Order");
+    assert_eq!(rtype("ship", "rec['k']"), "Order");
+    assert_eq!(rtype("pack", "o"), "Order", "Map.forEach value");
+    assert_eq!(rtype("greet", "u"), "@mt#@fn#loadUser!await", ".then callback");
+    assert_eq!(rtype("save", "state"), "User", "useState<T>");
+    assert_eq!(rtype("focus", "ref.current"), "Editor", "useRef<T>");
+    assert_eq!(rtype("find", "svc"), "UsersService", "moduleRef.get(T)");
+}
+
+#[test]
+fn javascript_vue_options_and_koa_prefix() {
+    let src = "export default { name: 'Comp', methods: { save() { this.helper(); }, helper() {} }, mounted() { this.save(); } };\n";
+    let f = extract_file("src/comp.js", Language::JavaScript, src);
+    let comp = sym(&f, "Comp");
+    assert!(comp.attrs.contains(&"export default".to_string()), "{comp:?}");
+    assert_eq!(sym(&f, "Comp.helper").kind, SymbolKind::Method);
+    assert_eq!(sym(&f, "Comp.mounted").entry_kind.as_deref(), Some("vue lifecycle"));
+    let koa = "import Router from '@koa/router';\nconst router = new Router({ prefix: '/koa' });\nrouter.get('/items', async (ctx) => {});\n";
+    let f = extract_file("src/koa.ts", Language::TypeScript, koa);
+    assert_eq!(f.routes.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), vec!["/koa/items"]);
+}
+
+#[test]
+fn frontend_route_configs_and_directives() {
+    let routes = |path: &str, lang: Language, src: &str| -> Vec<String> {
+        extract_file(path, lang, src).routes.iter().map(|r| format!("{} {} {}", r.http_method, r.path, r.framework)).collect()
+    };
+    let vue = "import { createRouter } from 'vue-router';\n\
+               const routes = [{ path: '/users', component: UsersView, children: [{ path: ':id', component: UserView }] }];\n\
+               export const router = createRouter({ history, routes });\n";
+    assert_eq!(routes("src/router.ts", Language::TypeScript, vue), vec!["PAGE /users vue-router", "PAGE /users/:id vue-router"]);
+    let ng = "export const routes: Routes = [{ path: 'admin', component: AdminComponent }];\n";
+    assert_eq!(routes("src/app.routes.ts", Language::TypeScript, ng), vec!["PAGE /admin angular"]);
+    let tanstack = "export const Route = createFileRoute('/posts')({ component: Posts });\n";
+    assert_eq!(routes("src/routes/posts.tsx", Language::Tsx, tanstack), vec!["PAGE /posts tanstack-router"]);
+
+    let f = extract_file("src/actions.ts", Language::TypeScript, "'use server';\nexport async function save() {}\n");
+    assert!(f.symbols[0].attrs.contains(&"use server".to_string()));
+    assert_eq!(sym(&f, "save").entry_kind.as_deref(), Some("server action"));
+
+    let f = extract_file("src/Card.tsx", Language::Tsx, "export function Card() { return <div data-testid=\"card\" />; }\nexport function useCard() {}\n");
+    assert!(sym(&f, "Card").modifiers.contains(&"react-component".to_string()));
+    assert!(sym(&f, "useCard").modifiers.contains(&"react-hook".to_string()));
+    assert!(f.literals.iter().any(|l| l.value == "card" && l.literal_type == "testid"));
+
+    let vue_sfc = "<template>\n  <button data-testid=\"save\" @click=\"save\" />\n</template>\n<script setup>\nfunction save() {}\n</script>\n";
+    let f = extract_file("src/Save.vue", Language::TypeScript, vue_sfc);
+    assert!(f.literals.iter().any(|l| l.value == "save" && l.literal_type == "testid" && l.line == 2), "{:?}", f.literals);
+}
