@@ -17,6 +17,6 @@ pub mod walk;
 pub use extract::extract_file;
 
 /// Bump whenever extraction output changes so cached indexes are rebuilt.
-pub const EXTRACTOR_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+x5");
+pub const EXTRACTOR_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+x10");
 pub use lang::Language;
 pub use model::*;

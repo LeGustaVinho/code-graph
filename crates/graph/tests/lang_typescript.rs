@@ -51,7 +51,14 @@ fn generics_return_types_and_super() {
 #[test]
 fn locals_shadow_module_functions() {
     let f = fixture();
-    assert!(edge(&f.conn, "shadow", "helper", "CALLS").is_none(), "{:?}", targets(&f.conn, "shadow", "CALLS"));
+    let c = &f.conn;
+    // `const helper = () => 1` inside `shadow` is the callee, not the module-level `helper`.
+    let module_level = count(
+        c,
+        "SELECT COUNT(*) FROM edge e JOIN node s ON s.id = e.source_id JOIN node t ON t.id = e.target_id          WHERE e.relation = 'CALLS' AND s.qualified_name = 'shadow' AND t.qualified_name = 'helper'",
+    );
+    assert_eq!(module_level, 0, "{:?}", targets(c, "shadow", "CALLS"));
+    assert_eq!(edge(c, "shadow", "shadow.helper", "CALLS").as_deref(), Some("exact"), "{:?}", targets(c, "shadow", "CALLS"));
 }
 
 #[test]

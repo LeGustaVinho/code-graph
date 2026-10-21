@@ -22,6 +22,15 @@ pub fn display(n: &Node) -> String {
                 s.name.clone()
             }
         }
+        // A function nested in another function: `Auth.submit` (names alone are ambiguous).
+        SymbolKind::Function if !s.name.contains(' ') && s.qualified_name.ends_with(&format!(".{}", s.name)) && !s.qualified_name.contains("::") => {
+            let outer = s.qualified_name[..s.qualified_name.len() - s.name.len() - 1].rsplit('.').next().unwrap_or("");
+            if outer.contains(' ') || outer.is_empty() {
+                s.name.clone()
+            } else {
+                format!("{outer}.{}", s.name)
+            }
+        }
         _ => s.name.clone(),
     }
 }
@@ -38,7 +47,8 @@ pub fn node_line(n: &Node) -> String {
 pub fn node_line_sig(n: &Node) -> String {
     let mut s = node_line(n);
     if !n.sym.signature.is_empty() && n.sym.kind != SymbolKind::Module && n.sym.kind != SymbolKind::Literal {
-        s.push_str(&format!(" | {}", n.sym.signature));
+        // Search hits only need enough of the signature to tell overloads apart.
+        s.push_str(&format!(" | {}", codegraph_core::extract::truncate(&n.sym.signature, 110)));
     }
     s
 }

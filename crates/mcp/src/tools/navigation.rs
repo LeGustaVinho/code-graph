@@ -138,6 +138,7 @@ fn tree(
     visited: &mut HashSet<String>,
     lines: &mut Vec<String>,
     with_caps: bool,
+    sites_from: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     if depth >= max_depth || lines.len() > 400 {
         return Ok(());
@@ -147,42 +148,93 @@ fn tree(
     let nodes = query::nodes_by_ids(conn, &others)?;
     let indent = "  ".repeat(depth + 1);
     let arrow = if callees { "→" } else { "←" };
-    let mut seen_here = HashSet::new();
+    // Every call site of the same pair is listed on one line (`@12,15`); unresolved calls of
+    // the same name are grouped the same way.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<EdgeRow>> = HashMap::new();
     for e in edges {
         let other = if callees { e.target_id.clone() } else { Some(e.source_id.clone()) };
-        match other.and_then(|o| nodes.get(&o).cloned()) {
+        let key = match other.filter(|o| nodes.contains_key(o)) {
+            Some(o) if o == id => continue,
+            Some(o) => o,
+            None if callees => format!("?{}", e.unresolved_symbol.clone().unwrap_or_default()),
+            None => continue,
+        };
+        if !groups.contains_key(&key) {
+            order.push(key.clone());
+        }
+        groups.entry(key).or_default().push(e);
+    }
+    let sites_of = |es: &[EdgeRow]| -> Vec<u32> {
+        let mut v: Vec<u32> = es.iter().map(|e| e.line).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    // One call that resolved to an implementation is also listed against the interface it
+    // was typed as (and sometimes as unresolved): keep the most concrete line only.
+    let resolved_sites: Vec<(String, bool, Vec<u32>)> = order
+        .iter()
+        .filter_map(|k| nodes.get(k).map(|n| (k.clone(), n.sym.is_abstract, sites_of(&groups[k]))))
+        .collect();
+    // An unresolved call is covered by any resolved target at the same sites; an abstract
+    // declaration only by a concrete one.
+    let covered = |key: &str, sites: &[u32]| {
+        let unresolved = !nodes.contains_key(key);
+        resolved_sites.iter().any(|(k, abs, s)| k != key && (unresolved || !abs) && sites.iter().all(|l| s.contains(l)))
+    };
+    for key in order {
+        let mut es = groups.remove(&key).unwrap_or_default();
+        es.sort_by_key(|e| e.line);
+        let site_lines = sites_of(&es);
+        let abstract_or_unresolved = nodes.get(&key).map(|n| n.sym.is_abstract).unwrap_or(true);
+        if abstract_or_unresolved && callees && covered(&key, &site_lines) {
+            continue;
+        }
+        let sites = site_lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(",");
+        let e = &es[0];
+        match nodes.get(&key) {
             Some(n) => {
-                if n.sym.id == id || !seen_here.insert(n.sym.id.clone()) {
-                    continue;
-                }
-                let site = if callees { format!("@{}", e.line) } else { format!("@{}:{}", e.source_file, e.line) };
+                // The caller's own file is already in its coordinates.
+                let site = if callees || e.source_file == n.file_path { format!("@{sites}") } else { format!("@{}:{sites}", e.source_file) };
                 let rel = if e.relation == "CALLS" { String::new() } else { format!(" {}", e.relation) };
                 let caps = if with_caps && !n.sym.capabilities.is_empty() {
                     format!(" {{{}}}", n.sym.capabilities.iter().cloned().collect::<Vec<_>>().join(","))
                 } else {
                     String::new()
                 };
-                let recursion = if visited.contains(&n.sym.id) { " (↻)" } else { "" };
-                lines.push(format!(
-                    "{indent}{arrow} {} {} {site}{rel} [{}: {}]{caps}{recursion}",
-                    display(&n),
-                    n.coords(),
-                    e.confidence.as_str(),
-                    short_evidence(&e, 70)
-                ));
+                // Exact edges need no justification; inferred ones say why.
+                let conf = match e.confidence {
+                    Confidence::Exact => String::new(),
+                    c => format!(" [{}: {}]", c.as_str(), short_evidence(e, 50)),
+                };
+                if visited.contains(&n.sym.id) {
+                    // Already expanded above: name and call sites only.
+                    lines.push(format!("{indent}{arrow} {} {site}{rel} (↻)", display(n)));
+                    continue;
+                }
+                lines.push(format!("{indent}{arrow} {} {} {site}{rel}{conf}{caps}", display(n), n.coords()));
+                // The call expressions themselves (arguments included), like grep would show.
+                if let Some(root) = sites_from {
+                    if let Ok(src) = std::fs::read_to_string(root.join(&e.source_file)) {
+                        let file_lines: Vec<&str> = src.lines().collect();
+                        for l in &site_lines {
+                            if let Some(t) = file_lines.get(*l as usize - 1) {
+                                lines.push(format!("{indent}    {l}| {}", codegraph_core::extract::truncate(t.trim(), 160)));
+                            }
+                        }
+                    }
+                }
                 if visited.insert(n.sym.id.clone()) {
-                    tree(conn, &n.sym.id, callees, depth + 1, max_depth, rels, visited, lines, with_caps)?;
+                    tree(conn, &n.sym.id, callees, depth + 1, max_depth, rels, visited, lines, with_caps, sites_from)?;
                 }
             }
             None => {
-                if callees {
-                    lines.push(format!(
-                        "{indent}{arrow} ? {} @{} [unresolved: {}]",
-                        e.unresolved_symbol.clone().unwrap_or_default(),
-                        e.line,
-                        short_evidence(&e, 80)
-                    ));
-                }
+                lines.push(format!(
+                    "{indent}{arrow} ? {} @{sites} [unresolved: {}]",
+                    e.unresolved_symbol.clone().unwrap_or_default(),
+                    short_evidence(e, 80)
+                ));
             }
         }
     }
@@ -209,6 +261,8 @@ pub struct HierarchyParams {
     pub direction: Option<String>,
     /// Tree depth (default 2, max 6).
     pub depth: Option<usize>,
+    /// Print the source line of every call site (default: on for callers at depth 1).
+    pub show_sites: Option<bool>,
     pub max_token_budget: Option<usize>,
     pub format: Option<String>,
 }
@@ -233,7 +287,9 @@ pub fn get_call_hierarchy(ctx: &Ctx, p: HierarchyParams) -> ToolResult {
         for s in &seeds {
             let mut lines = Vec::new();
             let mut visited: HashSet<String> = HashSet::from([s.clone()]);
-            tree(ctx.conn, s, callees, 0, depth, FLOW_RELATIONS, &mut visited, &mut lines, false)?;
+            let show = p.show_sites.unwrap_or(!callees && depth == 1);
+            let root = show.then_some(ctx.engine.root.as_path());
+            tree(ctx.conn, s, callees, 0, depth, FLOW_RELATIONS, &mut visited, &mut lines, false, root)?;
             if seeds.len() > 1 && !lines.is_empty() {
                 if let Some(m) = query::node(ctx.conn, s)? {
                     out.item(format!(" {}:", display(&m)));
@@ -388,7 +444,7 @@ pub fn get_impact_radius(ctx: &Ctx, p: ImpactParams) -> ToolResult {
 pub struct FullstackParams {
     /// Route ("GET /api/orders", "/api/orders/{id}") or a frontend/backend symbol.
     pub api_route_or_call: String,
-    /// Depth of the backend call tree (default 3).
+    /// Depth of the backend call tree (default 2).
     pub depth: Option<usize>,
     pub max_token_budget: Option<usize>,
     pub format: Option<String>,
@@ -419,7 +475,7 @@ fn api_routes(conn: &Connection) -> anyhow::Result<Vec<ApiRoute>> {
 
 pub fn trace_fullstack_flow(ctx: &Ctx, p: FullstackParams) -> ToolResult {
     let input = p.api_route_or_call.trim();
-    let depth = p.depth.unwrap_or(3).clamp(1, 6);
+    let depth = p.depth.unwrap_or(2).clamp(1, 6);
     let routes = api_routes(ctx.conn)?;
     let mut handlers: Vec<(String, String)> = Vec::new(); // (handler id, route label)
     let mut frontend_only: Vec<EdgeRow> = Vec::new();
@@ -518,18 +574,40 @@ pub fn trace_fullstack_flow(ctx: &Ctx, p: FullstackParams) -> ToolResult {
         } else {
             out.item("  frontend callers:");
         }
-        for e in &incoming {
-            out.item(format!("    {}", edge_line(e, &srcs)));
-            for up in query::edges_in(ctx.conn, &e.source_id, &["CALLS"])?.into_iter().take(4) {
-                if let Some(c) = query::node(ctx.conn, &up.source_id)? {
-                    out.item(format!("      ↑ {} {}:{} [{}]", display(&c), up.source_file, up.line, up.confidence.as_str()));
+        // Production callers one by one (with who calls them); test callers summarised.
+        let is_test = |e: &EdgeRow| srcs.get(&e.source_id).map(|n| n.sym.is_test).unwrap_or(false);
+        let tests: Vec<&EdgeRow> = incoming.iter().filter(|e| is_test(e)).collect();
+        if !tests.is_empty() {
+            let mut files: Vec<&str> = tests.iter().map(|e| e.source_file.as_str()).collect();
+            files.sort();
+            files.dedup();
+            let n_tests = tests.iter().map(|e| &e.source_id).collect::<HashSet<_>>().len();
+            out.item(format!("    tests: {n_tests} test(s) call it ({})", files.join(", ")));
+        }
+        for e in incoming.iter().filter(|e| !is_test(e)) {
+            let who = srcs.get(&e.source_id).map(display).unwrap_or_default();
+            let client = e.metadata.as_ref().and_then(|m| m.get("client")).and_then(|c| c.as_str()).map(|c| format!(" via {c}")).unwrap_or_default();
+            out.item(format!("    {}:{} {who}{client} [{}]", e.source_file, e.line, e.confidence.as_str()));
+            // Callers of the frontend function, one line per caller with all its call sites.
+            let mut ups: Vec<(String, Vec<u32>, &'static str)> = Vec::new();
+            for up in query::edges_in(ctx.conn, &e.source_id, &["CALLS"])? {
+                if let Some(u) = ups.iter_mut().find(|u| u.0 == up.source_id) {
+                    u.1.push(up.line);
+                } else if ups.len() < 4 {
+                    ups.push((up.source_id.clone(), vec![up.line], up.confidence.as_str()));
+                }
+            }
+            for (id, lines, conf) in ups {
+                if let Some(c) = query::node(ctx.conn, &id)? {
+                    let ls = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(",");
+                    out.item(format!("      ↑ {} {}:{ls} [{conf}]", display(&c), c.file_path));
                 }
             }
         }
         out.item("  backend flow:");
         let mut lines = Vec::new();
         let mut visited = HashSet::from([hid.clone()]);
-        tree(ctx.conn, hid, true, 1, depth + 1, &["CALLS", "RESOLVES_DI"], &mut visited, &mut lines, true)?;
+        tree(ctx.conn, hid, true, 1, depth + 1, &["CALLS", "RESOLVES_DI"], &mut visited, &mut lines, true, None)?;
         for l in &lines {
             out.item(l.clone());
         }

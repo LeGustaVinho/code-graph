@@ -475,6 +475,17 @@ fn parse_params(
     (ParamInfo::from_list(list), collapse_ws(inner), locals, defaults)
 }
 
+/// A `def` inside another function (closures, decorators' wrappers, app-factory route
+/// handlers): a symbol of its own, scoped to its parent.
+fn nested_function(ctx: &mut Ctx, st: &mut State, node: Node, decorators: Vec<String>, range: Node) {
+    let before = ctx.facts.symbols.len();
+    visit_function(ctx, st, node, decorators, range, None);
+    if let Some(s) = ctx.facts.symbols.get_mut(before) {
+        s.visibility = "private".into();
+        s.is_exported = false;
+    }
+}
+
 fn visit_function(ctx: &mut Ctx, st: &mut State, node: Node, decorators: Vec<String>, range: Node, cls: Option<&ClassInfo>) {
     let Some(n) = node.child_by_field_name("name") else { return };
     let name = ctx.text(n).to_string();
@@ -825,27 +836,21 @@ fn walk(ctx: &mut Ctx, st: &mut State, node: Node) {
         }
         "function_definition" => {
             if ctx.in_function() {
-                if let Some(n) = node.child_by_field_name("name") {
-                    let name = ctx.text(n).to_string();
-                    ctx.declare_local(&name, None);
-                }
-                let (_, _, locals, _) = parse_params(ctx, node.child_by_field_name("parameters"), false);
-                for (n, t) in locals {
-                    ctx.declare_local(&n, t);
-                }
-                if let Some(b) = node.child_by_field_name("body") {
-                    walk(ctx, st, b);
-                }
+                nested_function(ctx, st, node, Vec::new(), node);
             } else {
                 visit_function(ctx, st, node, Vec::new(), node, None);
             }
         }
         "decorated_definition" | "class_definition" => {
             if ctx.in_function() {
-                if let Some(def) = node.child_by_field_name("definition").or(Some(node)) {
-                    if def.kind() == "function_definition" {
-                        walk(ctx, st, def);
-                    }
+                if let Some(def) = node.child_by_field_name("definition").filter(|d| d.kind() == "function_definition") {
+                    // `@app.route('/x')` inside an app factory still declares a route.
+                    let decs: Vec<String> = named_children(node)
+                        .into_iter()
+                        .filter(|c| c.kind() == "decorator")
+                        .map(|d| collapse_ws(ctx.text(d).trim_start_matches('@')))
+                        .collect();
+                    nested_function(ctx, st, def, decs, node);
                 }
             } else {
                 visit_stmt(ctx, st, node, None);

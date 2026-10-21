@@ -127,6 +127,127 @@ struct State {
     playwright: bool,
     /// A Phaser file (imports `phaser` or uses the `Phaser` global / a scene's `this.load`).
     phaser: bool,
+    /// Local helpers that register a route from their parameters
+    /// (`const route = (method, url, h) => app.route({ method, url, handler })`).
+    /// Keys are (declaration's lexical owner id, name), because distinct factories can
+    /// declare helpers with the same name but different behavior.
+    route_wrappers: HashMap<(String, String), RouteWrapper>,
+    /// Helpers that read the environment variable named by a parameter
+    /// (`const required = (name) => env[name]`), scoped to the declaring function/module.
+    env_accessors: HashMap<(String, String), (usize, &'static str)>,
+}
+
+/// The owner of the currently visited helper declaration. A nested helper belongs to its
+/// parent function; a module-level helper belongs to the module. This is evaluated while
+/// walking the helper body, where `ctx.enclosing()` is the helper itself.
+fn helper_owner(ctx: &Ctx) -> Option<String> {
+    ctx.facts.symbols.iter().rev().find(|s| s.id == ctx.enclosing()).and_then(|s| s.parent_id.clone())
+}
+
+/// Find a helper visible at the call site, preferring the nearest lexical declaration.
+fn visible_helper<T: Clone>(ctx: &Ctx, helpers: &HashMap<(String, String), T>, name: &str) -> Option<T> {
+    ctx.scopes.iter().rev().find_map(|s| helpers.get(&(s.symbol_id.clone(), name.to_string())).cloned())
+}
+
+/// Where a route-registering helper takes the route's method, path and handler from.
+#[derive(Clone)]
+struct RouteWrapper {
+    /// Parameter index of the HTTP method, or the method the helper always uses.
+    method: Result<usize, String>,
+    url: usize,
+    handler: Option<usize>,
+    framework: &'static str,
+}
+
+/// Index of `name` among the parameters of the innermost enclosing function, with that
+/// function's name.
+fn enclosing_param(ctx: &Ctx, name: &str) -> Option<(String, usize)> {
+    let id = ctx.enclosing();
+    let s = ctx.facts.symbols.iter().rev().find(|s| s.id == id)?;
+    if !matches!(s.kind, SymbolKind::Function | SymbolKind::Method) || s.is_entrypoint {
+        return None;
+    }
+    let i = s.params.as_ref()?.list.iter().position(|p| p.name == name)?;
+    Some((s.name.clone(), i))
+}
+
+/// The parameter of the enclosing function that `n` passes along: the parameter itself, or a
+/// URL whose path is that parameter appended to a base (`${base}${path}`, `base + path`).
+/// A path with a parameter inside it (`/orders/${id}/cancel`) is a literal route, not a
+/// forwarded one.
+fn forwarded_param(ctx: &Ctx, n: Node) -> Option<usize> {
+    match n.kind() {
+        "identifier" => enclosing_param(ctx, ctx.text(n)).map(|(_, i)| i),
+        "template_string" => {
+            if template_text(n, ctx.src).starts_with('/') {
+                return None;
+            }
+            let kids = named_children(n);
+            let last = kids.last().filter(|c| c.kind() == "template_substitution" && n.end_byte() - c.end_byte() <= 1)?;
+            last.named_child(0).and_then(|e| forwarded_param(ctx, e))
+        }
+        "binary_expression" => {
+            let left = n.child_by_field_name("left")?;
+            if string_like(left, ctx.src).map(|s| s.starts_with('/')).unwrap_or(false) {
+                return None;
+            }
+            n.child_by_field_name("right").and_then(|r| forwarded_param(ctx, r))
+        }
+        "parenthesized_expression" => n.named_child(0).and_then(|c| forwarded_param(ctx, c)),
+        _ => None,
+    }
+}
+
+/// Arguments worth keeping on a call reference (see [`Reference::args`]): URL-like string
+/// literals, short literals beside them (an HTTP method) and pass-through parameters.
+fn call_args(ctx: &Ctx, args: &[Node]) -> Vec<String> {
+    let v: Vec<String> = args
+        .iter()
+        .take(6)
+        .map(|a| match (forwarded_param(ctx, *a), string_like(*a, ctx.src)) {
+            (Some(i), _) => format!("p:{i}"),
+            (None, Some(s)) if s.len() <= 200 => format!("s:{s}"),
+            _ => String::new(),
+        })
+        .collect();
+    let useful = v.iter().any(|a| a.starts_with("p:") || a.starts_with("s:/") || a.contains("://"));
+    if useful {
+        v
+    } else {
+        Vec::new()
+    }
+}
+
+/// The enclosing function sends a request to a URL built from one of its parameters
+/// (`request(method, path) { fetch(base + path, { method }) }`): calls of it with a literal
+/// path are HTTP calls (linked project-wide once calls are resolved).
+fn mark_http_wrapper(ctx: &mut Ctx, url: Option<Node>, method: String) {
+    let Some(i) = url.and_then(|u| forwarded_param(ctx, u)) else { return };
+    let id = ctx.enclosing();
+    if let Some(s) = ctx.symbol_mut(&id) {
+        if matches!(s.kind, SymbolKind::Function | SymbolKind::Method) && !s.modifiers.iter().any(|m| m.starts_with("http-wrapper:")) {
+            s.modifiers.push(format!("http-wrapper:{i}:{method}"));
+        }
+    }
+}
+
+/// HTTP method given by an options object (`{ method }`): a literal, a parameter (`p:<index>`)
+/// or `default`.
+fn options_method(ctx: &Ctx, opts: Option<Node>, default: &str) -> String {
+    match opts.and_then(|o| object_prop(ctx, o, "method")) {
+        Some(m) => match (string_like(m, ctx.src), param_arg(ctx, Some(m))) {
+            (Some(v), _) => v.to_ascii_uppercase(),
+            (None, Some((_, i))) => format!("p:{i}"),
+            _ => String::new(),
+        },
+        None => default.to_string(),
+    }
+}
+
+/// A parameter of the enclosing function passed as an argument (`url` in `app.get(url, h)`).
+fn param_arg(ctx: &Ctx, n: Option<Node>) -> Option<(String, usize)> {
+    let n = n?;
+    matches!(n.kind(), "identifier" | "shorthand_property_identifier").then(|| enclosing_param(ctx, ctx.text(n)))?
 }
 
 /// Attributes Playwright / Cypress / Testing Library locate elements by.
@@ -456,7 +577,7 @@ fn visit_top(ctx: &mut Ctx, st: &mut State, node: Node, exported: bool, is_defau
             visit_function_like(ctx, st, &name, node, node, exported, is_default, decorators);
         }
         "lexical_declaration" | "variable_declaration" => var_decl_top(ctx, st, node, exported),
-        "interface_declaration" => visit_interface(ctx, node, exported),
+        "interface_declaration" => visit_interface(ctx, node, exported, vis_for_export(st, exported)),
         "type_alias_declaration" => {
             if let Some(n) = node.child_by_field_name("name") {
                 let name = ctx.text(n).to_string();
@@ -2309,7 +2430,7 @@ fn visit_field(ctx: &mut Ctx, st: &mut State, m: Node, decorators: Vec<String>) 
     ctx.pop_scope();
 }
 
-fn visit_interface(ctx: &mut Ctx, node: Node, exported: bool) {
+fn visit_interface(ctx: &mut Ctx, node: Node, exported: bool, visibility: String) {
     let Some(n) = node.child_by_field_name("name") else { return };
     let name = ctx.text(n).to_string();
     let mut bases = Vec::new();
@@ -2324,7 +2445,7 @@ fn visit_interface(ctx: &mut Ctx, node: Node, exported: bool) {
     s.signature = if bases.is_empty() { format!("interface {name}") } else { format!("interface {name} extends {}", bases.join(", ")) };
     s.bases = bases;
     s.is_exported = exported;
-    s.visibility = "public".into();
+    s.visibility = visibility;
     s.is_abstract = true;
     s.docstring = doc_comment(node, ctx.src);
     s.body_hash = token_hash(node, ctx.src);
@@ -2404,6 +2525,14 @@ fn walk(ctx: &mut Ctx, st: &mut State, node: Node) {
                     continue;
                 }
                 let value = d.child_by_field_name("value");
+                // `const route = (method, url) => { … }` inside a function: a nested function.
+                if let (Some(n), Some(v)) = (d.child_by_field_name("name"), value) {
+                    if n.kind() == "identifier" && is_function_value(v) {
+                        let name = ctx.text(n).to_string();
+                        nested_function(ctx, st, &name, v, d);
+                        continue;
+                    }
+                }
                 if let Some(n) = d.child_by_field_name("name") {
                     // `const db = require('./db')` inside a function is still an import.
                     if let Some(module) = value.and_then(|v| require_module(ctx, v)) {
@@ -2414,6 +2543,8 @@ fn walk(ctx: &mut Ctx, st: &mut State, node: Node) {
                         let name = ctx.text(n).to_string();
                         let ty = type_annotation_text(ctx, d.child_by_field_name("type"))
                             .or_else(|| jsdoc(ctx, node).ty)
+                            // `const env = process.env`: reads through `env.X` are config reads.
+                            .or_else(|| value.filter(|v| ctx.text(*v) == "process.env").map(|_| "NodeJS.ProcessEnv".to_string()))
                             .or_else(|| value.and_then(|v| infer_value_type(ctx, v)));
                         let ty = ctx.subst_tparam(ty);
                         ctx.declare_local(&name, ty);
@@ -2432,6 +2563,10 @@ fn walk(ctx: &mut Ctx, st: &mut State, node: Node) {
         "function_declaration" | "generator_function_declaration" => {
             if let Some(n) = node.child_by_field_name("name") {
                 let name = ctx.text(n).to_string();
+                if ctx.in_function() {
+                    nested_function(ctx, st, &name, node, node);
+                    return;
+                }
                 ctx.declare_local(&name, None);
             }
             inline_function(ctx, st, node);
@@ -2518,11 +2653,21 @@ fn walk(ctx: &mut Ctx, st: &mut State, node: Node) {
         "member_expression" => member_expr(ctx, st, node),
         "subscript_expression" => {
             if let (Some(o), Some(i)) = (node.child_by_field_name("object"), node.child_by_field_name("index")) {
-                let ot = ctx.text(o);
-                if ot == "process.env" || ot == "import.meta.env" {
-                    if let Some(k) = string_like(i, ctx.src) {
-                        let d = binary_default(ctx, node);
-                        ctx.push_config(&k, "process.env", line_of(node), d);
+                let key = string_like(i, ctx.src);
+                if let Some(src) = env_object(ctx, o, key.as_deref()) {
+                    match key {
+                        Some(k) => {
+                            let d = binary_default(ctx, node);
+                            ctx.push_config(&k, src, line_of(node), d);
+                        }
+                        // `const required = (name) => env[name]`: calls of `required('X')` read X.
+                        None => {
+                            if let Some((f, idx)) = param_arg(ctx, Some(i)) {
+                                if let Some(owner) = helper_owner(ctx) {
+                                    st.env_accessors.insert((owner, f), (idx, src));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2651,6 +2796,18 @@ fn walk_children(ctx: &mut Ctx, st: &mut State, node: Node) {
     }
 }
 
+/// A named function declared inside another function body (`function actor() {}` or
+/// `const route = () => {}`): a symbol of its own, scoped to its parent, so its calls are
+/// attributed to it and calls to it resolve as local functions.
+fn nested_function(ctx: &mut Ctx, st: &mut State, name: &str, func: Node, range: Node) {
+    let before = ctx.facts.symbols.len();
+    visit_function_like(ctx, st, name, func, range, false, false, Vec::new());
+    if let Some(s) = ctx.facts.symbols.get_mut(before) {
+        s.visibility = "private".into();
+        s.is_exported = false;
+    }
+}
+
 fn inline_function(ctx: &mut Ctx, st: &mut State, node: Node) {
     let hint = ctx.lambda_hint.take();
     let params_node = node.child_by_field_name("parameters").or_else(|| node.child_by_field_name("parameter"));
@@ -2709,25 +2866,77 @@ fn apply_param_hint(ctx: &Ctx, params: Option<Node>, hint: &str, locals: &mut [(
     }
 }
 
+/// The fallback of a config read: `env.X ?? 'd'` / `env.X || 'd'`, or the other branch of
+/// `prod ? env.X : 'd'`. A logical test (`if (env.A || env.B) throw …`) is not a fallback.
 fn binary_default(ctx: &Ctx, node: Node) -> Option<String> {
     let p = node.parent()?;
     if p.kind() == "binary_expression" && p.child_by_field_name("left") == Some(node) {
         let op = p.child_by_field_name("operator").map(|o| ctx.text(o)).unwrap_or("");
-        if op == "||" || op == "??" {
+        if (op == "||" || op == "??") && !is_condition(p) {
             return p.child_by_field_name("right").map(|r| truncate(ctx.text(r), 120));
         }
     }
+    if p.kind() == "ternary_expression" && p.child_by_field_name("consequence") == Some(node) {
+        return p.child_by_field_name("alternative").map(|r| truncate(ctx.text(r), 120));
+    }
     None
+}
+
+/// `n` (through enclosing `||` / `&&` / `!` / parentheses) is the test of an `if`, loop or ternary.
+fn is_condition(n: Node) -> bool {
+    let mut cur = n;
+    while let Some(p) = cur.parent() {
+        match p.kind() {
+            "parenthesized_expression" | "unary_expression" => {}
+            "binary_expression" if matches!(p.child_by_field_name("operator").map(|o| o.kind()), Some("||" | "&&")) => {}
+            "if_statement" | "while_statement" | "do_statement" => return true,
+            "ternary_expression" => return p.child_by_field_name("condition") == Some(cur),
+            _ => return false,
+        }
+        cur = p;
+    }
+    false
+}
+
+/// `process.env` / `import.meta.env`, or a variable holding them: typed `NodeJS.ProcessEnv` /
+/// `ImportMetaEnv` (`loadConfig(env: NodeJS.ProcessEnv = process.env)`), or named `env` with a
+/// loose string-map type (`env: Record<string, string | undefined>`, Workers' `env`) when the
+/// key is CONSTANT_CASE. Returns the config source label.
+fn env_object(ctx: &Ctx, obj: Node, key: Option<&str>) -> Option<&'static str> {
+    match ctx.text(obj) {
+        "process.env" => return Some("process.env"),
+        "import.meta.env" => return Some("import.meta.env"),
+        _ => {}
+    }
+    if obj.kind() != "identifier" {
+        return None;
+    }
+    let name = ctx.text(obj);
+    if !(ctx.is_local(name) || ctx.is_module_var(name)) {
+        return None;
+    }
+    let ty = ctx.var_type(name);
+    if ty.as_deref().map(|t| t.contains("ProcessEnv") || t.contains("ImportMetaEnv")).unwrap_or(false) {
+        return Some("process.env");
+    }
+    let loose = ty
+        .as_deref()
+        .map(|t| {
+            let t = t.replace(' ', "");
+            t.starts_with("Record<string,string") || t.contains("[key:string]")
+        })
+        .unwrap_or(true);
+    let env_named = matches!(name, "env" | "environment" | "envVars");
+    let const_key = key.map(|k| k.chars().any(|c| c.is_ascii_uppercase()) && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'));
+    (env_named && loose && const_key.unwrap_or(true)).then_some("process.env")
 }
 
 fn member_expr(ctx: &mut Ctx, st: &mut State, node: Node) {
     let obj = node.child_by_field_name("object");
     let prop = node.child_by_field_name("property").map(|p| ctx.text(p).to_string()).unwrap_or_default();
     let Some(obj) = obj else { return };
-    let ot = ctx.text(obj);
-    if ot == "process.env" || ot == "import.meta.env" {
+    if let Some(src) = env_object(ctx, obj, Some(&prop)) {
         let d = binary_default(ctx, node);
-        let src = if ot == "process.env" { "process.env" } else { "import.meta.env" };
         ctx.push_config(&prop, src, line_of(node), d);
         return;
     }
@@ -2970,11 +3179,17 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
     let mut is_server_route = false;
     if st.server_file && is_route_verb && routerish && arg_list.len() >= min_args {
         let path = chained_path.clone().or_else(|| first_str.clone());
+        let method = if lname == "all" { "ANY".to_string() } else { lname.to_ascii_uppercase() };
         if let Some(path) = path.filter(|p| p.starts_with('/') || p == "*") {
             is_server_route = true;
-            let method = if lname == "all" { "ANY".to_string() } else { lname.to_ascii_uppercase() };
             let handler = *arg_list.last().unwrap();
             handled_args.extend(server_route(ctx, st, framework, &method, &path, handler, &recv_base, line));
+        } else if let Some((wrapper, url)) = param_arg(ctx, arg_list.first().copied()) {
+            // `const get = (path, h) => router.get(path, h)`: a route-registering helper.
+            let handler = param_arg(ctx, arg_list.last().copied()).map(|(_, i)| i).filter(|i| *i != url);
+            if let Some(owner) = helper_owner(ctx) {
+                st.route_wrappers.insert((owner, wrapper), RouteWrapper { method: Err(method), url, handler, framework });
+            }
         }
     }
     // `fastify.route({ method: 'POST', url: '/x', handler })`.
@@ -2989,6 +3204,71 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
                 // The options object is still walked (other keys); the handler body is done.
                 st.walked_handlers.push(handler.id());
             }
+        } else if let Some((wrapper, url)) = param_arg(ctx, object_prop(ctx, opts, "url").or_else(|| object_prop(ctx, opts, "path"))) {
+            // `const route = (method, url, h) => app.route({ method, url, handler: … })`.
+            let method_node = object_prop(ctx, opts, "method");
+            let method = match param_arg(ctx, method_node) {
+                Some((_, i)) => Ok(i),
+                None => Err(method_node.and_then(|m| string_like(m, ctx.src)).unwrap_or_else(|| "ANY".into()).to_ascii_uppercase()),
+            };
+            let handler = param_arg(ctx, handler).map(|(_, i)| i);
+            if let Some(owner) = helper_owner(ctx) {
+                st.route_wrappers.insert((owner, wrapper), RouteWrapper { method, url, handler, framework });
+            }
+        }
+    }
+    // A call of a route-registering helper: `route('POST', '/v1/friends', schema, handler)`.
+    if receiver.is_none() && !is_server_route {
+        if let Some(w) = visible_helper(ctx, &st.route_wrappers, &name) {
+            let path = arg_list.get(w.url).and_then(|a| string_like(*a, ctx.src)).filter(|p| p.starts_with('/'));
+            let method = match &w.method {
+                Ok(i) => arg_list.get(*i).and_then(|a| string_like(*a, ctx.src)).map(|m| m.to_ascii_uppercase()),
+                Err(m) => Some(m.clone()),
+            };
+            let handler = match w.handler {
+                Some(i) => arg_list.get(i).copied(),
+                None => arg_list.iter().rev().find(|a| is_function_value(**a)).copied(),
+            };
+            if let (Some(path), Some(method), Some(handler)) = (path, method, handler) {
+                is_server_route = true;
+                handled_args.extend(server_route(ctx, st, w.framework, &method, &path, handler, "", line));
+                // The helper's own request logic (auth, rate limits, …) runs around the handler:
+                // link the route to it so flows from the route include it.
+                let hid = ctx.facts.routes.last().map(|r| r.handler.clone()).filter(|h| !h.starts_with("ref:"));
+                if let Some(hid) = hid {
+                    ctx.facts.refs.push(Reference {
+                        kind: RefKind::Call,
+                        enclosing: hid,
+                        name: name.clone(),
+                        receiver: None,
+                        receiver_type: None,
+                        root_type: None,
+                        arg_count: argc,
+                        line,
+                        catch_types: Vec::new(),
+                        detail: Some("route registered through this helper".into()),
+                        args: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+    // Framework error handlers: Fastify `setErrorHandler(fn)`, Hono `onError(fn)` and Express
+    // error middleware `app.use((err, req, res, next) => …)` catch whatever a route throws.
+    if st.server_file && routerish {
+        let handler = match name.as_str() {
+            "setErrorHandler" | "onError" => arg_list.last().copied(),
+            "use" => arg_list.iter().copied().find(|a| {
+                is_function_value(*a)
+                    && a.child_by_field_name("parameters").map(|p| named_children(p).len() == 4).unwrap_or(false)
+            }),
+            _ => None,
+        }
+        .filter(|h| is_function_value(*h));
+        if let Some(h) = handler {
+            let id = handler_symbol(ctx, st, framework, "error handler", &format!("{framework} error handler"), h);
+            ctx.facts.global_handlers.push(GlobalHandler { handler: id, exception: "*".into(), framework: framework.to_string(), line });
+            handled_args.push(h);
         }
     }
     // Fastify lifecycle hooks: `fastify.addHook('onRequest', async (request, reply) => …)`.
@@ -3146,10 +3426,15 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
         }
     }
     if !is_server_route {
+        // A URL built from a parameter makes the function an HTTP-client wrapper.
+        let forwards_url = arg_list.first().and_then(|a| forwarded_param(ctx, *a)).is_some();
         if receiver.is_none() && matches!(name.as_str(), "fetch" | "$fetch" | "ofetch" | "useFetch") {
-            if let Some(url) = first_str.clone() {
+            if let Some(url) = first_str.clone().filter(|_| !forwards_url) {
                 let method = arg_list.get(1).and_then(|o| object_string_prop(ctx, *o, "method")).unwrap_or_else(|| "GET".into());
                 ctx.push_http_call(&method, &url, "fetch", line);
+            } else {
+                let method = options_method(ctx, arg_list.get(1).copied(), "GET");
+                mark_http_wrapper(ctx, arg_list.first().copied(), method);
             }
         } else if receiver.as_deref().map(|r| r.ends_with("window") || r == "globalThis").unwrap_or(false) && name == "fetch" {
             if let Some(url) = first_str.clone() {
@@ -3166,13 +3451,16 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
                 || recv_last == "superagent";
             if clientish {
                 let url = first_str.clone().or_else(|| arg_list.first().and_then(|o| object_string_prop(ctx, *o, "url")));
-                if let Some(url) = url.filter(|u| looks_like_url(u)) {
+                if let Some(url) = url.filter(|u| looks_like_url(u) && !forwards_url) {
                     let method = if lname == "request" {
                         arg_list.first().and_then(|o| object_string_prop(ctx, *o, "method")).unwrap_or_else(|| "GET".into())
                     } else {
                         lname.to_ascii_uppercase()
                     };
                     ctx.push_http_call(&method, &url, receiver.as_deref().unwrap_or("http"), line);
+                } else if lname != "request" {
+                    // `get(path) { return this.http.get(`${base}${path}`) }`.
+                    mark_http_wrapper(ctx, arg_list.first().copied(), lname.to_ascii_uppercase());
                 }
             }
         } else if receiver.is_none() && name == "axios" {
@@ -3187,6 +3475,14 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
     }
 
     // ---- Config, DI-adjacent and entrypoint patterns ----
+    if receiver.is_none() {
+        if let Some((i, src)) = visible_helper(ctx, &st.env_accessors, &name) {
+            if let Some(k) = arg_list.get(i).and_then(|a| string_like(*a, ctx.src)) {
+                let default = arg_list.get(i + 1).map(|d| truncate(ctx.text(*d), 120)).or_else(|| binary_default(ctx, node));
+                ctx.push_config(&k, src, line, default);
+            }
+        }
+    }
     if matches!(name.as_str(), "get" | "getOrThrow") && recv_last.contains("config") {
         if let Some(k) = first_str.clone() {
             ctx.push_config(&k, "config_service", line, arg_list.get(1).map(|n| ctx.text(*n).to_string()));
@@ -3314,7 +3610,14 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
         _ => None,
     };
     let detail = type_args.map(|t| collapse_ws(&t));
+    let refs_before = ctx.facts.refs.len();
     ctx.push_ref(RefKind::Call, &name, receiver, rtype, argc, line, detail);
+    if ctx.facts.refs.len() > refs_before {
+        let a = call_args(ctx, &arg_list);
+        if let Some(r) = ctx.facts.refs.last_mut() {
+            r.args = a;
+        }
+    }
     if let Some(r) = recv_node {
         walk(ctx, st, r);
     }
@@ -3618,6 +3921,16 @@ fn server_route<'t>(
     let walked = if is_function_value(handler) {
         let label = format!("{method} {path}");
         let id = handler_symbol(ctx, st, framework, &label, &format!("route {method} {path}"), handler);
+        // The route spans its whole registration (path, schema / middleware arguments and the
+        // handler), so reading the route reads all of it.
+        let mut call = handler.parent();
+        while let Some(c) = call.filter(|c| c.kind() != "call_expression") {
+            call = c.parent();
+        }
+        if let (Some(c), Some(s)) = (call, ctx.symbol_mut(&id)) {
+            s.start_line = s.start_line.min(line_of(c));
+            s.end_line = s.end_line.max(end_line_of(c));
+        }
         ctx.push_route(&id, method, path, framework, line);
         Some(handler)
     } else {

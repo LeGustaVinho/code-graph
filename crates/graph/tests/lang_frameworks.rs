@@ -35,7 +35,10 @@ fn react_routes_context_props_and_state() {
     for want in ["PAGE /users react-router", "PAGE /users/:id react-router", "PAGE /account/settings react-router"] {
         assert!(r.iter().any(|x| x == want), "{want} missing: {r:?}");
     }
-    assert_eq!(edge(c, "UsersPage", "Session.refresh", "CALLS").as_deref(), Some("exact"), "useContext(AuthContext)");
+    // `const reload = () => …` is a nested function of the component; passing it as a JSX
+    // handler links the component to it.
+    assert_eq!(edge(c, "UsersPage.reload", "Session.refresh", "CALLS").as_deref(), Some("exact"), "useContext(AuthContext)");
+    assert_eq!(edge(c, "UsersPage", "UsersPage.reload", "CALLS").as_deref(), Some("exact"), "onClick={{reload}}");
     assert_eq!(edge(c, "UserDetail", "Session.logout", "CALLS").as_deref(), Some("exact"), "({{ session }}: DetailProps)");
     assert_eq!(sym(c, "DetailProps.session").kind, "property", "type alias members");
     assert_eq!(sym(c, "useCart.add").kind, "method", "zustand store member");

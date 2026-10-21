@@ -332,6 +332,9 @@ impl<'a> FileResolver<'a> {
         if let Some(rc) = &r.receiver {
             m["receiver"] = json!(rc);
         }
+        if !r.args.is_empty() {
+            m["args"] = json!(r.args);
+        }
         m
     }
 
@@ -1213,6 +1216,27 @@ impl<'a> FileResolver<'a> {
     }
 
     /// Last resort: match by name across the project (inferred / unresolved).
+    /// The candidate whose declaring type is a supertype of every other candidate's.
+    fn common_declaration(&self, cands: &[usize]) -> Option<usize> {
+        let owner = |i: usize| self.index.syms[i].sym.parent_id.clone();
+        let ancestors = |t: &str| -> HashSet<String> {
+            let mut seen = HashSet::new();
+            let mut stack = vec![t.to_string()];
+            while let Some(x) = stack.pop() {
+                if seen.insert(x.clone()) && seen.len() < 64 {
+                    for (b, _) in self.index.bases.get(&x).cloned().unwrap_or_default() {
+                        stack.push(b);
+                    }
+                }
+            }
+            seen
+        };
+        cands.iter().copied().find(|&root| {
+            let Some(rt) = owner(root) else { return false };
+            cands.iter().all(|&c| c == root || owner(c).map(|ct| ct != rt && ancestors(&ct).contains(&rt)).unwrap_or(false))
+        })
+    }
+
     fn global_by_name(&mut self, r: &Reference, method_only: bool) {
         if STOP_NAMES.contains(&r.name.as_str()) || r.name.len() < 3 {
             return;
@@ -1253,6 +1277,16 @@ impl<'a> FileResolver<'a> {
                 self.emit_call(r, cands[0], Confidence::Inferred, what, "name-matcher");
             }
             n if n <= MAX_AMBIGUOUS => {
+                // `tx.one()` where every candidate is one declaration and its overrides /
+                // implementations (`Repository.one`, `PostgresRepository.one`, a test fake):
+                // the call goes through that declaration whatever the runtime type.
+                if method_only {
+                    if let Some(root) = self.common_declaration(&cands) {
+                        let what = format!("all {n} methods named '.{}()' implement {}", r.name, self.index.syms[root].sym.qualified_name);
+                        self.emit_call(r, root, Confidence::Inferred, what, "name-matcher");
+                        return;
+                    }
+                }
                 let recv = r.receiver.clone().unwrap_or_default();
                 let label = if recv.is_empty() { r.name.clone() } else { format!("{recv}.{}", r.name) };
                 self.emit_unresolved_call(r, &label, format!("{n} potential targets for {label}() (dynamic receiver)"), &cands);

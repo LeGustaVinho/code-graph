@@ -18,6 +18,8 @@ pub struct BudgetWriter {
     shown: usize,
     total: usize,
     truncated: bool,
+    /// The token budget (not a result limit) stopped the output.
+    budget_hit: bool,
 }
 
 const MARKER_RESERVE: usize = 32;
@@ -32,6 +34,7 @@ impl BudgetWriter {
             shown: 0,
             total: 0,
             truncated: false,
+            budget_hit: false,
         }
     }
 
@@ -53,6 +56,7 @@ impl BudgetWriter {
         if let Some(b) = self.budget {
             if self.used + cost + MARKER_RESERVE > b {
                 self.truncated = true;
+                self.budget_hit = true;
                 return false;
             }
         }
@@ -89,12 +93,12 @@ impl BudgetWriter {
             out.push('\n');
         }
         if self.truncated {
-            match self.budget {
+            match self.budget.filter(|_| self.budget_hit) {
                 Some(b) => out.push_str(&format!(
                     "[TRUNCATED: Showing {} of {} results to fit {} token budget ({} tokens used)]",
                     self.shown, self.total, b, self.used
                 )),
-                None => out.push_str(&format!("[TRUNCATED: Showing {} of {} results]", self.shown, self.total)),
+                None => out.push_str(&format!("[MORE: showing {} of {} results; raise `limit` to see the rest]", self.shown, self.total)),
             }
             out.push('\n');
         }

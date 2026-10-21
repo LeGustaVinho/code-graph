@@ -1,6 +1,6 @@
 //! 5.5 Data contracts, configuration & surgical extraction.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use codegraph_core::render;
 use codegraph_core::{Language, SymbolKind};
@@ -153,8 +153,64 @@ pub fn get_data_model(ctx: &Ctx, p: ModelParams) -> ToolResult {
 pub struct ConfigParams {
     /// Optional key filter (substring, case-insensitive).
     pub filter: Option<String>,
+    /// Only reads in files whose path contains this fragment (e.g. "apps/api").
+    pub path: Option<String>,
+    /// List keys that config files define but no code reads one per line (default: only their names).
+    pub include_unread: Option<bool>,
     pub max_token_budget: Option<usize>,
     pub format: Option<String>,
+}
+
+/// One key's reads grouped by (file, enclosing symbol, source, default): `file:12,30 in f (process.env, default 3000)`.
+fn grouped_reads(reads: &[(String, u32, String, String, Option<String>)], key: &str) -> Vec<String> {
+    // Grouped by (file, symbol, source); the defaults seen on any of those reads are merged.
+    let mut order: Vec<(String, String, String)> = Vec::new();
+    let mut lines: HashMap<(String, String, String), (Vec<u32>, Vec<String>)> = HashMap::new();
+    for (file, line, who, src, default) in reads {
+        let k = (file.clone(), who.clone(), src.clone());
+        if !lines.contains_key(&k) {
+            order.push(k.clone());
+        }
+        let v = lines.entry(k).or_default();
+        if !v.0.contains(line) {
+            v.0.push(*line);
+        }
+        if let Some(d) = default.as_deref().and_then(|d| clean_default(d, key)) {
+            if !v.1.contains(&d) {
+                v.1.push(d);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|k| {
+            let (ls, defaults) = &lines[&k];
+            let ls = ls.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(",");
+            let (file, who, src) = k;
+            let default = (!defaults.is_empty()).then(|| defaults.iter().map(|d| codegraph_core::extract::truncate(d, 60)).collect::<Vec<_>>().join(" | "));
+            let d = default.map(|d| format!(", default {d}")).unwrap_or_default();
+            let who = if who.is_empty() { String::new() } else { format!(" in {who}") };
+            // `process.env` is the common case: only other sources are named.
+            let how = match (src.as_str(), d.is_empty()) {
+                ("process.env", true) => String::new(),
+                ("process.env", false) => format!(" ({})", d.trim_start_matches(", ")),
+                _ => format!(" ({src}{d})"),
+            };
+            format!("{file}:{ls}{who}{how}")
+        })
+        .collect()
+}
+
+/// A readable fallback value: one line, not `undefined`, and not an expression that reads the
+/// key itself (`env.X ?? (prod ? required('X') : 'd')` is reported through its own `'d'`).
+fn clean_default(d: &str, key: &str) -> Option<String> {
+    let d = codegraph_core::extract::collapse_ws(d);
+    let d = d.trim();
+    let d = if d.starts_with('(') && d.ends_with(')') { &d[1..d.len() - 1] } else { d };
+    if d.is_empty() || d == "undefined" || d == "null" || d.contains(key) {
+        return None;
+    }
+    Some(codegraph_core::extract::truncate(d, 60))
 }
 
 pub fn get_config_matrix(ctx: &Ctx, p: ConfigParams) -> ToolResult {
@@ -162,7 +218,10 @@ pub fn get_config_matrix(ctx: &Ctx, p: ConfigParams) -> ToolResult {
     let rows: Vec<(String, String, String, u32, Option<String>, String, Option<String>)> =
         st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.flatten().collect();
     let encl = nodes_map(ctx.conn, rows.iter().filter_map(|r| r.6.clone()))?;
-    let mut keys: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
+    // key → (reads, defining files). Defined values are never printed: `.env` files hold secrets.
+    type Reads = Vec<(String, u32, String, String, Option<String>)>;
+    let mut keys: BTreeMap<String, (Reads, Vec<String>)> = BTreeMap::new();
+    let path = p.path.as_deref().map(|x| x.replace('\\', "/").trim_start_matches("./").to_string());
     for (key, src, file, line, default, usage, enc) in &rows {
         if let Some(f) = &p.filter {
             if !key.to_ascii_lowercase().contains(&f.to_ascii_lowercase()) {
@@ -171,46 +230,114 @@ pub fn get_config_matrix(ctx: &Ctx, p: ConfigParams) -> ToolResult {
         }
         let e = keys.entry(key.clone()).or_default();
         if usage == "define" {
-            let v = default.as_ref().map(|d| format!("={}", codegraph_core::extract::truncate(d, 40))).unwrap_or_default();
-            e.1.push(format!("{file}:{line}{v}"));
-        } else {
-            let who = enc.as_ref().and_then(|x| encl.get(x)).map(display).unwrap_or_default();
-            let d = default.as_ref().map(|d| format!(", default {}", codegraph_core::extract::truncate(d, 40))).unwrap_or_default();
-            let entry = format!("{file}:{line} in {who} ({src}{d})");
-            if !e.0.contains(&entry) {
-                e.0.push(entry);
+            if !e.1.contains(file) {
+                e.1.push(file.clone());
             }
+        } else if path.as_deref().map(|p| file.contains(p)).unwrap_or(true) {
+            let who = enc.as_ref().and_then(|x| encl.get(x)).map(display).unwrap_or_default();
+            e.0.push((file.clone(), *line, who, src.clone(), default.clone()));
         }
+    }
+    // With a path filter, keys nobody reads there are out of scope.
+    if path.is_some() {
+        keys.retain(|_, v| !v.0.is_empty());
     }
     let read_keys = keys.values().filter(|v| !v.0.is_empty()).count();
     let missing = keys.values().filter(|v| !v.0.is_empty() && v.1.is_empty()).count();
     let mut out = Out::new();
-    out.h(format!("{} config key(s): {read_keys} read by code, {missing} read but not defined in any indexed config file", keys.len()));
+    out.h(format!(
+        "{} config key(s): {read_keys} read by code ({missing} without indexed definitions)",
+        keys.len()
+    ));
     let json = wants_json(&p.format);
-    // Keys read by code first, then definitions nobody reads.
-    let mut ordered: Vec<(&String, &(Vec<String>, Vec<String>))> = keys.iter().collect();
-    ordered.sort_by_key(|(_, v)| v.0.is_empty());
-    for (k, (reads, defs)) in ordered {
-        if json {
-            out.item(json!({ "key": k, "reads": reads, "defined_at": defs }).to_string());
-            continue;
-        }
-        let mut item = k.to_string();
-        if reads.is_empty() {
-            item.push_str(&format!(" | defined only: {}", defs.join("; ")));
-        } else {
-            item.push_str(&format!(" | reads: {}", reads.join("; ")));
-            if defs.is_empty() && (k.starts_with("asset:") || k.starts_with("anim:")) {
-                item.push_str(" | ⚠ never loaded / created (no `this.load.*` / `anims.create` defines it)");
-            } else if defs.is_empty() && k.starts_with("registry:") {
-                item.push_str(" | ⚠ read but never set in the registry");
-            } else if defs.is_empty() {
-                item.push_str(" | ⚠ not defined in config files (must come from the environment)");
+    let mut unread: Vec<&String> = Vec::new();
+    if json {
+        for (k, (reads, defs)) in &keys {
+            if !reads.is_empty() || p.include_unread.unwrap_or(false) {
+                out.item(json!({ "key": k, "reads": grouped_reads(reads, k), "defined_in": defs }).to_string());
             } else {
-                item.push_str(&format!(" | defined: {}", defs.join("; ")));
+                unread.push(k);
             }
         }
-        out.item(item);
+        if !unread.is_empty() {
+            out.item(json!({ "unread_key_count": unread.len(), "hint": "include_unread=true for details" }).to_string());
+        }
+        return Ok(out);
+    }
+    // Text: keys grouped under the function that reads them (paths and names are not repeated
+    // per key); defining config files are numbered once.
+    let mut def_files: Vec<&String> = keys.values().filter(|v| !v.0.is_empty()).flat_map(|v| v.1.iter()).collect();
+    def_files.sort();
+    def_files.dedup();
+    if !def_files.is_empty() {
+        let legend: Vec<String> = def_files.iter().enumerate().map(|(i, f)| format!("[{}] {f}", i + 1)).collect();
+        out.h(format!("defining files: {}", legend.join(", ")));
+    }
+    // (file, reader) → [(key, lines, defaults, defined in)]
+    type Entry = (String, Vec<u32>, Vec<String>, String);
+    let mut groups: BTreeMap<(String, String), Vec<Entry>> = BTreeMap::new();
+    let mut first_line: HashMap<(String, String), u32> = HashMap::new();
+    for (k, (reads, defs)) in &keys {
+        if reads.is_empty() {
+            if p.include_unread.unwrap_or(false) {
+                out.item(format!("{k} | not read by indexed code | defined in: {}", defs.join(", ")));
+            } else {
+                unread.push(k);
+            }
+            continue;
+        }
+        let defined = if !defs.is_empty() {
+            let ids: Vec<String> = defs.iter().filter_map(|d| def_files.iter().position(|f| *f == d)).map(|i| (i + 1).to_string()).collect();
+            format!(" [{}]", ids.join(","))
+        } else if k.starts_with("asset:") || k.starts_with("anim:") {
+            " ⚠ never loaded / created (no `this.load.*` / `anims.create` defines it)".to_string()
+        } else if k.starts_with("registry:") {
+            " ⚠ read but never set in the registry".to_string()
+        } else {
+            " (no indexed definition)".to_string()
+        };
+        for (file, line, who, src, default) in reads {
+            let g = (file.clone(), if src == "process.env" { who.clone() } else { format!("{who} ({src})") });
+            let fl = first_line.entry(g.clone()).or_insert(*line);
+            *fl = (*fl).min(*line);
+            let entries = groups.entry(g).or_default();
+            let e = match entries.iter_mut().position(|e| &e.0 == k) {
+                Some(i) => &mut entries[i],
+                None => {
+                    entries.push((k.clone(), Vec::new(), Vec::new(), defined.clone()));
+                    entries.last_mut().unwrap()
+                }
+            };
+            if !e.1.contains(line) {
+                e.1.push(*line);
+            }
+            if let Some(d) = default.as_deref().and_then(|d| clean_default(d, k)) {
+                if !e.2.contains(&d) {
+                    e.2.push(d);
+                }
+            }
+        }
+    }
+    let mut ordered: Vec<((String, String), Vec<Entry>)> = groups.into_iter().collect();
+    ordered.sort_by_key(|(g, _)| (g.0.clone(), first_line.get(g).copied().unwrap_or(0)));
+    for ((file, who), mut entries) in ordered {
+        entries.sort_by_key(|e| e.1.iter().min().copied().unwrap_or(0));
+        out.item(if who.is_empty() { format!("{file}:") } else { format!("{file} {who}:") });
+        for (k, mut ls, defaults, defined) in entries {
+            ls.sort();
+            let ls = ls.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(",");
+            let d = if defaults.is_empty() { String::new() } else { format!(" ={}", defaults.join(" | ")) };
+            out.item(format!("  {k}:{ls}{d}{defined}"));
+        }
+    }
+    if !unread.is_empty() {
+        let names: Vec<&str> = unread.iter().take(20).map(|k| k.as_str()).collect();
+        let more = if unread.len() > 20 { format!(" … +{}", unread.len() - 20) } else { String::new() };
+        out.item(format!(
+            "{} key(s) defined in config files but not read by indexed code (dynamic reads are not seen; include_unread=true for details): {}{more}",
+            unread.len(),
+            names.join(", ")
+        ));
     }
     Ok(out)
 }
@@ -267,6 +394,10 @@ pub struct BodyParams {
     pub strip_comments: Option<bool>,
     /// Maximum number of lines to return.
     pub max_lines: Option<usize>,
+    /// First absolute file line to include (1-based, inclusive); requires end_line.
+    pub start_line: Option<u32>,
+    /// Last absolute file line to include (1-based, inclusive); requires start_line.
+    pub end_line: Option<u32>,
     pub max_token_budget: Option<usize>,
     pub format: Option<String>,
 }
@@ -276,6 +407,19 @@ pub fn get_symbol_body(ctx: &Ctx, p: BodyParams) -> ToolResult {
     if n.sym.kind == SymbolKind::Literal {
         return Err(ToolError::BadArgs("literal nodes have no body; use find_literal".into()));
     }
+    let selection = match (p.start_line, p.end_line) {
+        (None, None) => None,
+        (Some(from), Some(to)) if from > 0 && from <= to && from >= n.sym.start_line && to <= n.sym.end_line => {
+            Some((from as usize, to as usize))
+        }
+        (Some(from), Some(to)) => {
+            return Err(ToolError::BadArgs(format!(
+                "invalid absolute file line range {from}..{to}; start_line and end_line must be ordered, positive, and inside symbol {}:{}-{}",
+                n.file_path, n.sym.start_line, n.sym.end_line
+            )));
+        }
+        _ => return Err(ToolError::BadArgs("start_line and end_line must be provided together (absolute, inclusive file lines)".into())),
+    };
     let path = ctx.engine.root.join(&n.file_path);
     let source = std::fs::read_to_string(&path).map_err(|e| ToolError::Internal(anyhow::anyhow!("reading {}: {e}", n.file_path)))?;
     let strip = p.strip_comments.unwrap_or(false);
@@ -288,15 +432,41 @@ pub fn get_symbol_body(ctx: &Ctx, p: BodyParams) -> ToolResult {
     let lines: Vec<&str> = text.lines().collect();
     let start = n.sym.start_line.max(1) as usize;
     let end = (n.sym.end_line as usize).min(lines.len());
+    if let Some((from, to)) = selection {
+        if to > original.len() || to > lines.len() {
+            return Err(ToolError::BadArgs(format!(
+                "requested file lines {from}..{to} exceed available source lines ({} in {})",
+                original.len(), n.file_path
+            )));
+        }
+    }
     let mut out = Out::new();
     out.h(format!("{} | {}", node_line(&n), n.sym.signature));
+    if let Some((from, to)) = selection {
+        out.h(format!("file lines {from}..{to} (absolute, inclusive)"));
+    }
+    // The body's common indentation is dropped (a method nested in a class or a closure would
+    // otherwise repeat it on every line); relative indentation is kept.
+    let indent = (start..=end)
+        .filter_map(|i| lines.get(i - 1))
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
     let mut body: Vec<String> = Vec::new();
-    for i in start..=end {
+    let (render_start, render_end) = selection.unwrap_or((start, end));
+    for i in render_start..=render_end {
         let l = lines.get(i - 1).copied().unwrap_or("");
         if strip && l.trim().is_empty() && !original.get(i - 1).map(|o| o.trim().is_empty()).unwrap_or(true) {
             continue; // line held only a comment
         }
-        body.push(format!("{i:>4}| {}", l.trim_end()));
+        if selection.is_some() {
+            // A requested slice is an exact source excerpt, including original indentation.
+            body.push(format!("{i:>4}| {l}"));
+        } else {
+            let l = if l.len() >= indent && l.is_char_boundary(indent) { &l[indent..] } else { l.trim_start() };
+            body.push(format!("{i:>4}| {}", l.trim_end()));
+        }
     }
     let total = body.len();
     if let Some(m) = p.max_lines {

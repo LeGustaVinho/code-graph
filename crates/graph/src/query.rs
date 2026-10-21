@@ -160,8 +160,10 @@ pub fn search(conn: &Connection, q: &str, kind: Option<&str>, limit: usize, incl
         if use_fts {
             let fts_q = format!("\"{}\"", q.replace('"', "\"\""));
             let cols = NODE_COLS.split(", ").map(|c| format!("n.{c}")).collect::<Vec<_>>().join(", ");
+            // Filters apply inside the ranked scan, so a kind filter never empties a page of
+            // otherwise-matching rows.
             let sql = format!(
-                "SELECT {cols} FROM (SELECT rowid, rank FROM node_fts WHERE node_fts MATCH ?1 ORDER BY rank, rowid LIMIT ?3) f JOIN node n ON n.rid = f.rowid WHERE 1 = 1{} ORDER BY n.derived, f.rank, n.qualified_name, n.file_path, n.start_line, n.id",
+                "SELECT {cols} FROM node_fts f JOIN node n ON n.rid = f.rowid WHERE node_fts MATCH ?1{} ORDER BY n.derived, f.rank, n.qualified_name, n.file_path, n.start_line, n.id LIMIT ?3",
                 filters.replace(" kind", " n.kind")
             );
             let mut st = conn.prepare_cached(&sql)?;
@@ -176,12 +178,17 @@ pub fn search(conn: &Connection, q: &str, kind: Option<&str>, limit: usize, incl
     // Total (capped so very common terms stay cheap).
     let total: i64 = if use_fts {
         let fts_q = format!("\"{}\"", q.replace('"', "\"\""));
-        conn.query_row("SELECT COUNT(*) FROM (SELECT 1 FROM node_fts WHERE node_fts MATCH ?1 LIMIT 1000)", [fts_q], |r| r.get(0))?
+        let sql = format!(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM node_fts f JOIN node n ON n.rid = f.rowid WHERE node_fts MATCH ?1{} LIMIT 1000)",
+            filters.replace(" kind", " n.kind")
+        );
+        conn.query_row(&sql, params![fts_q, kind_arg], |r| r.get(0))?
     } else {
         out.len() as i64
     };
     let _ = extra;
-    let total = (total as usize).max(out.len());
+    // Fewer rows than the limit means every match is shown.
+    let total = if out.len() < limit { out.len() } else { (total as usize).max(out.len()) };
     out.truncate(limit);
     Ok((out, total))
 }

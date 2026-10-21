@@ -783,6 +783,29 @@ fn recompute_global(tx: &Transaction, index: &SymbolIndex, progress: &Progress) 
         })?;
         rows.flatten().collect()
     };
+    // Calls of HTTP-client wrappers (`request('POST', '/v1/orders')`) are HTTP calls too.
+    let arg_calls: Vec<global::ArgCallRow> = {
+        let mut st = tx.prepare(
+            "SELECT source_id, source_file, target_id, line_number, metadata FROM edge              WHERE relation = 'CALLS' AND target_id IS NOT NULL AND metadata LIKE '%\"args\"%' ORDER BY source_file, line_number, source_id, target_id",
+        )?;
+        let rows = st.query_map([], |r| {
+            let meta: Option<String> = r.get(4)?;
+            let args: Vec<String> = meta
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+                .and_then(|v| v.get("args").and_then(|a| serde_json::from_value(a.clone()).ok()))
+                .unwrap_or_default();
+            Ok(global::ArgCallRow {
+                source_id: r.get(0)?,
+                source_file: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                target_id: r.get(2)?,
+                line: r.get::<_, Option<u32>>(3)?.unwrap_or(0),
+                args,
+            })
+        })?;
+        rows.flatten().collect()
+    };
+    let mut calls = calls;
+    calls.extend(global::wrapper_http_calls(index, &arg_calls));
     let http = global::http_edges(index, &resolved, &calls);
     edges.extend(global::http_test_edges(index, &http));
     let testids: Vec<global::TestIdRow> = {

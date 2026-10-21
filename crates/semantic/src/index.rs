@@ -426,7 +426,9 @@ impl SymbolIndex {
                 out.extend(found.iter().copied());
                 continue; // nearest declaration wins (override)
             }
-            if depth < 6 {
+            // `seen` already stops cycles; the cap only bounds pathological hierarchies (layered
+            // service classes routinely inherit 7+ levels deep).
+            if depth < 32 {
                 if let Some(bs) = self.bases.get(tid) {
                     for (b, _) in bs {
                         if let Some(bi) = self.by_id.get(b) {

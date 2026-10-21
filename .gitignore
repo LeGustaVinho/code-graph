@@ -2,3 +2,7 @@
 .codegraph/
 *.db-wal
 *.db-shm
+/benchmarks/2026-10-21-lfg*/
+/benchmarks/**/_tokenizer/
+/benchmarks/**/__pycache__/
+/benchmarks/example/

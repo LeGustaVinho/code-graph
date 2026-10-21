@@ -258,6 +258,14 @@ pub(super) fn infer(ctx: &mut Ctx) {
     for h in &facts.http_calls {
         add(&h.enclosing, "NETWORK_IO");
     }
+    // Raw SQL queries (`tx.query('SELECT …')`, `WITH … SELECT`).
+    for l in facts.literals.iter().filter(|l| matches!(l.literal_type.as_str(), "string" | "template")) {
+        let head: String = l.value.trim_start().chars().take(7).collect::<String>().to_ascii_uppercase();
+        if head.starts_with("SELECT ") || head.starts_with("SELECT
+") || (head.starts_with("WITH ") && l.value.to_ascii_uppercase().contains("SELECT ")) {
+            add(&l.enclosing, "DB_READ");
+        }
+    }
     for c in facts.config.iter().filter(|c| c.usage == "read") {
         if let Some(e) = &c.enclosing {
             add(e, "CONFIG_READ");

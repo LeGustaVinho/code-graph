@@ -125,7 +125,13 @@ pub fn trace_error_flow(ctx: &Ctx, p: ErrorFlowParams) -> ToolResult {
         }
         for c in &caught {
             let catcher = c.target_id.as_ref().and_then(|x| cnodes.get(x)).map(node_line).unwrap_or_default();
-            item.push_str(&format!("\n  CAUGHT by {catcher} [{}: {}]", c.confidence.as_str(), c.evidence));
+            let global = c.metadata.as_ref().and_then(|m| m.get("global_handler")).and_then(|g| g.as_bool()).unwrap_or(false);
+            if global {
+                // Nothing in the call chain catches it: the evidence would only repeat that.
+                item.push_str(&format!("\n  CAUGHT by global handler {catcher} [{}]", c.confidence.as_str()));
+            } else {
+                item.push_str(&format!("\n  CAUGHT by {catcher} [{}: {}]", c.confidence.as_str(), c.evidence));
+            }
         }
         out.item(item);
     }

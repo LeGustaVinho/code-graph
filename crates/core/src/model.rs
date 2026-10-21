@@ -220,6 +220,12 @@ pub struct Reference {
     /// Message literal (throws) or generic type arguments (calls).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Call arguments that matter across files, by position: `s:<string literal>`,
+    /// `p:<index>` (a parameter of the enclosing function, passed through), or empty.
+    /// Only recorded when one of them is set (calls of HTTP-client wrappers are linked to
+    /// routes through them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

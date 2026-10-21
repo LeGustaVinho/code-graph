@@ -1,6 +1,6 @@
 //! 5.6 Governance & tests: complexity hotspots, architecture rules, tests for a symbol.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use codegraph_graph::store::{node_from_row, NODE_COLS};
 use codegraph_graph::Node;
@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::fmt::{display, node_line};
+use super::fmt::display;
 use super::{nodes_map, resolve_symbol, wants_json, Ctx, Out, ToolResult};
 
 #[derive(Deserialize, JsonSchema)]
@@ -131,15 +131,36 @@ pub fn validate_dependency_rule(ctx: &Ctx, p: RuleParams) -> ToolResult {
 pub struct TestsParams {
     /// Symbol id or name (types include their members).
     pub symbol_id: String,
-    /// Maximum hops between a test and the symbol (default 4).
+    /// Maximum hops between a test and the symbol (default 2, max 6).
     pub depth: Option<usize>,
+    /// Maximum displayed results including direct tests and transitive files (default 12).
+    pub limit: Option<usize>,
     pub max_token_budget: Option<usize>,
     pub format: Option<String>,
 }
 
+/// `tests/order-service.spec.ts` names `src/order-service.ts` (and `test_orders.py` names `orders.py`).
+fn names_file(test_file: &str, file: &str) -> bool {
+    let stem = |p: &str| -> String {
+        let name = p.rsplit(['/', '\\']).next().unwrap_or(p);
+        let base = name.split('.').next().unwrap_or(name).to_ascii_lowercase();
+        let base = base.strip_prefix("test_").or_else(|| base.strip_prefix("spec_")).unwrap_or(&base);
+        let base = base.strip_suffix("_tests")
+            .or_else(|| base.strip_suffix("_test"))
+            .or_else(|| base.strip_suffix("_spec"))
+            .or_else(|| base.strip_suffix("tests"))
+            .or_else(|| base.strip_suffix("test"))
+            .unwrap_or(base);
+        base.to_string()
+    };
+    let (t, f) = (stem(test_file), stem(file));
+    !f.is_empty() && t == f
+}
+
 pub fn get_tests_for_symbol(ctx: &Ctx, p: TestsParams) -> ToolResult {
     let n = resolve_symbol(ctx.conn, &p.symbol_id)?;
-    let depth = p.depth.unwrap_or(4).clamp(1, 10);
+    let depth = p.depth.unwrap_or(2).clamp(1, 6);
+    let limit = p.limit.unwrap_or(12).clamp(1, 100);
     let sql = "WITH RECURSIVE seeds(id) AS (SELECT ?1 UNION SELECT id FROM node WHERE parent_id = ?1), \
                up(id, d) AS (SELECT id, 0 FROM seeds UNION SELECT e.source_id, up.d + 1 FROM up JOIN edge e ON e.target_id = up.id \
                WHERE up.d < ?2 AND e.relation IN ('CALLS', 'HTTP_CALLS', 'TESTS', 'RESOLVES_DI')) \
@@ -149,12 +170,89 @@ pub fn get_tests_for_symbol(ctx: &Ctx, p: TestsParams) -> ToolResult {
     let nodes = nodes_map(ctx.conn, rows.iter().map(|r| r.0.clone()))?;
     let direct: HashSet<String> =
         codegraph_graph::query::edges_in(ctx.conn, &n.sym.id, &["TESTS"])?.into_iter().map(|e| e.source_id).collect();
+    // Tests that call the symbol (1 hop), link to it explicitly or live in the test file named
+    // after its file are listed one by one; the rest — usually reached through shared setup
+    // such as an app factory — are summarised per file, nearest first.
+    let mut close: Vec<(i64, &Node, &str)> = Vec::new();
+    let mut by_file: BTreeMap<String, (i64, usize)> = BTreeMap::new();
+    for (id, d) in &rows {
+        let Some(t) = nodes.get(id) else { continue };
+        let how = if direct.contains(id) {
+            Some("direct")
+        } else if *d <= 1 {
+            Some("calls it")
+        } else if names_file(&t.file_path, &n.file_path) {
+            Some("same-name file")
+        } else {
+            None
+        };
+        match how {
+            Some(h) => close.push((*d, t, h)),
+            None => {
+                let e = by_file.entry(t.file_path.clone()).or_insert((*d, 0));
+                e.1 += 1;
+                e.0 = e.0.min(*d);
+            }
+        }
+    }
+    // Test files named after the symbol's file, even when no call path reaches it within
+    // `depth` (tests that drive it through HTTP, a CLI or fixtures).
+    let reached: HashSet<&str> = nodes.values().map(|t| t.file_path.as_str()).collect();
+    let mut named: Vec<(String, i64)> = Vec::new();
+    {
+        let mut st = ctx.conn.prepare("SELECT file_path, COUNT(*) FROM node WHERE is_test = 1 AND kind = 'test' GROUP BY file_path ORDER BY file_path")?;
+        let rows: Vec<(String, i64)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.flatten().collect();
+        for (f, c) in rows {
+            if names_file(&f, &n.file_path) && !reached.contains(f.as_str()) {
+                named.push((f, c));
+            }
+        }
+    }
+    close.sort_by(|a, b| {
+        let priority = |h: &str| match h { "direct" => 0, "calls it" => 1, _ => 2 };
+        priority(a.2).cmp(&priority(b.2))
+            .then(a.0.cmp(&b.0))
+            .then(a.1.file_path.cmp(&b.1.file_path))
+            .then(a.1.sym.start_line.cmp(&b.1.sym.start_line))
+    });
     let mut out = Out::new();
-    out.h(format!("{} test(s) reach {} {} (≤ {depth} hops)", rows.len(), display(&n), n.coords()));
-    for (id, d) in rows {
-        let Some(t) = nodes.get(&id) else { continue };
-        let how = if direct.contains(&id) { "direct" } else { "transitive" };
-        out.item(format!("{d} hop(s) {how} {}", node_line(t)));
+    let files = &reached;
+    out.h(format!("{} linked test(s) in {} file(s) for {} {} (≤ {depth} hops); {} same-name candidate file(s)",
+        rows.len(), files.len(), display(&n), n.coords(), named.len()));
+    let shown_close = close.len().min(limit);
+    let shown_named = named.len().min(limit - shown_close);
+    let shown_other = by_file.len().min(limit - shown_close - shown_named);
+    out.unshown = close.len() - shown_close + named.len() - shown_named + by_file.len() - shown_other;
+    if wants_json(&p.format) {
+        for (d, t, how) in close.iter().take(shown_close) {
+            out.item(json!({ "test": display(t), "coords": t.coords(), "hops": d, "link": how }).to_string());
+        }
+        for (f, c) in named.iter().take(shown_named) {
+            out.item(json!({ "file": f, "tests": c, "link": "same-name candidate" }).to_string());
+        }
+        let mut transitives: Vec<_> = by_file.iter().collect();
+        transitives.sort_by(|a, b| a.1 .0.cmp(&b.1 .0).then(b.1 .1.cmp(&a.1 .1)).then(a.0.cmp(b.0)));
+        for (f, (d, c)) in transitives.into_iter().take(shown_other) {
+            out.item(json!({ "file": f, "tests": c, "min_hops": d }).to_string());
+        }
+        return Ok(out);
+    }
+    if !close.is_empty() {
+        out.item(format!("closest ({}):", close.len()));
+        for (d, t, how) in close.iter().take(shown_close) {
+            out.item(format!("  {d}h {how} {} {}", display(t), t.coords()));
+        }
+    }
+    for (f, c) in named.iter().take(shown_named) {
+        out.item(format!("same-name candidate (not a proven call path): {f} ({c} test(s))"));
+    }
+    if !by_file.is_empty() {
+        let mut files: Vec<(&String, &(i64, usize))> = by_file.iter().collect();
+        files.sort_by(|a, b| a.1 .0.cmp(&b.1 .0).then(b.1 .1.cmp(&a.1 .1)).then(a.0.cmp(b.0)));
+        out.item(format!("other tests reaching it through shared code, by file ({}; a smaller depth narrows):", files.len()));
+        for (f, (d, c)) in files.iter().take(shown_other) {
+            out.item(format!("  {f}: {c} test(s), ≥{d}h"));
+        }
     }
     Ok(out)
 }

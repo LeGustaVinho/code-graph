@@ -355,6 +355,81 @@ fn dedupe_routes(v: Vec<&ResolvedRoute>) -> Vec<&ResolvedRoute> {
     v.into_iter().filter(|r| seen.insert(r.handler_id.clone())).collect()
 }
 
+/// A resolved call with the arguments the extractor kept (`s:<literal>` / `p:<index>`).
+#[derive(Clone, Debug)]
+pub struct ArgCallRow {
+    pub source_id: String,
+    pub source_file: String,
+    pub target_id: String,
+    pub line: u32,
+    pub args: Vec<String>,
+}
+
+/// Where a wrapper takes the URL from (parameter index) and its HTTP method (`p:<index>`, a
+/// verb, or empty when unknown).
+type WrapperSpec = (usize, String);
+
+/// Calls of HTTP-client wrappers, project-wide: a function marked `http-wrapper:<url>:<method>`
+/// by the extractor (its parameter reaches `fetch` / axios / a client's URL) makes every call
+/// of it with a literal path an HTTP call, and every function that forwards its own parameter
+/// to such a wrapper a wrapper too (`protectedRequest(…, path)` → `request('POST', path)` →
+/// `fetch(base + path)`).
+pub fn wrapper_http_calls(index: &SymbolIndex, calls: &[ArgCallRow]) -> Vec<HttpCallRow> {
+    let mut wrappers: HashMap<String, WrapperSpec> = HashMap::new();
+    for s in &index.syms {
+        if let Some(spec) = s.sym.modifiers.iter().find_map(|m| m.strip_prefix("http-wrapper:")) {
+            if let Some((url, method)) = spec.split_once(':') {
+                if let Ok(i) = url.parse() {
+                    wrappers.insert(s.sym.id.clone(), (i, method.to_string()));
+                }
+            }
+        }
+    }
+    let arg = |c: &ArgCallRow, i: usize| c.args.get(i).cloned().unwrap_or_default();
+    // Wrappers of wrappers, to a fixed point (bounded: chains are short).
+    for _ in 0..6 {
+        let mut added = false;
+        for c in calls {
+            let Some((url_i, method)) = wrappers.get(&c.target_id).cloned() else { continue };
+            if wrappers.contains_key(&c.source_id) {
+                continue;
+            }
+            if let Some(p) = arg(c, url_i).strip_prefix("p:").and_then(|p| p.parse::<usize>().ok()) {
+                let m = match method.strip_prefix("p:").and_then(|k| k.parse::<usize>().ok()) {
+                    Some(k) => {
+                        let a = arg(c, k);
+                        a.strip_prefix("s:").map(|v| v.to_ascii_uppercase()).unwrap_or_else(|| if a.starts_with("p:") { a } else { String::new() })
+                    }
+                    None => method.clone(),
+                };
+                wrappers.insert(c.source_id.clone(), (p, m));
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    let mut out = Vec::new();
+    for c in calls {
+        let Some((url_i, method)) = wrappers.get(&c.target_id) else { continue };
+        let Some(url) = arg(c, *url_i).strip_prefix("s:").map(String::from) else { continue };
+        if !(url.starts_with('/') || url.contains("://")) {
+            continue;
+        }
+        let method = match method.strip_prefix("p:").and_then(|k| k.parse::<usize>().ok()) {
+            Some(k) => arg(c, k).strip_prefix("s:").map(|v| v.to_ascii_uppercase()).unwrap_or_default(),
+            None => method.clone(),
+        };
+        let client = index.get(&c.target_id).map(|s| s.sym.name.clone()).unwrap_or_else(|| "wrapper".into());
+        out.push(HttpCallRow {
+            file: c.source_file.clone(),
+            call: HttpCall { enclosing: c.source_id.clone(), http_method: method, url, client, line: c.line },
+        });
+    }
+    out
+}
+
 pub fn http_edges(index: &SymbolIndex, routes: &[ResolvedRoute], calls: &[HttpCallRow]) -> Vec<Edge> {
     let mut out = Vec::new();
     for c in calls {

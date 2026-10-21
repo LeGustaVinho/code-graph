@@ -515,6 +515,7 @@ impl<'a> Ctx<'a> {
             line,
             catch_types,
             detail,
+            args: Vec::new(),
         });
     }
 
@@ -1078,6 +1079,28 @@ fn strip_xml_tags(s: &str) -> String {
 }
 
 /// Table written by a raw SQL DML statement, if `literal` is one.
+/// The first table a `WITH …` statement writes (`ON CONFLICT … DO UPDATE SET` is not a table).
+fn sql_cte_write_table(sql: &str) -> Option<String> {
+    let words: Vec<&str> = sql.split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == ',').filter(|w| !w.is_empty()).collect();
+    for (i, w) in words.iter().enumerate() {
+        let up = w.to_ascii_uppercase();
+        let next = |k: usize| words.get(i + k).map(|x| x.to_ascii_uppercase()).unwrap_or_default();
+        let table = match up.as_str() {
+            "INSERT" if next(1) == "INTO" => words.get(i + 2),
+            "DELETE" if next(1) == "FROM" => words.get(i + 2),
+            "UPDATE" if next(1) != "SET" && words.get(i.wrapping_sub(1)).map(|p| !p.eq_ignore_ascii_case("DO")).unwrap_or(true) => words.get(i + 1),
+            _ => None,
+        };
+        if let Some(t) = table {
+            let name = t.trim_matches(|c| c == '"' || c == '[' || c == ']' || c == '`' || c == ';');
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                return Some(format!("table:{name}"));
+            }
+        }
+    }
+    None
+}
+
 pub fn sql_write_table(literal: &str) -> Option<String> {
     let t = literal.trim_start();
     let upper: String = t.chars().take(64).collect::<String>().to_ascii_uppercase();
@@ -1087,6 +1110,9 @@ pub fn sql_write_table(literal: &str) -> Option<String> {
         r
     } else if let Some(r) = upper.strip_prefix("DELETE FROM ") {
         r
+    } else if upper.starts_with("WITH ") {
+        // `WITH x AS (…) INSERT INTO t …` / data-modifying CTEs: the first written table.
+        return sql_cte_write_table(t);
     } else {
         return None;
     };
@@ -1306,6 +1332,17 @@ mod preprocessor_tests {
         let f = extract_file("N.cs", Language::CSharp, src);
         assert!(f.symbols.iter().any(|s| s.name == "X"));
         assert!(f.symbols.iter().any(|s| s.name == "Y"));
+    }
+
+    #[test]
+    fn cte_writes_are_found_and_upserts_are_not_tables() {
+        assert_eq!(sql_write_table("WITH s AS (SELECT 1) INSERT INTO memberships (a) SELECT a FROM s").as_deref(), Some("table:memberships"));
+        assert_eq!(sql_write_table("WITH s AS (SELECT 1) SELECT * FROM s").as_deref(), None);
+        assert_eq!(
+            sql_write_table("WITH s AS (SELECT 1) INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2").as_deref(),
+            Some("table:t")
+        );
+        assert_eq!(sql_write_table("UPDATE orders SET x = 1").as_deref(), Some("table:orders"));
     }
 
     #[test]

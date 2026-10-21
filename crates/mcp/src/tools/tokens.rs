@@ -76,7 +76,39 @@ pub fn get_file_skeleton(ctx: &Ctx, p: SkeletonParams) -> ToolResult {
     let nodes = query::nodes_in_file(ctx.conn, &file)?;
     let lang = Language::from_path(std::path::Path::new(&file)).unwrap_or(Language::TypeScript);
     let lines = query::file_line_count(ctx.conn, &file).unwrap_or(0);
-    let syms: Vec<codegraph_core::Symbol> = nodes.into_iter().map(|n| n.sym).collect();
+    let mut syms: Vec<codegraph_core::Symbol> = nodes.into_iter().map(|n| n.sym).collect();
+    // In ES modules, only exported declarations form the module's public surface.
+    // A class's public members are part of that surface even though they do not carry
+    // their own export modifier. Other languages (including Python and Rust) have
+    // different public API rules, so retain the renderer's native visibility checks.
+    let es_module = matches!(lang, Language::TypeScript | Language::Tsx | Language::JavaScript);
+    let module = syms.iter().find(|s| s.kind == SymbolKind::Module).map(|s| s.id.clone());
+    if es_module {
+        if let Some(module) = module {
+            let exported: HashSet<String> = syms.iter()
+                .filter(|s| s.parent_id.as_deref() == Some(&module) && s.is_exported)
+                .map(|s| s.id.clone()).collect();
+            if !exported.is_empty() {
+                let by_id: HashMap<String, (Option<String>, bool)> = syms.iter()
+                    .map(|s| (s.id.clone(), (s.parent_id.clone(), s.kind.is_type() || s.kind == SymbolKind::Impl)))
+                    .collect();
+                syms.retain(|s| {
+                    if s.kind == SymbolKind::Module || exported.contains(&s.id) {
+                        return true;
+                    }
+                    let mut parent = s.parent_id.as_ref();
+                    while let Some(id) = parent {
+                        if exported.contains(id) { return true; }
+                        let Some((next, is_type)) = by_id.get(id) else { break };
+                        // Nested local functions are implementation details.
+                        if !is_type { break; }
+                        parent = next.as_ref();
+                    }
+                    false
+                });
+            }
+        }
+    }
     let rendered = render::skeleton(&file, lines, lang, &syms);
     let mut out = Out::new();
     let mut it = rendered.into_iter();
