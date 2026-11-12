@@ -17,6 +17,8 @@ use serde_json::json;
 use super::fmt::{display, edge_line, node_line, short_evidence};
 use super::{nodes_map, resolve_navigation_symbols, resolve_symbol, wants_json, Ctx, Out, ToolError, ToolResult};
 
+mod route_evidence;
+
 pub const FLOW_RELATIONS: &[&str] = &["CALLS", "HTTP_CALLS", "RESOLVES_DI"];
 
 /// BFS shortest path (exact edges explored first). Returns the path and unresolved
@@ -449,25 +451,31 @@ pub fn get_impact_radius(ctx: &Ctx, p: ImpactParams) -> ToolResult {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FullstackParams {
-    /// Route ("GET /api/orders", "/api/orders/{id}") or a frontend/backend symbol.
+    /// Route ("GET /api/orders", "/api/orders/{id}"), indexed file:line, or frontend/backend symbol.
     pub api_route_or_call: String,
     /// Depth of the backend call tree (default 2).
     pub depth: Option<usize>,
+    /// Show indexed registration, bounded source excerpts, and direct calls instead of the call tree.
+    pub route_evidence: Option<bool>,
     pub max_token_budget: Option<usize>,
     pub format: Option<String>,
 }
 
+#[derive(PartialEq, Eq)]
 struct ApiRoute {
     handler_id: String,
     method: String,
     path: String,
     normalized: String,
     framework: String,
+    file: String,
+    line: u32,
 }
 
 fn api_routes(conn: &Connection) -> anyhow::Result<Vec<ApiRoute>> {
-    let mut st =
-        conn.prepare("SELECT handler_id, http_method, path, normalized, framework FROM api_route ORDER BY file_path, line_number, id")?;
+    let mut st = conn.prepare(
+        "SELECT handler_id, http_method, path, normalized, framework, file_path, line_number FROM api_route ORDER BY file_path, line_number, id",
+    )?;
     let rows = st.query_map([], |r| {
         Ok(ApiRoute {
             handler_id: r.get(0)?,
@@ -475,6 +483,8 @@ fn api_routes(conn: &Connection) -> anyhow::Result<Vec<ApiRoute>> {
             path: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
             normalized: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
             framework: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            file: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            line: r.get::<_, Option<u32>>(6)?.unwrap_or_default(),
         })
     })?;
     Ok(rows.flatten().collect())
@@ -483,39 +493,67 @@ fn api_routes(conn: &Connection) -> anyhow::Result<Vec<ApiRoute>> {
 pub fn trace_fullstack_flow(ctx: &Ctx, p: FullstackParams) -> ToolResult {
     let input = p.api_route_or_call.trim();
     let depth = p.depth.unwrap_or(2).clamp(1, 6);
+    let evidence = p.route_evidence.unwrap_or(false);
     let routes = api_routes(ctx.conn)?;
-    let mut handlers: Vec<(String, String)> = Vec::new(); // (handler id, route label)
+    let mut handlers: Vec<(String, Option<&ApiRoute>)> = Vec::new();
+    let mut add_handler = |id: &str, route| {
+        if !handlers.iter().any(|(seen_id, seen_route)| seen_id == id && (!evidence || *seen_route == route)) {
+            handlers.push((id.to_owned(), route));
+        }
+    };
     let mut frontend_only: Vec<EdgeRow> = Vec::new();
-    let looks_like_route = input.contains('/');
-    if looks_like_route {
-        let (method, path) = match input.split_once(' ') {
-            Some((m, p)) if m.chars().all(|c| c.is_ascii_alphabetic()) => (Some(m.to_ascii_uppercase()), p.trim()),
-            _ => (None, input),
-        };
+    let file_ref = input.rsplit_once(':').filter(|(file, _)| {
+        !input.starts_with('/') && !input.contains("://") && codegraph_core::Language::from_path(std::path::Path::new(file)).is_some()
+    });
+    let (method, path) = match input.split_once(' ') {
+        Some((m, p)) if p.contains('/') && m.chars().all(|c| c.is_ascii_alphabetic()) && (file_ref.is_none() || p.trim_start().starts_with('/')) =>
+            (Some(m.to_ascii_uppercase()), p.trim()),
+        _ => (None, input),
+    };
+    let file_ref = file_ref.filter(|_| method.is_none());
+    let coordinate_routes = if let Some((file, line)) = file_ref.and_then(|(f, l)| Some((f, l.split('-').next()?.parse::<u32>().ok()?))) {
+        let files = query::resolve_file(ctx.conn, file)?;
+        routes.iter().filter(|r| r.line == line && files.contains(&r.file)).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let matches_method = |candidate: &str| method.as_deref().map_or(true, |m| candidate == m || candidate == "ANY");
+    let (symbol_base, _, arity) = super::split_overload(input);
+    let arity_symbol = if arity.is_some() && !symbol_base.contains(['/', '\\']) {
+        resolve_symbol(ctx.conn, input).ok()
+    } else {
+        None
+    };
+    let looks_like_route = method.is_some() || input.starts_with('/') || (input.contains('/') && file_ref.is_none() && arity_symbol.is_none());
+    if !coordinate_routes.is_empty() {
+        for route in coordinate_routes {
+            add_handler(&route.handler_id, Some(route));
+        }
+    } else if looks_like_route {
         let norm = normalize_route(path);
         let needle = if norm.starts_with("{}") {
             format!("/{}", norm.split('/').skip_while(|s| *s == "{}").collect::<Vec<_>>().join("/"))
         } else {
             norm.clone()
         };
-        let mut matched: Vec<&ApiRoute> = routes.iter().filter(|r| r.normalized == needle).collect();
+        let mut matched: Vec<&ApiRoute> = routes.iter().filter(|r| matches_method(&r.method) && r.normalized == needle).collect();
         if matched.is_empty() {
-            matched = routes.iter().filter(|r| r.normalized.ends_with(&needle)).collect();
+            matched = routes.iter().filter(|r| matches_method(&r.method) && r.normalized.ends_with(&needle)).collect();
         }
-        if let Some(m) = &method {
-            matched.retain(|r| &r.method == m || r.method == "ANY");
-        }
-        let mut seen = HashSet::new();
         for r in matched {
-            if seen.insert(r.handler_id.clone()) {
-                handlers.push((r.handler_id.clone(), format!("{} {} [{}]", r.method, r.path, r.framework)));
-            }
+            add_handler(&r.handler_id, Some(r));
         }
     } else {
-        let n = resolve_symbol(ctx.conn, input)?;
-        let route_of = |id: &str| routes.iter().find(|r| r.handler_id == id).map(|r| format!("{} {} [{}]", r.method, r.path, r.framework));
-        if let Some(label) = route_of(&n.sym.id) {
-            handlers.push((n.sym.id.clone(), label));
+        let n = match arity_symbol {
+            Some(n) => n,
+            None => resolve_symbol(ctx.conn, input)?,
+        };
+        let route_of = |id: &str| routes.iter().find(|r| r.handler_id == id);
+        for route in routes.iter().filter(|r| r.handler_id == n.sym.id) {
+            add_handler(&n.sym.id, Some(route));
+            if !evidence {
+                break;
+            }
         }
         // Frontend side: HTTP_CALLS from the symbol or from its callees.
         let mut frontier = vec![n.sym.id.clone()];
@@ -530,9 +568,12 @@ pub fn trace_fullstack_flow(ctx: &Ctx, p: FullstackParams) -> ToolResult {
                     if e.relation == "HTTP_CALLS" {
                         match &e.target_id {
                             Some(t) => {
-                                let label = route_of(t).unwrap_or_else(|| "route".into());
-                                if !handlers.iter().any(|h| &h.0 == t) {
-                                    handlers.push((t.clone(), label));
+                                if evidence {
+                                    for route in routes_for_http_edge(&routes, t, &e) {
+                                        add_handler(t, route);
+                                    }
+                                } else {
+                                    add_handler(t, route_of(t));
                                 }
                             }
                             None => frontend_only.push(e),
@@ -562,17 +603,26 @@ pub fn trace_fullstack_flow(ctx: &Ctx, p: FullstackParams) -> ToolResult {
             })?
             .flatten()
             .collect();
-        let n = normalize_route(input.split_once(' ').map(|x| x.1).unwrap_or(input));
+        let n = normalize_route(path);
         for (f, m, u, l) in
-            calls.into_iter().filter(|c| normalize_route(&c.2).ends_with(n.trim_start_matches('{').trim_start_matches('}'))).take(10)
+            calls.into_iter().filter(|c| matches_method(&c.1) && normalize_route(&c.2).ends_with(n.trim_start_matches('{').trim_start_matches('}'))).take(10)
         {
             out.item(format!("UNLINKED {m} {u} at {f}:{l}"));
         }
         return Ok(out);
     }
-    out.h(format!("Fullstack flow for '{input}': {} backend handler(s)", handlers.len()));
-    for (hid, label) in &handlers {
+    if evidence {
+        out.h("Route evidence (relative lines use the route or handler file)");
+    } else {
+        out.h(format!("Fullstack flow for '{input}': {} backend handler(s)", handlers.len()));
+    }
+    for (hid, route) in &handlers {
         let Some(h) = query::node(ctx.conn, hid)? else { continue };
+        if evidence {
+            route_evidence::render(ctx, &mut out, *route, &h)?;
+            continue;
+        }
+        let label = route.map(|r| format!("{} {} [{}]", r.method, r.path, r.framework)).unwrap_or_else(|| "route".into());
         out.item(format!("ROUTE {label} → {}", node_line(&h)));
         let incoming = query::edges_in(ctx.conn, hid, &["HTTP_CALLS"])?;
         let srcs = nodes_map(ctx.conn, incoming.iter().map(|e| e.source_id.clone()).chain(std::iter::once(hid.clone())))?;
@@ -645,6 +695,23 @@ pub fn trace_fullstack_flow(ctx: &Ctx, p: FullstackParams) -> ToolResult {
         }
     }
     Ok(out)
+}
+
+fn routes_for_http_edge<'a>(routes: &'a [ApiRoute], id: &str, edge: &EdgeRow) -> Vec<Option<&'a ApiRoute>> {
+    let candidates: Vec<_> = routes.iter().filter(|r| r.handler_id == id).collect();
+    let recorded = edge.metadata.as_ref().and_then(|m| m.get("route")).and_then(|s| s.as_str()).and_then(|s| s.split_once(' '));
+    let framework = edge.metadata.as_ref().and_then(|m| m.get("framework")).and_then(|s| s.as_str());
+    let matched: Vec<_> = candidates.iter().copied().filter(|r| {
+        recorded.is_some_and(|(method, path)| r.method == method && r.path == path)
+            && framework.map_or(true, |f| r.framework == f)
+    }).map(Some).collect();
+    if !matched.is_empty() {
+        matched
+    } else if let (None, [only]) = (recorded, candidates.as_slice()) {
+        vec![Some(*only)]
+    } else {
+        vec![None]
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]

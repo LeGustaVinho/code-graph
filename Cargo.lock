@@ -308,6 +308,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tree-sitter",
 ]
 
 [[package]]

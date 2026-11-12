@@ -315,7 +315,7 @@ CodeGraph equips AI agents with specialized analytical tools designed to minimiz
 
 ### 3. Deep Navigation & Flows
 - **`trace_execution_path`**: Computes the shortest call path between two symbols (spanning local calls, DI resolutions, and HTTP network jumps) with line-by-line evidence.
-- **`trace_fullstack_flow`**: Bridges frontend API calls (e.g. `POST /api/orders`) directly to backend controllers, services, database mutations, and external webhooks.
+- **`trace_fullstack_flow`**: Bridges frontend API calls (e.g. `POST /api/orders`) directly to backend controllers, services, database mutations, and external webhooks. Set `route_evidence: true` for compact registration and direct-call evidence with source locations. Supported JavaScript and TypeScript registrations can include excerpts for the dispatch, request body wiring, and local helpers.
 - **`resolve_dependency_injection`**: Determines which concrete implementation is injected for an interface or service token (.NET DI, NestJS, FastAPI), including lifetime scope and consumer sites.
 - **`get_call_hierarchy`**: Computes recursive caller or callee trees (`callers`, `callees`, or `both`) up to a specified depth.
 - **`get_type_hierarchy`**: Maps inheritance chains: base classes, implemented interfaces (supertypes), and derived subtypes.
