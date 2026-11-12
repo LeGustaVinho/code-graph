@@ -1,0 +1,88 @@
+{
+  "tokenizer": "o200k_base",
+  "measurement": "captured tool-output tokens + skill and verification logs",
+  "quality_gate": "REQUIRES_INDEPENDENT_REVIEW",
+  "baseline": {
+    "main": {
+      "1": 6930,
+      "2": 888,
+      "3": 2894,
+      "4": 2577,
+      "5": 1105,
+      "6": 973,
+      "7": 6407
+    },
+    "verify": {},
+    "skill": 0,
+    "files": {
+      "S1.log": 6930,
+      "S2.log": 888,
+      "S3.log": 2894,
+      "S4.log": 2577,
+      "S5.log": 1105,
+      "S6.log": 973,
+      "S7.log": 6407
+    },
+    "by_scenario": {
+      "1": 6930,
+      "2": 888,
+      "3": 2894,
+      "4": 2577,
+      "5": 1105,
+      "6": 973,
+      "7": 6407
+    },
+    "total": 21774,
+    "missing_scenarios": []
+  },
+  "candidate": {
+    "main": {
+      "1": 2498,
+      "2": 3210,
+      "3": 5135,
+      "4": 1037,
+      "5": 656,
+      "6": 1673,
+      "7": 8506
+    },
+    "verify": {
+      "6": 31
+    },
+    "skill": 1517,
+    "files": {
+      "S0.log": 1517,
+      "S1.log": 2498,
+      "S2.log": 3210,
+      "S3.log": 5135,
+      "S4.log": 1037,
+      "S5.log": 656,
+      "S6.log": 1673,
+      "S6.verify.log": 31,
+      "S7.log": 8506
+    },
+    "by_scenario": {
+      "1": 2498,
+      "2": 3210,
+      "3": 5135,
+      "4": 1037,
+      "5": 656,
+      "6": 1704,
+      "7": 8506
+    },
+    "total": 24263,
+    "missing_scenarios": []
+  },
+  "scenario_savings": {
+    "1": 0.6395382395382395,
+    "2": -2.614864864864865,
+    "3": -0.7743607463718036,
+    "4": 0.5975941016686068,
+    "5": 0.4063348416289593,
+    "6": -0.7512846865364851,
+    "7": -0.32761042609645696
+  },
+  "weighted_savings": -0.1143106457242582,
+  "arithmetic_mean_scenario_savings": -0.40352193443340073,
+  "weighted_target_met": false,
+  "scenario_mean_target_met": false
+}

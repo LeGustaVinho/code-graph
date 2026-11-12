@@ -152,12 +152,13 @@ pub fn registry() -> Vec<ToolDef> {
     vec![
         // 5.1 Token economy & aggregation
         tool!("batch_query", "Run several CodeGraph tools in one call: operations=[{tool, args}]. Returns each result under a header.", tokens::BatchParams, tokens::batch_query),
-        tool!("get_file_skeleton", "Zero-body stub of a file: public declarations and signatures only, with exact line ranges (~60 tokens for large files).", tokens::SkeletonParams, tokens::get_file_skeleton),
+        tool!("get_file_skeleton", "Zero-body file stub with signatures and line ranges. Defaults to non-private declarations; reports omitted members, and include_private=true reveals private declarations (including Unity lifecycle methods).", tokens::SkeletonParams, tokens::get_file_skeleton),
         tool!("get_structural_diff", "AST-level diff vs a git ref (default HEAD): symbols added/removed, signature or body changed. Formatting/comment-only edits are ignored.", git::DiffParams, git::get_structural_diff),
         tool!("simulate_signature_change", "Simulate changing a function's parameter count: lists call sites that would break (arg count mismatch), overrides/interface declarations to update, and ambiguous call sites.", tokens::SimulateParams, tokens::simulate_signature_change),
         tool!("get_flow_diagram", "Tiny Mermaid flowchart (3-6 edges) of calls between the given symbols, or around a single symbol. Line style encodes confidence (solid exact, dotted inferred, x unresolved).", tokens::FlowParams, tokens::get_flow_diagram),
         // 5.2 Discovery
-        tool!("search_universal", "Ranked FTS5 trigram search over symbols (classes, functions, methods, variables, constants, models). Optional kind filter and token budget.", discovery::SearchParams, discovery::search_universal),
+        tool!("search_universal", "Find declarations by ranked fuzzy search (name, signature, path). Use exact=true for case-sensitive exact name/qualified_name matches to exclude similar symbols; optional kind and token budget.", discovery::SearchParams, discovery::search_universal),
+        tool!("search_source", "Find literal source-text occurrences (including comments) with file:line evidence in indexed readable files, optionally restricted to root-relative file/directory. Existing directories with no supported source files return a verified empty scope; directories with unindexed supported source retain an explicit error. Supports whole_word and case_sensitive.", discovery::SourceSearchParams, discovery::search_source),
         tool!("find_literal", "Find string/number literals (routes, error messages, config keys, SQL) with exact locations and enclosing symbols.", discovery::LiteralParams, discovery::find_literal),
         tool!("find_variable_or_const", "Find a variable/constant/field declaration plus every read (READS_VAR) and write (WRITES_VAR) site.", discovery::VarParams, discovery::find_variable_or_const),
         // 5.3 Navigation
@@ -178,7 +179,8 @@ pub fn registry() -> Vec<ToolDef> {
         tool!("get_config_matrix", "Every environment variable / configuration key read by the code, where it is defined, defaults, and missing definitions.", data::ConfigParams, data::get_config_matrix),
         tool!("get_type_contract", "Public contract of a type: base types and member signatures without implementations.", data::ContractParams, data::get_type_contract),
         tool!("get_symbol_body", "Exact source of one symbol with preserved line numbers (optionally without comments, capped by max_lines).", data::BodyParams, data::get_symbol_body),
-        tool!("get_file_outline", "Dense hierarchical outline of a file: kinds, names, line ranges, complexity and capability tags.", data::OutlineParams, data::get_file_outline),
+        tool!("get_flow_evidence", "Selected control, assignment and call statements with source line numbers. For a type, members=[name,...] selects exact member names in one call; filter is an alternative substring selector. Excerpt is incomplete; inspect omitted logic as needed.", data::FlowEvidenceParams, data::get_flow_evidence),
+        tool!("get_file_outline", "Dense hierarchical file outline with line ranges and capabilities. names=[name,...] selects exact declarations (ancestors retained); include_signatures=true adds signatures. filter is a substring alternative.", data::OutlineParams, data::get_file_outline),
         // 5.6 Governance, tests & git
         tool!("get_complexity_hotspots", "Functions ranked by cyclomatic complexity and risk (complexity × fan-in).", governance::HotspotParams, governance::get_complexity_hotspots),
         tool!("validate_dependency_rule", "Check whether source_module may depend on target_module under the architecture rules (.codegraph/architecture.toml or default layering) and list existing violating dependencies.", governance::RuleParams, governance::validate_dependency_rule),
@@ -363,6 +365,29 @@ pub fn resolve_symbol(conn: &Connection, input: &str) -> Result<Node, ToolError>
 ", n.sym.id, fmt::node_line(n), n.sym.signature));
             }
             Err(ToolError::NotFound(msg.trim_end().to_string()))
+        }
+    }
+}
+
+/// For read-only navigation, an unqualified overload family is a useful
+/// selection in its own right. Return all same-qualified callables instead of
+/// forcing a series of manual symbol-id queries; any other ambiguity still
+/// requires explicit disambiguation. Does not change semantic edge confidence.
+pub fn resolve_navigation_symbols(conn: &Connection, input: &str) -> Result<Vec<Node>, ToolError> {
+    match resolve_symbol(conn, input) {
+        Ok(n) => Ok(vec![n]),
+        Err(original) => {
+            if input.contains('(') || input.rsplit_once('/').is_some_and(|(_, suffix)| suffix.parse::<u32>().is_ok()) {
+                return Err(original);
+            }
+            let matches = query::find_nodes(conn, input, 50)?;
+            if matches.len() > 1
+                && matches.iter().all(|n| n.sym.kind.is_callable() && n.sym.qualified_name == matches[0].sym.qualified_name)
+            {
+                Ok(matches)
+            } else {
+                Err(original)
+            }
         }
     }
 }

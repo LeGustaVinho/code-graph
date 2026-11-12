@@ -1,0 +1,68 @@
+{
+  "date": "2026-10-23",
+  "repository": "D:/Entidades/EmergentsWorlds/warcodes-mobileapp",
+  "repository_head": "00b453eb43c0dee6dff8c4194b4464c65b01c47e",
+  "codegraph_head": "a42e9722114715afb8013072450f2738278b81b9",
+  "codegraph_binary_sha256": "076010B0A51A61F97E1150B49061BBC5A76A0E545991948B2A185B7F16E91AF2",
+  "tokenizer": "o200k_base",
+  "source_scope": "*.cs only; no prefab, unity, json, asset or config file reads",
+  "measurement": "full stdout+stderr of instrumented reading operations plus raw CodeGraph skill text once; not billed model tokens",
+  "agents": "two fresh independent agents with identical seven questions and separate logs, no shared context",
+  "scenario_labels": {
+    "S1": "UserProfilePanel public methods and Unity lifecycle methods, C# only",
+    "S2": "BarcodeScannerWrapper permission and scanning lifecycle, C# only",
+    "S3": "WorldNavigationHelper overloads, routes and direct C# caller sites, no prefab",
+    "S4": "DisplayScriptResolver prefab task cache, validation and errors, C# only",
+    "S5": "IDisplayScriptResolver members and direct implementations, C# only",
+    "S6": "FirebaseManager DisplayScripts initialization, C# only",
+    "S7": "Test C# textual references to DisplayScriptResolver, C# only"
+  },
+  "baseline": {
+    "by_scenario": {"S1": 1751, "S2": 5759, "S3": 801, "S4": 1244, "S5": 358, "S6": 1413, "S7": 193},
+    "reading_tokens": 11519,
+    "operations": 20,
+    "completed": 16,
+    "no_matches": 3,
+    "nonzero_exit": 1,
+    "sum_operation_ms": 220
+  },
+  "codegraph": {
+    "by_scenario": {"S1": 394, "S2": 6620, "S3": 1040, "S4": 2451, "S5": 237, "S6": 2201, "S7": 411},
+    "reading_tokens": 13354,
+    "skill_tokens": 682,
+    "total_tokens": 14036,
+    "operations": 61,
+    "completed": 57,
+    "no_matches": 2,
+    "nonzero_exit": 2,
+    "sum_operation_ms": 9402
+  },
+  "weighted_savings_including_skill": -0.2185085510895044,
+  "arithmetic_mean_scenario_savings": -0.2846253161657835,
+  "weighted_savings_only_reads": -0.159302022744,
+  "weighted_20pct_target_met": false,
+  "scenario_mean_20pct_target_met": false,
+  "scope_audit": {
+    "non_cs_read_operations": 0,
+    "unfiltered_conventional_rg_operations": 0,
+    "all_seven_scenarios_recorded_in_both_arms": true
+  },
+  "quality_review": "Core facts equivalent in all seven scenarios; S3 no direct callsites in C# outside declaration, serialized Unity bindings explicitly excluded. S7 CodeGraph tests-directory no indexed files was checked by rg before absence conclusions.",
+  "recorded_failures": [
+    "CodeGraph S3 get_symbol_body overload reference GotoArea/1 returned nonzero exit",
+    "CodeGraph S7 search_source under Tests returned nonzero exit because path is unindexed, followed by conventional search",
+    "Conventional S7 rg path Assets/Game/Tests does not exist; separately scoped searches covered Assets/Game and Tests"
+  ],
+  "limitations": [
+    "One run per agent in one Unity/C# project, not cross-project or statistical proof",
+    "Reading stdout+stderr tokens only; no hidden model reasoning, prompt billing or agent message tokens",
+    "Updated task set is not numerically interchangeable with previous report: S6 is a C# initialization task instead of a JSON manifest task",
+    "Other working-tree modifications were preserved",
+    "No execution of Unity application or dynamic binding checks; all evidence is static C#"
+  ],
+  "raw_logs": [
+    "target/tmp/bench_20261023_cs_only_02/baseline",
+    "target/tmp/bench_20261023_cs_only_02/cg"
+  ],
+  "comparator_result": "target/tmp/bench_20261023_cs_only_02/comparison.json"
+}

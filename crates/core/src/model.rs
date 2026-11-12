@@ -226,6 +226,10 @@ pub struct Reference {
     /// routes through them).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// Static C# argument types at a call site, in positional order. `None` means the
+    /// extractor cannot prove a type; other languages and older saved facts omit this.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arg_types: Vec<Option<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

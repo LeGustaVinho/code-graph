@@ -1,35 +1,25 @@
 ---
 name: codegraph
-description: Read and navigate source code through the CodeGraph semantic index instead of opening whole files. Use whenever you need to read, explore, search or understand files CodeGraph supports — C# (.cs), TypeScript (.ts/.tsx/.mts/.cts, not .d.ts), JavaScript (.js/.jsx/.mjs/.cjs, not .min.js), Vue / Svelte components (.vue/.svelte), Python (.py/.pyi), Rust (.rs), Prisma (.prisma) and config files (appsettings*.json, local.settings.json, .env, .env.*) — or to find symbols, callers/callees, usages, implementations, DI bindings, routes, data models, config keys, tests for a symbol, or the impact of a change. Prefer it over Read/cat/grep for these files.
+description: Navigate C#, TypeScript/JS/TSX/JSX, Vue/Svelte, Python, Rust, Prisma and configuration with indexed code symbols, flows, callers, tests, routes and types.
 ---
 
-# CodeGraph
+# CodeGraph navigation
 
-**Consultas econômicas:** Comece com max_token_budget=500 e depth=1; aumente para 2 quando precisar de mais relações. get_tests_for_symbol prioriza testes ligados diretamente (depth padrão 2, limit padrão 12); arquivos com nomes semelhantes são apenas candidatos. get_config_matrix aceita path para limitar o arquivo que lê a configuração e filter para restringir nomes de chaves, além de include_unread para detalhar definições sem usos indexados. get_call_hierarchy agrupa sites por origem; show_sites=true inclui os trechos completos das chamadas e aumenta o consumo. get_file_skeleton filtra declarações por export em módulos ES identificáveis, mantendo as regras das demais linguagens. Consulte o schema antes de usar formatos específicos como JSON.
+Use installed `mcp__codegraph__*` tools, or CLI: `codegraph query <tool> --root <repo> --args <json>` (Windows binary: `D:\Entidades\Gustavo\Projects\CodeGraph\target\release\codegraph.exe`). Pass JSON as a separate safely quoted argument. Output defaults to compact; JSON is opt-in.
 
-**Pare quando houver evidência suficiente:** Para listas de chamadas use primeiro get_call_hierarchy depth=1 com sites; para envs, get_config_matrix com path; para testes, get_tests_for_symbol seguido do outline do teste mais relevante; para fluxos HTTP, trace_fullstack_flow. Se as saídas já contêm os dados pedidos com arquivo:linha, responda sem repetir a mesma leitura via get_symbol_body, outline ou grep. Expanda o corpo de um símbolo ou use leitura crua só quando faltar uma condição/SQL essencial, houver incerteza de edge, ou a resposta anterior for contraditória/incompleta. Não reduza a cobertura para caber no orçamento: aumente o budget quando necessário.
+**Start with the smallest sufficient evidence.** Pass an already-known symbol or file straight to its tool; discovery is unnecessary. Usually set `max_token_budget:500`, `depth:1`, then expand only omitted evidence. Stop when file:line evidence answers the question. Count fallbacks and failed queries.
 
-**Trecho de um corpo longo:** \`get_symbol_body\` aceita \`symbol_id\`, \`start_line\` e \`end_line\` (ambos obrigatórios ao selecionar, linhas **absolutas do arquivo**, inclusivas e dentro do símbolo). Ex.: \`{"symbol_id":"Service.process","start_line":35,"end_line":50}\` devolve somente essas 16 linhas com numeração e indentação originais. Sem esses parâmetros, mantém o comportamento usual; \`max_lines\` continua limitando o prefixo do trecho retornado.
+| Goal | Tool |
+| --- | --- |
+| Exact declaration | `search_universal(query,exact:true,kind?)`; omit `exact` for fuzzy discovery |
+| Text uses, comments, scoped absence | `search_source(query,path?,whole_word?)` |
+| File API / named members | `get_file_skeleton(file_path,include_private?)` or `get_file_outline(file_path,names:[...],include_signatures:true?)` |
+| Type members / implementations | `get_type_contract(type_id)`, `get_type_hierarchy(symbol_id,direction?)` |
+| Method flow / guards / mutations | `get_flow_evidence(symbol_id,members:[...]?,max_lines?)` |
+| Callers / callees | `get_call_hierarchy(symbol_id,direction:"callers"|"callees",depth:1,show_sites:true)` |
+| Tests / config | `get_tests_for_symbol(symbol_id)`, `get_config_matrix(filter?,path?)` |
+| Routes / DI / side effects | `trace_fullstack_flow`, `resolve_dependency_injection`, `get_state_mutations`, `trace_error_flow` |
 
-A semantic index of the repo (symbols, calls, types, DI, routes, ORM models, config keys) with exact `file:line` evidence. For the file types above, ask it first and open raw text only for lines you need.
+`names`/`members` select multiple **exact** names in one query; `filter` is a substring alternative. `include_signatures:true` adds signatures to selected outline members. A type flow is an incomplete selection: inspect missing branches with `get_symbol_body(symbol_id,start_line?,end_line?)` (absolute inclusive bounds), when needed. Public skeletons omit private methods unless requested. For overloaded methods use an exact signature, `sym_...` ID or `Name/<arity>` where supported. An `exact` call edge can still be overload-ambiguous; Unity Inspector and dynamic bindings may lack static edges. **Honor the requested file types:** C# code-only reference searches must remain in `.cs` files, including conventional fallbacks; inspect Unity `.prefab`/`.unity` bindings only when explicitly requested.
 
-**Call**: MCP tools `mcp__codegraph__*` if registered, else `codegraph query <tool> --root <repo> --args '<json>'` (binary: `codegraph` on PATH, else `<codegraph-repo>/target/release/codegraph[.exe]`; put the absolute path here when installing). Bash: single-quote the JSON. PowerShell 5.1: `--args '{\"query\":\"Order\"}'`. Changed files are re-indexed automatically. All tools take `max_token_budget`, `format:"json"`; `codegraph tools --json` lists schemas.
-
-**Symbols**: `Name`, `Type.member`, `outer.inner` (nested functions), `file.ts:120` (innermost at that line) or `sym_…`; an ambiguous name lists the candidates. A type stands for its members; a route symbol (`"POST /v1/orders"`) spans its whole registration. `file_path` takes a unique suffix.
-
-**Workflow**: map a file with one call — `get_file_skeleton` (public API) *or* `get_file_outline` (all members, complexity, side-effect tags); read just what matters with `get_symbol_body` (`symbol_id`), several at once in `batch_query` (`operations:[{"tool":…,"args":{…}}]`); follow relationships with the tools below; before editing, read only the lines you change. Results are complete for `exact` edges (caller lists include every site), so don't re-grep them; verify only `inferred`/`unresolved` hints or answers that look wrong, and say so.
-
-| Need | Tool (key args) |
-|---|---|
-| Find a symbol / a literal | `search_universal` (`query`, `kind?`) · `find_literal` (`query`, `exact?`) |
-| Variable reads & writes | `find_variable_or_const` (`name`) |
-| Callers / callees, every site (`@12,15`; callers at depth 1 print the call lines) | `get_call_hierarchy` (`symbol_id`, `direction`, `depth`) |
-| Supertypes / implementations · public API | `get_type_hierarchy` · `get_type_contract` |
-| Path A→B · route ↔ frontend callers → handler → DB | `trace_execution_path` · `trace_fullstack_flow` (`api_route_or_call:"POST /v1/orders"`, `depth?`) |
-| DI binding · exception throw/catch · mutations | `resolve_dependency_injection` · `trace_error_flow` · `get_state_mutations` |
-| By side effect (`DB_WRITE`, `NETWORK_IO`, …) · entry points · ORM models | `find_by_capability` · `get_entrypoints` · `get_data_model` |
-| Env/config keys by reading function | `get_config_matrix` (`path?`, `filter?`) |
-| Tests for a symbol (closest first) | `get_tests_for_symbol` (`symbol_id`, `depth?`) |
-| Change impact | `get_impact_radius`, `simulate_signature_change`, `get_changed_subgraph`, `get_structural_diff` |
-
-Lines read `m OrderService.checkout src/services.ts:20-29 | checkout(...)`. If CodeGraph errors or is missing, read files normally and say so.
+A zero text match covers only indexed, readable files. A `verified empty source scope` means the directory contains no supported source files and needs no fallback. Missing paths, ignored source files and other incomplete index coverage still require conventional verification before claiming absence. Never infer server behavior from a client call alone. Other tools: `batch_query`, `get_entrypoints`, `find_literal`, `get_data_model`, `get_impact_radius`, `get_structural_diff`. If CodeGraph is unavailable, use targeted conventional reads and disclose the fallback.

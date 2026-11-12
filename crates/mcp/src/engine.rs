@@ -75,6 +75,7 @@ impl Engine {
     /// [`Engine::open`], reporting the initial indexing run to `progress`.
     pub fn open_with(root: &Path, progress: Arc<Progress>) -> Result<Arc<Engine>> {
         let root = codegraph_graph::canonical_root(root);
+        let _write_lock = codegraph_graph::lock_writer(&root)?;
         let mut conn = codegraph_graph::open(&root)?;
         let stats = index_project_with(&root, &mut conn, IndexOptions::default(), &progress)?;
         tracing::info!(
@@ -177,6 +178,7 @@ impl Engine {
     }
 
     pub fn reindex_paths(&self, paths: &[String]) -> Result<IndexStats> {
+        let _write_lock = codegraph_graph::lock_writer(&self.root)?;
         self.pending.store(paths.len(), Ordering::SeqCst);
         self.reindexing.store(true, Ordering::SeqCst);
         let res = {
@@ -192,6 +194,7 @@ impl Engine {
     }
 
     pub fn reindex_all(&self, rebuild: bool) -> Result<IndexStats> {
+        let _write_lock = codegraph_graph::lock_writer(&self.root)?;
         self.reindexing.store(true, Ordering::SeqCst);
         let res = {
             let mut conn = self.writer.lock().unwrap();

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::fmt::{display, node_line};
-use super::{nodes_map, resolve_file_arg, resolve_symbol, wants_json, Ctx, Out, ToolError, ToolResult};
+use super::{nodes_map, resolve_file_arg, resolve_navigation_symbols, resolve_symbol, wants_json, Ctx, Out, ToolError, ToolResult};
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -481,23 +481,190 @@ pub fn get_symbol_body(ctx: &Ctx, p: BodyParams) -> ToolResult {
     Ok(out)
 }
 
+/// Selected source statements useful for tracing a function. This is deliberately
+/// an excerpt, not a complete control-flow model: statements without an indexed
+/// call or an explicit control keyword are omitted and may still affect behavior.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FlowEvidenceParams {
+    /// Method/function or type identifier, qualified name or file:line.
+    pub symbol_id: String,
+    /// Maximum selected source lines (default 80).
+    pub max_lines: Option<usize>,
+    /// Optional member-name substring for type/impl queries.
+    pub filter: Option<String>,
+    /// Exact member names to include when symbol_id is a type/impl. Useful when
+    /// investigating several related methods without separate tool calls.
+    /// Cannot be combined with filter.
+    pub members: Option<Vec<String>>,
+    /// Limit methods of a type returned in one query (default 12).
+    pub max_members: Option<usize>,
+    pub max_token_budget: Option<usize>,
+    pub format: Option<String>,
+}
+
+fn control_header(line: &str) -> bool {
+    let s = line.trim_start();
+    const PREFIXES: &[&str] = &[
+        "if ", "if(", "else", "elif ", "switch ", "switch(", "match ",
+        "case ", "case:", "default:", "for ", "for(", "foreach ", "foreach(",
+        "while ", "while(", "do {", "try:", "try {", "catch ", "catch(",
+        "except ", "finally", "return", "throw", "raise ", "yield ",
+        "break", "continue", "defer ", "guard ", "async for ", "with ",
+    ];
+    PREFIXES.iter().any(|p| s.starts_with(p))
+        || s.starts_with("// fallthrough")
+}
+
+fn assignment_statement(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    bytes.iter().enumerate().any(|(i, b)| *b == b'='
+        && !matches!(i.checked_sub(1).and_then(|j| bytes.get(j)), Some(b'=' | b'!' | b'<' | b'>' | b'?'))
+        && !matches!(bytes.get(i + 1), Some(b'=' | b'>')))
+}
+
+pub fn get_flow_evidence(ctx: &Ctx, p: FlowEvidenceParams) -> ToolResult {
+    if p.filter.is_some() && p.members.is_some() {
+        return Err(ToolError::BadArgs("choose filter or members, not both".into()));
+    }
+    let family = resolve_navigation_symbols(ctx.conn, &p.symbol_id)?;
+    if family.len() > 1 {
+        let mut out = Out::new();
+        out.h(format!("Flow evidence: {} overloads of {} (selected source excerpts, not exhaustive)", family.len(), p.symbol_id));
+        for n in family {
+            out.item(flow_evidence_one(ctx, &n, p.max_lines)?.render(None));
+        }
+        return Ok(out);
+    }
+    let n = &family[0];
+    if n.sym.kind.is_callable() {
+        return flow_evidence_one(ctx, &n, p.max_lines);
+    }
+    if n.sym.kind.is_type() || n.sym.kind == SymbolKind::Impl {
+        let mut members = query::children(ctx.conn, &n.sym.id)?;
+        members.retain(|m| m.sym.kind.is_callable()
+            && p.filter.as_deref().is_none_or(|f| m.sym.name.to_lowercase().contains(&f.to_lowercase()))
+            && p.members.as_ref().is_none_or(|wanted| wanted.iter().any(|name| name == &m.sym.name)));
+        let total = members.len();
+        let limit = p.max_members.unwrap_or(12).clamp(1, 50);
+        let mut out = Out::new();
+        out.h(format!("Flow evidence (selected excerpts, not exhaustive) for {}: {total} matching callable(s)", node_line(&n)));
+        if total == 0 { out.item("(no matching callable members)"); }
+        for member in members.into_iter().take(limit) {
+            out.item(flow_evidence_one(ctx, &member, p.max_lines)?.render(None));
+        }
+        out.unshown = total.saturating_sub(limit);
+        return Ok(out);
+    }
+    Err(ToolError::BadArgs("get_flow_evidence requires a callable, type or impl symbol".into()))
+}
+
+fn flow_evidence_one(ctx: &Ctx, n: &codegraph_graph::Node, max_lines_arg: Option<usize>) -> ToolResult {
+    let path = ctx.engine.root.join(&n.file_path);
+    let bytes = std::fs::read(&path).map_err(|e| ToolError::Internal(anyhow::anyhow!("reading {}: {e}", n.file_path)))?;
+    let source = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = source.lines().collect();
+    let start = n.sym.start_line.max(1) as usize;
+    let end = (n.sym.end_line as usize).min(lines.len());
+    let mut selected = std::collections::BTreeSet::<usize>::new();
+    selected.insert(start);
+    // Calls are drawn from semantic facts, including unresolved targets.
+    for e in query::edges_out(ctx.conn, &n.sym.id, &["CALLS", "HTTP_CALLS", "RESOLVES_DI"])? {
+        let line = e.line as usize;
+        if (start..=end).contains(&line) { selected.insert(line); }
+    }
+    for line in start..=end {
+        let raw = lines[line - 1];
+        // Dynamic/framework calls are frequently unresolved in a static graph.
+        // Include expression-looking lines as fallback evidence, even when no
+        // CALLS edge exists. Parenthesized expressions are only candidates:
+        // this view never claims that every selected line is a call.
+        let trimmed = raw.trim_start();
+        if !trimmed.starts_with("//") && !trimmed.starts_with('#') && !trimmed.starts_with('*')
+            && ((trimmed.contains('(') && trimmed.contains(')')) || assignment_statement(trimmed))
+        {
+            selected.insert(line);
+        }
+        if !control_header(raw) { continue; }
+        selected.insert(line);
+        // Multi-line guards (e.g. C# `if (a &&\n b)` or Python `if (\n...
+        // )`) must retain the full condition. Stop at the first balanced `)` or
+        // block opener, with a conservative 12-line cap.
+        let mut depth = raw.chars().filter(|c| *c == '(').count() as isize
+            - raw.chars().filter(|c| *c == ')').count() as isize;
+        if depth > 0 {
+            for next in line + 1..=end.min(line + 12) {
+                let s = lines[next - 1];
+                selected.insert(next);
+                depth += s.chars().filter(|c| *c == '(').count() as isize
+                    - s.chars().filter(|c| *c == ')').count() as isize;
+                if depth <= 0 { break; }
+            }
+        }
+    }
+    let total = selected.len();
+    let max_lines = max_lines_arg.unwrap_or(80).clamp(1, 500);
+    let mut out = Out::new();
+    out.h(format!("Flow evidence (selected source excerpt, not exhaustive): {} | {}", node_line(&n), n.sym.signature));
+    out.h(format!("{} of {} source lines selected; {} omitted (inspect get_symbol_body for assignments, dynamic calls and other missing logic)", total, end.saturating_sub(start) + 1, end.saturating_sub(start) + 1 - total));
+    for line in selected.into_iter().take(max_lines) {
+        let src = lines[line - 1].trim_end();
+        out.item(format!("{line:>4}| {}", src.trim_start()));
+    }
+    out.unshown = total.saturating_sub(max_lines);
+    Ok(out)
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OutlineParams {
     /// File path (relative to the project root; suffixes accepted).
     pub file_path: String,
+    /// Optional declaration-name/qualified-name substring; keeps the parent
+    /// chain for each match and omits unrelated declarations.
+    pub filter: Option<String>,
+    /// Exact declaration names to select in one call, retaining ancestor
+    /// declarations. Cannot be combined with filter.
+    pub names: Option<Vec<String>>,
+    /// Include signatures (and their return types), useful when inspecting a
+    /// selected subset of methods. Default false for dense navigation.
+    pub include_signatures: Option<bool>,
     pub max_token_budget: Option<usize>,
     pub format: Option<String>,
 }
 
 pub fn get_file_outline(ctx: &Ctx, p: OutlineParams) -> ToolResult {
+    if p.filter.is_some() && p.names.is_some() {
+        return Err(ToolError::BadArgs("choose filter or names, not both".into()));
+    }
     let file = resolve_file_arg(ctx.conn, &p.file_path)?;
     let nodes = query::nodes_in_file(ctx.conn, &file)?;
     let lang = Language::from_path(std::path::Path::new(&file)).unwrap_or(Language::TypeScript);
     let lines = query::file_line_count(ctx.conn, &file).unwrap_or(0);
-    let syms: Vec<codegraph_core::Symbol> = nodes.into_iter().map(|n| n.sym).collect();
+    let mut syms: Vec<codegraph_core::Symbol> = nodes.into_iter().map(|n| n.sym).collect();
+    if p.filter.as_deref().is_some_and(|s| !s.is_empty()) || p.names.is_some() {
+        let needle = p.filter.as_deref().unwrap_or("").to_lowercase();
+        let parents: std::collections::HashMap<_, _> = syms.iter()
+            .map(|s| (s.id.clone(), s.parent_id.clone())).collect();
+        let mut keep = std::collections::HashSet::new();
+        for sym in &syms {
+            let matched = p.names.as_ref().map_or_else(
+                || sym.name.to_lowercase().contains(&needle) || sym.qualified_name.to_lowercase().contains(&needle),
+                |names| names.iter().any(|name| name == &sym.name || name == &sym.qualified_name),
+            );
+            if !matched {
+                continue;
+            }
+            let mut cursor = Some(sym.id.clone());
+            while let Some(id) = cursor {
+                if !keep.insert(id.clone()) { break; }
+                cursor = parents.get(&id).cloned().flatten();
+            }
+        }
+        syms.retain(|s| keep.contains(&s.id) || s.kind == SymbolKind::Module);
+    }
     let mut out = Out::new();
-    let mut it = render::outline(&file, lines, lang, &syms).into_iter();
+    let mut it = render::outline(&file, lines, lang, &syms, p.include_signatures.unwrap_or(false)).into_iter();
     if let Some(h) = it.next() {
         out.h(h);
     }
@@ -508,8 +675,12 @@ pub fn get_file_outline(ctx: &Ctx, p: OutlineParams) -> ToolResult {
     if out.items.is_empty() {
         let mut st = ctx.conn.prepare("SELECT config_key, line_number FROM config_dependency WHERE file_path = ?1 ORDER BY line_number")?;
         for r in st.query_map(params![file], |r| Ok(format!("key {} :{}", r.get::<_, String>(0)?, r.get::<_, u32>(1)?)))?.flatten() {
-            out.item(r);
+            if p.filter.as_deref().is_none_or(|q| r.to_lowercase().contains(&q.to_lowercase())) { out.item(r); }
         }
+    }
+    if out.items.is_empty() && (p.filter.is_some() || p.names.is_some()) {
+        let label = p.filter.clone().unwrap_or_else(|| p.names.as_ref().unwrap().join(", "));
+        out.item(format!("(no indexed declarations matching '{label}')"));
     }
     let _ = (NODE_COLS, node_from_row as fn(&rusqlite::Row) -> rusqlite::Result<codegraph_graph::Node>);
     Ok(out)

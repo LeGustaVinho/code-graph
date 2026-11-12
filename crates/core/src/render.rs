@@ -18,8 +18,8 @@ fn children_map(symbols: &[Symbol]) -> HashMap<String, Vec<&Symbol>> {
     map
 }
 
-fn is_public(s: &Symbol) -> bool {
-    !(s.visibility == "private" || s.visibility == "protected" && false)
+fn is_visible(s: &Symbol, include_private: bool) -> bool {
+    include_private || s.visibility != "private"
 }
 
 fn skeleton_line(s: &Symbol, lang: Language) -> String {
@@ -45,8 +45,9 @@ fn skeleton_line(s: &Symbol, lang: Language) -> String {
     }
 }
 
-/// Zero-body stub: public declarations and signatures only.
-pub fn skeleton(path: &str, line_count: u32, lang: Language, symbols: &[Symbol]) -> Vec<String> {
+/// Zero-body stub: non-private declarations and signatures by default.
+/// Private declarations can be included for implementation-level navigation.
+pub fn skeleton(path: &str, line_count: u32, lang: Language, symbols: &[Symbol], include_private: bool) -> Vec<String> {
     let mut out = Vec::new();
     let Some(module) = symbols.iter().find(|s| s.kind == SymbolKind::Module) else { return out };
     out.push(format!("// {path} ({line_count} lines, {})", lang.as_str()));
@@ -54,10 +55,10 @@ pub fn skeleton(path: &str, line_count: u32, lang: Language, symbols: &[Symbol])
         out.push(format!("namespace {ns}"));
     }
     let map = children_map(symbols);
-    fn rec(id: &str, depth: usize, map: &HashMap<String, Vec<&Symbol>>, lang: Language, out: &mut Vec<String>) {
+    fn rec(id: &str, depth: usize, map: &HashMap<String, Vec<&Symbol>>, lang: Language, include_private: bool, out: &mut Vec<String>) {
         let Some(kids) = map.get(id) else { return };
         for s in kids {
-            if !is_public(s) {
+            if !is_visible(s, include_private) {
                 continue;
             }
             // Locals bound at module level that are not exported add noise.
@@ -65,29 +66,30 @@ pub fn skeleton(path: &str, line_count: u32, lang: Language, symbols: &[Symbol])
                 continue;
             }
             let indent = "  ".repeat(depth);
-            let has_kids = map.get(&s.id).map(|k| k.iter().any(|c| is_public(c))).unwrap_or(false);
+            let has_kids = map.get(&s.id).map(|k| k.iter().any(|c| is_visible(c, include_private))).unwrap_or(false);
             let line_ref =
                 if s.end_line > s.start_line { format!(" :{}-{}", s.start_line, s.end_line) } else { format!(" :{}", s.start_line) };
+            let private_label = if include_private && s.visibility == "private" { " [private]" } else { "" };
             let is_type = s.kind.is_type();
             if is_type && has_kids && s.kind != SymbolKind::Enum {
                 let open = if lang == Language::Python { "" } else { " {" };
-                out.push(format!("{indent}{}{open}{line_ref}", skeleton_line(s, lang)));
-                rec(&s.id, depth + 1, map, lang, out);
+                out.push(format!("{indent}{}{open}{line_ref}{private_label}", skeleton_line(s, lang)));
+                rec(&s.id, depth + 1, map, lang, include_private, out);
                 if lang != Language::Python {
                     out.push(format!("{indent}}}"));
                 }
             } else if s.kind == SymbolKind::Enum {
                 let members: Vec<String> = map.get(&s.id).map(|k| k.iter().map(|c| c.name.clone()).collect()).unwrap_or_default();
-                out.push(format!("{indent}{} {{ {} }}{line_ref}", skeleton_line(s, lang), members.join(", ")));
+                out.push(format!("{indent}{} {{ {} }}{line_ref}{private_label}", skeleton_line(s, lang), members.join(", ")));
             } else if s.kind == SymbolKind::Test {
-                out.push(format!("{indent}{}{line_ref}", skeleton_line(s, lang)));
-                rec(&s.id, depth + 1, map, lang, out);
+                out.push(format!("{indent}{}{line_ref}{private_label}", skeleton_line(s, lang)));
+                rec(&s.id, depth + 1, map, lang, include_private, out);
             } else {
-                out.push(format!("{indent}{}{line_ref}", skeleton_line(s, lang)));
+                out.push(format!("{indent}{}{line_ref}{private_label}", skeleton_line(s, lang)));
             }
         }
     }
-    rec(&module.id, 0, &map, lang, &mut out);
+    rec(&module.id, 0, &map, lang, include_private, &mut out);
     out
 }
 
@@ -114,12 +116,12 @@ pub fn kind_abbrev(kind: SymbolKind) -> &'static str {
 }
 
 /// Hierarchical outline including private members, complexity and capability tags.
-pub fn outline(path: &str, line_count: u32, lang: Language, symbols: &[Symbol]) -> Vec<String> {
+pub fn outline(path: &str, line_count: u32, lang: Language, symbols: &[Symbol], include_signatures: bool) -> Vec<String> {
     let mut out = Vec::new();
     let Some(module) = symbols.iter().find(|s| s.kind == SymbolKind::Module) else { return out };
     out.push(format!("{path} [{}, {line_count} lines]", lang.as_str()));
     let map = children_map(symbols);
-    fn rec(id: &str, depth: usize, map: &HashMap<String, Vec<&Symbol>>, out: &mut Vec<String>) {
+    fn rec(id: &str, depth: usize, map: &HashMap<String, Vec<&Symbol>>, include_signatures: bool, out: &mut Vec<String>) {
         let Some(kids) = map.get(id) else { return };
         for s in kids {
             let indent = "  ".repeat(depth);
@@ -145,11 +147,16 @@ pub fn outline(path: &str, line_count: u32, lang: Language, symbols: &[Symbol]) 
                 SymbolKind::Test => format!("\"{}\"", s.name),
                 _ => s.name.clone(),
             };
-            out.push(format!("{indent}{} {label} {range}{extra}", kind_abbrev(s.kind)));
-            rec(&s.id, depth + 1, map, out);
+            let signature = if include_signatures && !s.signature.is_empty() {
+                format!(" | {}", crate::extract::truncate(&s.signature, 160))
+            } else {
+                String::new()
+            };
+            out.push(format!("{indent}{} {label} {range}{extra}{signature}", kind_abbrev(s.kind)));
+            rec(&s.id, depth + 1, map, include_signatures, out);
         }
     }
-    rec(&module.id, 0, &map, &mut out);
+    rec(&module.id, 0, &map, include_signatures, &mut out);
     out
 }
 

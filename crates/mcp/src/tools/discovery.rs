@@ -1,7 +1,10 @@
 //! 5.2 Discovery: search_universal, find_literal, find_variable_or_const.
 
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::time::Instant;
 
+use codegraph_core::lang::Language;
 use codegraph_graph::query;
 use codegraph_graph::store::{node_from_row, NODE_COLS};
 use codegraph_graph::Node;
@@ -18,6 +21,8 @@ use super::{nodes_map, wants_json, Ctx, Out, ToolResult};
 pub struct SearchParams {
     /// Text to search (substring / trigram match on names, qualified names, signatures and paths).
     pub query: String,
+    /// Require a case-sensitive, exact name or qualified-name match instead of fuzzy search (default false).
+    pub exact: Option<bool>,
     /// Optional kind filter: class, interface, method, function, variable, const, field, property, data_model, test, enum, module, literal.
     pub kind: Option<String>,
     /// Maximum results (default 20).
@@ -39,19 +44,247 @@ fn node_json(n: &Node) -> String {
     .to_string()
 }
 
+/// Exact declaration lookup is intentionally separate from the ranked fuzzy search:
+/// prefix, substring, case-insensitive, and signature matches are not admissible.
+fn search_exact(ctx: &Ctx, query: &str, kind: Option<&str>, limit: usize) -> Result<(Vec<Node>, usize), rusqlite::Error> {
+    let query = query.trim();
+    let kind_filter = if kind.is_some() { "AND kind = ?2" } else { "AND ?2 IS NULL" };
+    let literal_filter = if kind == Some("literal") { "" } else { "AND kind <> 'literal'" };
+    let predicate = format!("(name = ?1 COLLATE BINARY OR qualified_name = ?1 COLLATE BINARY) {kind_filter} {literal_filter}");
+    let sql = format!("SELECT {NODE_COLS} FROM node WHERE {predicate} ORDER BY derived, kind, qualified_name, file_path, start_line, id LIMIT ?3");
+    let mut st = ctx.conn.prepare(&sql)?;
+    let rows: Vec<Node> = st.query_map(params![query, kind, limit as i64], node_from_row)?.collect::<Result<_, _>>()?;
+    let count_sql = format!("SELECT COUNT(*) FROM (SELECT 1 FROM node WHERE {predicate} LIMIT 1000)");
+    let total: i64 = ctx.conn.query_row(&count_sql, params![query, kind], |r| r.get(0))?;
+    Ok((rows, total as usize))
+}
+
 pub fn search_universal(ctx: &Ctx, p: SearchParams) -> ToolResult {
     let t0 = Instant::now();
     let limit = p.limit.unwrap_or(20).clamp(1, 200);
-    let include_literals = p.kind.as_deref() == Some("literal");
-    let (rows, total) = query::search(ctx.conn, &p.query, p.kind.as_deref(), limit, include_literals)?;
+    let exact = p.exact.unwrap_or(false);
+    let (rows, total) = if exact {
+        search_exact(ctx, &p.query, p.kind.as_deref(), limit)?
+    } else {
+        let include_literals = p.kind.as_deref() == Some("literal");
+        query::search(ctx.conn, &p.query, p.kind.as_deref(), limit, include_literals)?
+    };
     let mut out = Out::new();
     let total_label = if total >= 1000 { "1000+".to_string() } else { total.to_string() };
-    out.h(format!("{total_label} match(es) for '{}' ({:.1} ms)", p.query, t0.elapsed().as_secs_f64() * 1000.0));
+    out.h(format!("{total_label} {}match(es) for '{}' ({:.1} ms)", if exact { "exact declaration " } else { "" }, p.query, t0.elapsed().as_secs_f64() * 1000.0));
     let json = wants_json(&p.format);
     for n in &rows {
         out.item(if json { node_json(n) } else { node_line_sig(n) });
     }
     out.unshown = total.saturating_sub(rows.len());
+    Ok(out)
+}
+
+/// Text search over files recorded by the semantic index. Unlike a symbol query,
+/// this also finds references in expressions. Zero matches describe only indexed,
+/// readable source files, not ignored or unsupported files. It scans source because
+/// the reference-name table is not an exhaustive inverted index for every language.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSearchParams {
+    /// Exact text to find (not a regex).
+    pub query: String,
+    /// Optional root-relative file or directory; excludes every other path.
+    pub path: Option<String>,
+    /// Match only whole identifiers/words (default false).
+    pub whole_word: Option<bool>,
+    /// Case-sensitive comparison (default true).
+    pub case_sensitive: Option<bool>,
+    /// Maximum matching lines to include (default 30, max 200).
+    pub limit: Option<usize>,
+    pub max_token_budget: Option<usize>,
+    pub format: Option<String>,
+}
+
+fn identifier_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn text_matches(line: &str, needle: &str, case_sensitive: bool, whole_word: bool) -> bool {
+    let (haystack, needle) = if case_sensitive {
+        (line.to_owned(), needle.to_owned())
+    } else {
+        (line.to_lowercase(), needle.to_lowercase())
+    };
+    if !whole_word {
+        return haystack.contains(&needle);
+    }
+    haystack.match_indices(&needle).any(|(start, _)| {
+        let end = start + needle.len();
+        !haystack[..start].chars().next_back().is_some_and(identifier_char)
+            && !haystack[end..].chars().next().is_some_and(identifier_char)
+    })
+}
+
+fn matches_scope(file: &str, scope: &str) -> bool {
+    if scope.is_empty() {
+        return true;
+    }
+    if cfg!(windows) {
+        // Windows paths are normally case-insensitive, including their directory
+        // components; respect the filesystem's behavior when filtering the index.
+        return file.eq_ignore_ascii_case(scope) || file.get(..scope.len()).is_some_and(|prefix| {
+            prefix.eq_ignore_ascii_case(scope) && file.as_bytes().get(scope.len()) == Some(&b'/')
+        });
+    }
+    file == scope || file.starts_with(&format!("{scope}/"))
+}
+
+/// Root-relative scope suggestions from known indexed files (without walking
+/// directories excluded from indexing). `Tests` can suggest `Assets/Tests`.
+fn scope_suggestions(indexed: &[String], scope: &str) -> Vec<String> {
+    if scope.contains('/') || scope.is_empty() {
+        return Vec::new();
+    }
+    let mut suggestions = BTreeSet::new();
+    for file in indexed {
+        let parts: Vec<_> = file.split('/').collect();
+        for i in 0..parts.len() {
+            if parts[i].eq_ignore_ascii_case(scope) && i > 0 {
+                suggestions.insert(parts[..=i].join("/"));
+            }
+        }
+    }
+    suggestions.into_iter().take(3).collect()
+}
+
+/// An unindexed directory may genuinely have no supported source files (for
+/// example an empty Unity Tests folder). Check its contents before treating it
+/// as a query failure. Do not follow symlinks, cross the project root, or assume
+/// that an unreadable/very large directory is empty. Ignored or oversized source
+/// files still count here: their presence makes index coverage inconclusive.
+fn scope_has_no_source_files(root: &Path, dir: &Path) -> std::io::Result<bool> {
+    if !dir.is_dir() || !std::fs::canonicalize(dir)?.starts_with(std::fs::canonicalize(root)?) {
+        return Ok(false);
+    }
+    let mut pending = vec![dir.to_path_buf()];
+    let mut inspected = 0usize;
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            inspected += 1;
+            if inspected > 20_000 {
+                return Ok(false); // Bounds metadata work for large unindexed trees.
+            }
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                return Ok(false); // The target may contain supported files.
+            }
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if !kind.is_file() || Language::from_path(&entry.path()).is_some() {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+pub fn search_source(ctx: &Ctx, p: SourceSearchParams) -> ToolResult {
+    let needle = p.query.trim();
+    if needle.is_empty() {
+        return Err(super::ToolError::BadArgs("query must not be empty".into()));
+    }
+    let scope = p.path.as_deref().unwrap_or("").trim().replace('\\', "/");
+    let scope = scope.trim_start_matches("./").trim_end_matches('/');
+    let scope = if scope == "." { "" } else { scope };
+    if !scope.is_empty() && !Path::new(scope).components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+        return Err(super::ToolError::BadArgs("path must be relative to project root".into()));
+    }
+    let scope = Path::new(scope).components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join("/");
+    let scope = scope.as_str();
+    let mut st = ctx.conn.prepare(
+        "SELECT file_path, status FROM file_meta ORDER BY file_path",
+    )?;
+    let indexed = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut indexed_paths = Vec::new();
+    let mut files = 0usize;
+    let mut unindexed = 0usize;
+    let mut unreadable = 0usize;
+    let mut lossy_decoded = 0usize;
+    let mut matched = 0usize;
+    let limit = p.limit.unwrap_or(30).clamp(1, 200);
+    let case_sensitive = p.case_sensitive.unwrap_or(true);
+    let whole_word = p.whole_word.unwrap_or(false);
+    let json = wants_json(&p.format);
+    let mut out = Out::new();
+    for (file, status) in indexed.collect::<Result<Vec<_>, _>>()? {
+        if status == "indexed" {
+            indexed_paths.push(file.clone());
+        }
+        if !matches_scope(&file, scope) {
+            continue;
+        }
+        if status != "indexed" {
+            unindexed += 1;
+            continue;
+        }
+        files += 1;
+        let absolute = ctx.engine.root.join(Path::new(&file));
+        let Ok(bytes) = std::fs::read(&absolute) else {
+            unreadable += 1;
+            continue;
+        };
+        // Legacy source files may carry a non-UTF-8 comment or string. Preserve
+        // searchable ASCII identifiers and report that decoding was lossy.
+        let content = String::from_utf8_lossy(&bytes);
+        if matches!(content, std::borrow::Cow::Owned(_)) {
+            lossy_decoded += 1;
+        }
+        for (i, line) in content.lines().enumerate() {
+            if !text_matches(line, needle, case_sensitive, whole_word) {
+                continue;
+            }
+            matched += 1;
+            if matched <= limit {
+                if json {
+                    out.item(json!({
+                        "file": file,
+                        "line": i + 1,
+                        "text": line.trim(),
+                    }).to_string());
+                } else {
+                    out.item(format!("{}:{} | {}", file, i + 1, codegraph_core::extract::truncate(line.trim(), 180)));
+                }
+            }
+        }
+    }
+    if files == 0 {
+        if scope.is_empty() {
+            return Err(super::ToolError::NotFound("project has no indexed source files; search_source cannot establish whether text is present".into()));
+        }
+        let exists = ctx.engine.root.join(scope).exists();
+        if exists && unindexed == 0
+            && scope_has_no_source_files(&ctx.engine.root, &ctx.engine.root.join(scope)).unwrap_or(false)
+        {
+            out.h(format!(
+                "0 matching line(s) for '{needle}' under {scope}: no supported source files exist in this directory or its subdirectories (0 indexed files scanned)."
+            ));
+            out.h("This is a verified empty source scope; unsupported file formats were not searched.");
+            return Ok(out);
+        }
+        let mut message = if exists {
+            format!("path '{scope}' exists but has no indexed source files ({unindexed} recorded as stale/error). No files were searched and absence cannot be established; check ignore rules, supported source extensions, file-size limits, or indexing errors, or search this directory directly with a file-text search.")
+        } else {
+            format!("path '{scope}' does not exist relative to the project root; no indexed source files were searched. Use a root-relative path")
+        };
+        let suggestions = scope_suggestions(&indexed_paths, scope);
+        if !suggestions.is_empty() {
+            message.push_str(&format!(". Indexed paths with that name: {}", suggestions.join(", ")));
+        }
+        return Err(super::ToolError::NotFound(message));
+    }
+    let label = if scope.is_empty() { "." } else { scope };
+    out.h(format!("{matched} matching line(s) in indexed source for '{needle}' under {label} ({files} indexed files scanned, {unreadable} unreadable, {lossy_decoded} lossy UTF-8, {unindexed} stale/error files excluded)"));
+    if matched == 0 {
+        out.h("No matches in the indexed, readable source files searched; ignored, unsupported and oversized files were not checked, so absence outside the index is unverified.");
+    }
+    out.unshown = matched.saturating_sub(limit);
     Ok(out)
 }
 

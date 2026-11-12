@@ -208,6 +208,16 @@ pub fn get_tests_for_symbol(ctx: &Ctx, p: TestsParams) -> ToolResult {
             }
         }
     }
+    // Test files that import the symbol or its module: the most direct evidence of coverage,
+    // whatever the tests then drive it through (HTTP, a CLI, fixtures).
+    let importers: Vec<(String, i64)> = {
+        let mut st = ctx.conn.prepare(
+            "SELECT e.source_file, (SELECT COUNT(*) FROM node t WHERE t.file_path = e.source_file AND t.kind = 'test')              FROM edge e WHERE e.relation = 'IMPORTS' AND (e.target_id = ?1 OR e.target_file = ?2)              AND EXISTS (SELECT 1 FROM node t WHERE t.file_path = e.source_file AND t.is_test = 1)              GROUP BY e.source_file ORDER BY e.source_file",
+        )?;
+        let rows: Vec<(String, i64)> = st.query_map(params![n.sym.id, n.file_path], |r| Ok((r.get(0)?, r.get(1)?)))?.flatten().collect();
+        rows
+    };
+    named.retain(|(f, _)| !importers.iter().any(|(i, _)| i == f));
     close.sort_by(|a, b| {
         let priority = |h: &str| match h { "direct" => 0, "calls it" => 1, _ => 2 };
         priority(a.2).cmp(&priority(b.2))
@@ -219,6 +229,12 @@ pub fn get_tests_for_symbol(ctx: &Ctx, p: TestsParams) -> ToolResult {
     let files = &reached;
     out.h(format!("{} linked test(s) in {} file(s) for {} {} (≤ {depth} hops); {} same-name candidate file(s)",
         rows.len(), files.len(), display(&n), n.coords(), named.len()));
+    if rows.is_empty() && named.is_empty() && importers.is_empty() {
+        // A graph with no linked test edges cannot prove that tests do not
+        // exist: unsupported files, excluded directories, Inspector bindings,
+        // and dynamic calls can all sit outside the indexed call graph.
+        out.h("No linked tests in the index; absence of tests is unverified (check unindexed scopes and dynamic callers).");
+    }
     let shown_close = close.len().min(limit);
     let shown_named = named.len().min(limit - shown_close);
     let shown_other = by_file.len().min(limit - shown_close - shown_named);
@@ -236,6 +252,10 @@ pub fn get_tests_for_symbol(ctx: &Ctx, p: TestsParams) -> ToolResult {
             out.item(json!({ "file": f, "tests": c, "min_hops": d }).to_string());
         }
         return Ok(out);
+    }
+    if !importers.is_empty() {
+        let list: Vec<String> = importers.iter().map(|(f, c)| format!("{f} ({c} test(s))")).collect();
+        out.item(format!("test files importing {}: {}", n.file_path, list.join(", ")));
     }
     if !close.is_empty() {
         out.item(format!("closest ({}):", close.len()));

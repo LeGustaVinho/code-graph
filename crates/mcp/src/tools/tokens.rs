@@ -67,6 +67,8 @@ pub fn batch_query(ctx: &Ctx, p: BatchParams) -> ToolResult {
 pub struct SkeletonParams {
     /// File path (relative to the project root; suffixes like "OrderService.cs" are accepted).
     pub file_path: String,
+    /// Include private declarations and mark them [private] (default: false). Exported-root filtering still applies to ES modules.
+    pub include_private: Option<bool>,
     pub max_token_budget: Option<usize>,
     pub format: Option<String>,
 }
@@ -82,6 +84,7 @@ pub fn get_file_skeleton(ctx: &Ctx, p: SkeletonParams) -> ToolResult {
     // their own export modifier. Other languages (including Python and Rust) have
     // different public API rules, so retain the renderer's native visibility checks.
     let es_module = matches!(lang, Language::TypeScript | Language::Tsx | Language::JavaScript);
+    let before_export_filter = syms.len();
     let module = syms.iter().find(|s| s.kind == SymbolKind::Module).map(|s| s.id.clone());
     if es_module {
         if let Some(module) = module {
@@ -109,17 +112,26 @@ pub fn get_file_skeleton(ctx: &Ctx, p: SkeletonParams) -> ToolResult {
             }
         }
     }
-    let rendered = render::skeleton(&file, lines, lang, &syms);
+    let include_private = p.include_private.unwrap_or(false);
+    let private_omitted = if include_private { 0 } else { syms.iter().filter(|s| s.visibility == "private").count() };
+    let non_exported_omitted = before_export_filter - syms.len();
+    let rendered = render::skeleton(&file, lines, lang, &syms, include_private);
     let mut out = Out::new();
     let mut it = rendered.into_iter();
     if let Some(h) = it.next() {
         out.h(h);
     }
+    if private_omitted > 0 {
+        out.h(format!("// {private_omitted} private declaration(s) omitted; use include_private=true or get_file_outline"));
+    }
+    if non_exported_omitted > 0 {
+        out.h(format!("// {non_exported_omitted} non-exported ES module declaration(s) omitted"));
+    }
     for l in it {
         out.item(l);
     }
     if out.items.is_empty() {
-        out.item("(no public declarations)");
+        out.item("(no declarations in selected scope)");
     }
     Ok(out)
 }

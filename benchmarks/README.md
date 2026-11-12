@@ -14,10 +14,17 @@ token-saving claim is accepted.
 2. Give the **same tasks** to isolated agents; the conventional arm can use text
    searches/line ranges, and the CodeGraph arm can query the graph and fall back
    to recorded conventional reads. Neither reads the other's outputs.
+   Preserve the question's file scope in both arms. For a C#-only scenario,
+   explicitly limit text searches to `--glob '*.cs'` and read only `.cs` files.
+   Do not expand to Unity prefabs, scenes, serialized events or config files
+   unless those artifacts are explicitly part of the task. CodeGraph semantic
+   query results must be reviewed against the same extension restriction.
 3. Instrument **every code-reading operation** using `query_logger.py`: it
    records stdout, stderr, arguments, status, and durations. Record the
    CodeGraph skill in `S0.log`, and use `--verify` for text reads performed
-   while validating CodeGraph answers.
+   while validating CodeGraph answers. Concurrent logger invocations in one
+   arm are serialized when appending logs and manifests. A failed query and
+   a valid `rg` search with no matches have different recorded statuses.
 4. Compare the logs using `compare_reading.py` (o200k_base). Require **both**
    the weighted savings across total tokens and arithmetic mean scenario
    savings to exceed 20%, with complete logs and manual equivalence review.
@@ -33,6 +40,7 @@ python -m pip install -r benchmarks/requirements.txt
 python benchmarks/query_logger.py --run benchmarks/example/codegraph --scenario S1 --root D:/repo --cg search_universal --arg query=Order
 python benchmarks/query_logger.py --run benchmarks/example/codegraph --scenario S1 --root D:/repo --read src/order.ts --start 40 --end 60 --verify
 python benchmarks/query_logger.py --run benchmarks/example/baseline --scenario S1 --root D:/repo --rg 'Order' --path src
+python benchmarks/query_logger.py --run benchmarks/example/baseline --scenario S1 --root D:/repo --rg 'Order' --path src --glob '*.cs'
 python benchmarks/holdout_smoke.py target/release/codegraph.exe
 python benchmarks/compare_reading.py --baseline benchmarks/example/baseline --candidate benchmarks/example/codegraph --output benchmarks/example/comparison.json
 ```
@@ -45,6 +53,10 @@ increased and the extra output included in the total. A CodeGraph agent's
 fallback text reads are **part of its cost**. Setup/indexing effort and execution
 time should be reported separately, since this metric measures tool-output
 tokens. Count skill-loading cost when included in the agent's context.
+The `get_flow_evidence` output is deliberately a *selected* source excerpt:
+when an omitted state assignment or implicit behavior matters, expand with
+`get_symbol_body` and count that expansion too. Treat quality-equivalence
+review as a separate gate; token-only ratios cannot establish parity.
 
 Raw benchmark captures from private repositories are kept locally and excluded
 from the public source tree to avoid publishing third-party source code.

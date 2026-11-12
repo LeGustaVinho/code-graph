@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::fmt::{display, edge_line, node_line, short_evidence};
-use super::{nodes_map, resolve_symbol, wants_json, Ctx, Out, ToolError, ToolResult};
+use super::{nodes_map, resolve_navigation_symbols, resolve_symbol, wants_json, Ctx, Out, ToolError, ToolResult};
 
 pub const FLOW_RELATIONS: &[&str] = &["CALLS", "HTTP_CALLS", "RESOLVES_DI"];
 
@@ -183,6 +183,8 @@ fn tree(
         let unresolved = !nodes.contains_key(key);
         resolved_sites.iter().any(|(k, abs, s)| k != key && (unresolved || !abs) && sites.iter().all(|l| s.contains(l)))
     };
+    // Callees already expanded elsewhere in the tree: one summary line per level.
+    let mut seen_again: Vec<String> = Vec::new();
     for key in order {
         let mut es = groups.remove(&key).unwrap_or_default();
         es.sort_by_key(|e| e.line);
@@ -206,11 +208,10 @@ fn tree(
                 // Exact edges need no justification; inferred ones say why.
                 let conf = match e.confidence {
                     Confidence::Exact => String::new(),
-                    c => format!(" [{}: {}]", c.as_str(), short_evidence(e, 50)),
+                    c => format!(" [{}: {}]", c.as_str(), short_evidence(e, 40)),
                 };
                 if visited.contains(&n.sym.id) {
-                    // Already expanded above: name and call sites only.
-                    lines.push(format!("{indent}{arrow} {} {site}{rel} (↻)", display(n)));
+                    seen_again.push(format!("{} {site}{rel}", display(n)));
                     continue;
                 }
                 lines.push(format!("{indent}{arrow} {} {} {site}{rel}{conf}{caps}", display(n), n.coords()));
@@ -237,6 +238,9 @@ fn tree(
                 ));
             }
         }
+    }
+    if !seen_again.is_empty() {
+        lines.push(format!("{indent}{arrow} (↻ expanded above) {}", seen_again.join("; ")));
     }
     Ok(())
 }
@@ -268,7 +272,7 @@ pub struct HierarchyParams {
 }
 
 pub fn get_call_hierarchy(ctx: &Ctx, p: HierarchyParams) -> ToolResult {
-    let n = resolve_symbol(ctx.conn, &p.symbol_id)?;
+    let family = resolve_navigation_symbols(ctx.conn, &p.symbol_id)?;
     let depth = p.depth.unwrap_or(2).clamp(1, 6);
     let dir = p.direction.as_deref().unwrap_or("callees");
     let dirs: Vec<bool> = match dir {
@@ -278,9 +282,11 @@ pub fn get_call_hierarchy(ctx: &Ctx, p: HierarchyParams) -> ToolResult {
         other => return Err(ToolError::BadArgs(format!("direction must be callers|callees|both, got '{other}'"))),
     };
     let mut out = Out::new();
-    out.h(node_line(&n));
-    let seeds = expand_type(ctx.conn, &n)?;
-    for callees in dirs {
+    if family.len() > 1 { out.h(format!("{} overloads of {}", family.len(), p.symbol_id)); }
+    for n in family {
+      out.h(node_line(&n));
+      let seeds = expand_type(ctx.conn, &n)?;
+      for &callees in &dirs {
         let label = if callees { "callees" } else { "callers" };
         let total: i64 = seeds.iter().map(|s| reachable_count(ctx.conn, s, callees, depth)).sum();
         out.item(format!("{label} (depth {depth}, {total} reachable):"));
@@ -299,6 +305,7 @@ pub fn get_call_hierarchy(ctx: &Ctx, p: HierarchyParams) -> ToolResult {
                 out.item(l);
             }
         }
+      }
     }
     Ok(out)
 }
@@ -588,6 +595,13 @@ pub fn trace_fullstack_flow(ctx: &Ctx, p: FullstackParams) -> ToolResult {
             let who = srcs.get(&e.source_id).map(display).unwrap_or_default();
             let client = e.metadata.as_ref().and_then(|m| m.get("client")).and_then(|c| c.as_str()).map(|c| format!(" via {c}")).unwrap_or_default();
             out.item(format!("    {}:{} {who}{client} [{}]", e.source_file, e.line, e.confidence.as_str()));
+            // The call itself (payload and options), so the caller needn't be opened for it.
+            if let Some(t) = std::fs::read_to_string(ctx.engine.root.join(&e.source_file))
+                .ok()
+                .and_then(|src| src.lines().nth(e.line.saturating_sub(1) as usize).map(|l| l.trim().to_string()))
+            {
+                out.item(format!("      {}| {}", e.line, codegraph_core::extract::truncate(&t, 160)));
+            }
             // Callers of the frontend function, one line per caller with all its call sites.
             let mut ups: Vec<(String, Vec<u32>, &'static str)> = Vec::new();
             for up in query::edges_in(ctx.conn, &e.source_id, &["CALLS"])? {

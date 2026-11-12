@@ -1,0 +1,77 @@
+{
+  "date": "2026-10-23",
+  "repository": "D:/Entidades/EmergentsWorlds/warcodes-mobileapp",
+  "repository_head": "00b453eb43c0dee6dff8c4194b4464c65b01c47e",
+  "codegraph_head": "a42e9722114715afb8013072450f2738278b81b9",
+  "codegraph_binary_sha256": "076010B0A51A61F97E1150B49061BBC5A76A0E545991948B2A185B7F16E91AF2",
+  "codegraph_skill_sha256": "e9b94edec435c3f8f3a4052ff67d09ab829d4bd5275220e787bbbab78eaddde8",
+  "tokenizer": "o200k_base",
+  "scope": "Only .cs code source files; no serialized Unity assets, packages, prefabs or config content.",
+  "design": "Fresh isolated CodeGraph and conventional workers; same seven C# scenarios; independent tool-output logs, no context/result sharing.",
+  "measurement": "stdout+stderr token counts from instrumented reading commands, including retries, failures, conventional CodeGraph fallbacks, plus CodeGraph skill text once; excludes agent reasoning, message tokens and model billing.",
+  "scenario_labels": {
+    "S1": "UserProfilePanel public and Unity lifecycle methods",
+    "S2": "BarcodeScannerWrapper camera permissions and scan lifecycle",
+    "S3": "WorldNavigationHelper overloads, routes and direct C# callsites",
+    "S4": "DisplayScriptResolver task caching, reference validation and errors",
+    "S5": "IDisplayScriptResolver contract and direct implementations",
+    "S6": "FirebaseManager initialization of GameInstance.DisplayScripts",
+    "S7": "DisplayScriptResolver direct text in C# test files"
+  },
+  "baseline": {
+    "by_scenario": {"S1": 1750, "S2": 6620, "S3": 772, "S4": 1244, "S5": 383, "S6": 3717, "S7": 160},
+    "reading_tokens": 14646,
+    "operations": 23,
+    "completed": 22,
+    "no_matches": 1,
+    "nonzero_exit": 0,
+    "sum_operation_ms": 236
+  },
+  "codegraph": {
+    "by_scenario": {"S1": 854, "S2": 5131, "S3": 1223, "S4": 2040, "S5": 515, "S6": 2813, "S7": 478},
+    "reading_tokens": 13054,
+    "skill_tokens": 682,
+    "total_tokens": 13736,
+    "operations": 38,
+    "completed": 36,
+    "no_matches": 1,
+    "nonzero_exit": 1,
+    "conventional_fallback_operations": 3,
+    "sum_operation_ms": 5115
+  },
+  "by_scenario_savings": {
+    "S1": 0.512,
+    "S2": 0.225,
+    "S3": -0.584,
+    "S4": -0.640,
+    "S5": -0.345,
+    "S6": 0.243,
+    "S7": -1.987
+  },
+  "weighted_savings_including_skill": 0.06213300559879831,
+  "weighted_savings_excluding_skill": 0.108698620784,
+  "arithmetic_mean_scenario_savings": -0.3680120621195476,
+  "net_tokens_saved_including_skill": 910,
+  "weighted_20pct_target_met": false,
+  "scenario_mean_20pct_target_met": false,
+  "audit": {
+    "seven_scenarios_in_both_arms": true,
+    "non_cs_conventional_read_operations": 0,
+    "unfiltered_conventional_rg_operations": 0,
+    "baseline_errors": [],
+    "codegraph_errors": ["S7 search_source under Tests: directory exists but contains no indexed source files; exit 1, not a verified absence"],
+    "valid_no_matches": ["Baseline S7 rg on Tests *.cs", "CodeGraph S7 verification rg on Tests *.cs"],
+    "quality": "Equivalent core C# facts in S1-S7, including no direct C# GotoAreaLocation callsite beyond declaration. Tests scope was verified by conventional search after unindexed CodeGraph path."
+  },
+  "limitations": [
+    "One execution per arm; previous rerun showed materially different numbers with the same skill and code snapshot, demonstrating sensitivity to agent search strategy.",
+    "Only output tokens from instrumented reading operations and one skill document are included.",
+    "No claim of total prompt/reasoning token savings, billing savings, or universal benefit.",
+    "Unrelated pre-existing project/repository worktree modifications were preserved."
+  ],
+  "raw_log_paths": [
+    "target/tmp/bench_20261023_cs_only_03/baseline",
+    "target/tmp/bench_20261023_cs_only_03/cg"
+  ],
+  "comparator_output": "target/tmp/bench_20261023_cs_only_03/comparison.json"
+}

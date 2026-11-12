@@ -1576,7 +1576,41 @@ fn call(ctx: &mut Ctx, node: Node) {
     // `orders.Where(o => o.Paid)`: lambda parameters are elements of the receiver.
     let hint = if ELEMENT_LAMBDA_METHODS.contains(&name.as_str()) { rtype.as_deref().and_then(element_type) } else { None };
 
+    // Preserve only types known from syntax or the local scope; overload selection must
+    // not mistake a same-arity alternative for an exact caller.
+    let arg_types: Vec<Option<String>> = args
+        .map(named_children)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|arg| {
+            // Positional matching is unsafe for `M(second: x, first: y)` or
+            // ref/out/in arguments. Leave these calls ambiguous for now.
+            if arg.kind() == "argument" {
+                let text = ctx.text(arg).trim_start();
+                let named = text.split_once(':').is_some_and(|(prefix, _)| {
+                    let ident = prefix.trim();
+                    !ident.is_empty() && ident.chars().all(|c| c.is_alphanumeric() || c == '_')
+                });
+                if named
+                    || named_children(arg).iter().any(|n| n.kind() == "name_colon")
+                    || ["ref ", "out ", "in "].iter().any(|prefix| text.starts_with(prefix))
+                {
+                    // An unsafe binding must veto overload selection even when
+                    // another positional argument uniquely matches a signature.
+                    return Some("@csharp:unsupported-argument-binding".into());
+                }
+                arg.named_child(0).and_then(|value| argument_type(ctx, value))
+            } else {
+                argument_type(ctx, arg)
+            }
+        })
+        .collect();
     ctx.push_ref(RefKind::Call, &name, receiver.clone(), rtype, argc, line, generic.map(|g| collapse_ws(&g)));
+    if arg_types.iter().any(Option::is_some) {
+        if let Some(last) = ctx.facts.refs.last_mut() {
+            last.arg_types = arg_types;
+        }
+    }
     if let Some(r) = recv_node {
         walk(ctx, r);
     }
@@ -1595,6 +1629,38 @@ fn call(ctx: &mut Ctx, node: Node) {
 fn arg_nodes(args: Option<Node>) -> Vec<Node> {
     let Some(a) = args else { return Vec::new() };
     named_children(a).into_iter().map(|arg| if arg.kind() == "argument" { arg.named_child(0).unwrap_or(arg) } else { arg }).collect()
+}
+
+/// Infer a call argument's type without treating an unknown expression as a guess.
+/// The existing expression inference handles typed parameters, locals, fields, casts,
+/// creations and deferred member types; literals add exact primitive types.
+fn argument_type(ctx: &Ctx, value: Node) -> Option<String> {
+    match value.kind() {
+        "string_literal" | "verbatim_string_literal" | "raw_string_literal" | "interpolated_string_expression" => Some("string".into()),
+        "boolean_literal" | "true" | "false" => Some("bool".into()),
+        "character_literal" => Some("char".into()),
+        "integer_literal" => {
+            let literal = ctx.text(value).to_ascii_lowercase();
+            let suffix = literal.trim_end_matches(|c: char| c == 'u' || c == 'l');
+            let suffix = &literal[suffix.len()..];
+            Some(match suffix {
+                "l" => "long",
+                "u" => "uint",
+                "ul" | "lu" => "ulong",
+                _ => "int",
+            }.into())
+        }
+        "real_literal" => {
+            let literal = ctx.text(value).to_ascii_lowercase();
+            Some(match literal.chars().last() {
+                Some('f') => "float",
+                Some('m') => "decimal",
+                _ => "double",
+            }.into())
+        }
+        "parenthesized_expression" => value.named_child(0).and_then(|v| argument_type(ctx, v)),
+        _ => infer_expr_type(ctx, value),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

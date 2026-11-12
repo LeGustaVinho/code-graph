@@ -249,8 +249,8 @@ fn generated_files_and_test_hooks() {
 
 // ---------------------------------------------------------------- copies of a project
 
-/// A large overload family (`math.mul`, `Assert.AreEqual` for every vector type) gives a
-/// call one inferred link, not one edge per same-arity overload.
+/// A large overload family (`math.mul`, `Assert.AreEqual` for every vector type) gives
+/// one link rather than fanning out; statically known types permit an exact match.
 #[test]
 fn large_overload_families_do_not_fan_out() {
     let tmp = tempfile::tempdir().unwrap();
@@ -269,9 +269,162 @@ fn large_overload_families_do_not_fan_out() {
     codegraph_graph::index_project(&root, &mut conn, codegraph_graph::IndexOptions::default()).unwrap();
     let run = target_sigs(&conn, "Uses.Run", "CALLS");
     assert_eq!(run.len(), 1, "{run:?}");
-    assert_eq!(edge(&conn, "Uses.Run", "Check.AreEqual", "CALLS").as_deref(), Some("inferred"));
-    // A small overload set keeps every candidate.
-    assert_eq!(target_sigs(&conn, "Uses.Two", "CALLS").len(), 2);
+    assert_eq!(edge(&conn, "Uses.Run", "Check.AreEqual", "CALLS").as_deref(), Some("exact"));
+    // A statically typed integer argument selects the int overload, not the float one.
+    let two = target_sigs(&conn, "Uses.Two", "CALLS");
+    assert_eq!(two.len(), 1, "{two:?}");
+    assert!(two[0].1.contains("int x"), "{two:?}");
+}
+
+/// Regression for callers attributed to both ItemDataRef and List<ItemDataRef>
+/// overloads even though the argument has a statically known, distinct type.
+#[test]
+fn csharp_overloads_use_argument_types_and_keep_unknown_calls_unresolved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("Overloads.cs"),
+        r#"using System.Collections.Generic;
+namespace Example {
+    public class ItemDataRef { }
+    public class Proxy { public ItemDataRef upgradeRarityCost; }
+    public class Menu {
+        public void ShowPurchaseConfirmationPanel(ItemDataRef item) {
+            ShowPurchaseConfirmationPanel(new List<ItemDataRef> { item });
+        }
+        public void ShowPurchaseConfirmationPanel(List<ItemDataRef> items) { }
+        public void Compare(int value) { }
+        public void Compare(float value) { }
+        public void OneOrTwo(int value) { }
+        public void OneOrTwo(int value, int other) { }
+        public void Ordered(ItemDataRef item, List<ItemDataRef> items) { }
+        public void Ordered(List<ItemDataRef> items, ItemDataRef item) { }
+    }
+    public class Caller {
+        public void Single(Menu menu, ItemDataRef costItem) {
+            menu.ShowPurchaseConfirmationPanel(costItem);
+        }
+        public void Multiple(Menu menu, List<ItemDataRef> costs) {
+            menu.ShowPurchaseConfirmationPanel(costs);
+        }
+        public void Field(Menu menu, Proxy proxy) {
+            menu.ShowPurchaseConfirmationPanel(proxy.upgradeRarityCost);
+        }
+        public void Unknown(Menu menu) {
+            menu.ShowPurchaseConfirmationPanel(default);
+        }
+        public void Numeric(Menu menu) { menu.Compare(1); }
+        public void ByArity(Menu menu, int value) { menu.OneOrTwo(value); }
+        public void Named(Menu menu, ItemDataRef item, List<ItemDataRef> items) {
+            menu.Ordered(items: items, item: item);
+        }
+    }
+}"#,
+    )
+    .unwrap();
+    let mut conn = codegraph_graph::open(&root).unwrap();
+    codegraph_graph::index_project(&root, &mut conn, codegraph_graph::IndexOptions::default()).unwrap();
+    let overloads = |caller: &str| {
+        target_sigs(&conn, caller, "CALLS")
+            .into_iter()
+            .filter(|(_, s)| s.contains("ShowPurchaseConfirmationPanel("))
+            .map(|(_, s)| s)
+            .collect::<Vec<_>>()
+    };
+    for name in ["Caller.Single", "Caller.Field"] {
+        let edges = overloads(name);
+        assert_eq!(edges.len(), 1, "{name}: {edges:?}");
+        assert!(edges[0].contains("ItemDataRef item"), "{name}: {edges:?}");
+        assert!(!edges[0].contains("List<ItemDataRef>"), "{name}: {edges:?}");
+    }
+    for name in ["Caller.Multiple", "Menu.ShowPurchaseConfirmationPanel"] {
+        let edges = overloads(name);
+        assert_eq!(edges.len(), 1, "{name}: {edges:?}");
+        assert!(edges[0].contains("List<ItemDataRef>"), "{name}: {edges:?}");
+    }
+    assert!(overloads("Caller.Unknown").is_empty(), "unknown argument must not produce false CALLS edges");
+    let unresolved = count(
+        &conn,
+        "SELECT COUNT(*) FROM edge e JOIN node n ON n.id = e.source_id \
+         WHERE n.qualified_name = 'Example.Caller.Unknown' AND e.relation = 'CALLS' \
+         AND e.confidence = 'unresolved' AND e.unresolved_symbol = 'ShowPurchaseConfirmationPanel'",
+    );
+    assert_eq!(unresolved, 1, "unknown argument should retain overload candidates");
+    let numeric = target_sigs(&conn, "Caller.Numeric", "CALLS");
+    assert_eq!(numeric.len(), 1, "{numeric:?}");
+    assert!(numeric[0].1.contains("int value"), "{numeric:?}");
+    let arity = target_sigs(&conn, "Caller.ByArity", "CALLS");
+    assert_eq!(arity.len(), 1, "{arity:?}");
+    assert!(arity[0].1.contains("OneOrTwo(int value)"), "{arity:?}");
+    let named = target_sigs(&conn, "Caller.Named", "CALLS");
+    assert!(named.iter().all(|(_, s)| !s.contains("Ordered(")), "named argument order is not inferred yet: {named:?}");
+    let unresolved_named = count(
+        &conn,
+        "SELECT COUNT(*) FROM edge e JOIN node n ON n.id = e.source_id \
+         WHERE n.qualified_name = 'Example.Caller.Named' AND e.relation = 'CALLS' \
+         AND e.confidence = 'unresolved' AND e.unresolved_symbol = 'Ordered'",
+    );
+    assert_eq!(unresolved_named, 1);
+}
+
+#[test]
+fn csharp_interface_property_disambiguates_overloads_with_untyped_callbacks() {
+    let src = r#"using System;
+using System.Collections.Generic;
+namespace Example {
+    public class Cost { }
+    public interface IOffer { Cost UpgradeCost { get; } }
+    public interface IGenericOffer<T> { T UpgradeCost { get; } }
+    public class Modal {
+        public static Modal Instance { get; }
+        public void Confirm(string title, string detail, string label, Cost cost, Action yes, Action no = null) { }
+        public void Confirm(string title, string detail, string label, List<Cost> costs, Action yes, Action no = null) { }
+    }
+    public class Controller {
+        public void Open(IOffer offer) {
+            Modal.Instance.Confirm("Upgrade", "Details", "Buy", offer.UpgradeCost,
+                () => { }, () => { });
+        }
+        public void OpenUnknown(IOffer offer) {
+            Modal.Instance.Confirm("Upgrade", "Details", "Buy", default,
+                () => { }, () => { });
+        }
+        public void OpenNamed(IOffer offer) {
+            Modal.Instance.Confirm("Upgrade", "Details", "Buy",
+                yes: () => { }, cost: offer.UpgradeCost);
+        }
+        public void OpenGeneric(IGenericOffer<Cost> offer) {
+            Modal.Instance.Confirm("Upgrade", "Details", "Buy", offer.UpgradeCost,
+                () => { }, () => { });
+        }
+    }
+}"#;
+    let facts = codegraph_core::extract_file("Overloads.cs", codegraph_core::Language::CSharp, src);
+    let call = facts.refs.iter().find(|r| r.name == "Confirm" && r.line == 14).expect("typed property call");
+    assert_eq!(call.arg_count, Some(6));
+    assert_eq!(call.arg_types.len(), 6);
+    assert_eq!(call.arg_types[3].as_deref(), Some("@mt#IOffer#UpgradeCost"));
+    assert!(call.arg_types[4].is_none(), "callbacks are not statically typed by syntax");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("Overloads.cs"), src).unwrap();
+    let mut conn = codegraph_graph::open(&root).unwrap();
+    codegraph_graph::index_project(&root, &mut conn, codegraph_graph::IndexOptions::default()).unwrap();
+    let confirm = |method: &str| {
+        target_sigs(&conn, method, "CALLS").into_iter()
+            .filter(|(_, sig)| sig.starts_with("Confirm("))
+            .map(|(_, sig)| sig).collect::<Vec<_>>()
+    };
+    let exact = confirm("Controller.Open");
+    assert_eq!(exact.len(), 1, "{exact:?}");
+    assert!(exact[0].contains("Cost cost"), "{exact:?}");
+    assert!(!exact[0].contains("List<Cost>"), "{exact:?}");
+    for method in ["Controller.OpenUnknown", "Controller.OpenNamed", "Controller.OpenGeneric"] {
+        let links = confirm(method);
+        assert!(links.is_empty(), "unsafe argument type in {method}: {links:?}");
+    }
 }
 
 /// Side-by-side copies of one project (build artifacts, validation snapshots): `partial`

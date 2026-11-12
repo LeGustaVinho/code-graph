@@ -1,0 +1,51 @@
+{
+  "date": "2026-10-23",
+  "project": "warcodes-mobileapp",
+  "project_head": "2a1406b3f3b0aa27a60c1857d153fb346dd2f423",
+  "method": "Independent candidate CodeGraph agent versus frozen independently validated conventional baseline on identical seven read tasks",
+  "metric": "o200k_base tokens in tool-returned text, including fallback operations and candidate raw skill text; excludes hidden reasoning and API billing",
+  "quality": "complete equivalent answers across seven scenarios, manually reviewed; no files edited in source project",
+  "baseline": {
+    "source_report": "benchmarks/results/2026-10-23-warcodes-mobileapp-read-benchmark.json",
+    "log": "target/tmp/read_meter_plain_warcodes.jsonl",
+    "by_scenario": {"S1": 1011, "S2": 1522, "S3": 946, "S4": 884, "S5": 3418, "S6": 1307, "S7": 158},
+    "operations": 19,
+    "total_tokens": 9246
+  },
+  "codegraph": {
+    "log": "target/tmp/read_meter_cg_warcodes_multi.jsonl",
+    "by_scenario": {"S1": 136, "S2": 2229, "S3": 420, "S4": 1194, "S5": 420, "S6": 419, "S7": 283},
+    "operations": 19,
+    "reading_tokens": 5101,
+    "skill_tokens": 640,
+    "total_tokens": 5741,
+    "sum_operation_seconds": 6.419,
+    "nonzero_statuses": [
+      {"scenario": "S7", "code": 1, "reason": "search_source under Tests: directory exists, no indexed files"},
+      {"scenario": "S7", "code": 1, "reason": "rg --files -g *.cs Tests: no matching files"}
+    ]
+  },
+  "by_scenario_savings": {
+    "S1": 0.86548, "S2": -0.46452, "S3": 0.55603, "S4": -0.35068, "S5": 0.87712, "S6": 0.67942, "S7": -0.79114
+  },
+  "weighted_savings": 0.37908284663638325,
+  "arithmetic_mean_scenario_savings": 0.19595805581417242,
+  "target_weighted_10pct_met": true,
+  "target_mean_10pct_met": true,
+  "invalid_exploratory_run": {
+    "log": "target/tmp/read_meter_plain_warcodes_fixbase.jsonl",
+    "reason": "two unbounded rg --files outputs recorded ~388462 tokens while an external PowerShell filter hid most of the output from the worker; excluded in favor of the fully logged prior validated baseline",
+    "tokens": 403167
+  },
+  "general_fixes": [
+    "get_file_outline names=[...] selects multiple exact declarations and include_signatures=true returns their declarations",
+    "get_flow_evidence members=[...] selects several exact type members in one query",
+    "Shorter CodeGraph skill provides economical default tool selection without project-specific identifiers"
+  ],
+  "multi_language_validation": ["C#", "TypeScript", "Python", "Rust"],
+  "limitations": [
+    "One candidate run and one frozen conventional baseline; agent query strategies can vary",
+    "Not a measure of hidden model reasoning, tool-call argument tokens, or commercial API billing",
+    "Improvements are general-purpose but 37.9% observed savings is specific to these seven tasks"
+  ]
+}

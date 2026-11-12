@@ -1,0 +1,71 @@
+{
+  "date": "2026-10-23",
+  "scope_valid_for_cs_only": false,
+  "superseded_by": "2026-10-23-warcodes-csharp-only-corrected.json",
+  "project": "D:/Entidades/EmergentsWorlds/warcodes-mobileapp",
+  "project_git_head": "5080c8844e69c336f4671f652b274aaa0fa2cc2b",
+  "codegraph_git_head": "a42e9722114715afb8013072450f2738278b81b9",
+  "codegraph_binary_sha256": "076010B0A51A61F97E1150B49061BBC5A76A0E545991948B2A185B7F16E91AF2",
+  "tokenizer": "o200k_base",
+  "metric": "stdout+stderr text of logged code-reading operations; raw CodeGraph skill loaded once as S0",
+  "isolation": "two independently spawned workers, no cross-worker messages, identical scenario prompts; independent prime quality review excluded from readings",
+  "scenario_labels": {
+    "S1": "UserProfilePanel public and lifecycle API",
+    "S2": "BarcodeScannerWrapper camera permission and scanning lifecycle",
+    "S3": "WorldNavigationHelper routing and Unity prefab bindings",
+    "S4": "DisplayScriptResolver caching and failure behavior",
+    "S5": "IDisplayScriptResolver interface and direct implementers",
+    "S6": "Firebase package declarations and absence verification",
+    "S7": "DisplayScriptResolver references in test files"
+  },
+  "baseline": {
+    "tokens_by_scenario": {"S1": 1750, "S2": 5947, "S3": 7836, "S4": 1244, "S5": 411, "S6": 1228, "S7": 193},
+    "reading_tokens": 18609,
+    "operations": 40,
+    "completed": 33,
+    "no_matches": 5,
+    "nonzero_exit": 2,
+    "summed_operation_duration_ms": 922
+  },
+  "codegraph": {
+    "tokens_by_scenario": {"S1": 467, "S2": 7005, "S3": 2320, "S4": 2456, "S5": 789, "S6": 1286, "S7": 411},
+    "reading_tokens": 14734,
+    "skill_tokens": 640,
+    "total_tokens": 15374,
+    "operations": 64,
+    "completed": 56,
+    "no_matches": 2,
+    "nonzero_exit": 6,
+    "conventional_verification_operations": 19,
+    "summed_operation_duration_ms": 19161
+  },
+  "reading_only_weighted_savings": 0.2082325756354452,
+  "weighted_savings_including_skill": 0.17384061475630075,
+  "arithmetic_mean_scenario_savings": -0.2587972710911365,
+  "by_scenario_savings": {"S1": 0.7331, "S2": -0.1779, "S3": 0.7039, "S4": -0.9743, "S5": -0.9197, "S6": -0.0472, "S7": -1.1295},
+  "weighted_20pct_target_met": false,
+  "scenario_mean_20pct_target_met": false,
+  "quality_review": "Principal findings equivalent across S1-S7; S3 requires prefab/UnityEvent fallback and does not prove execution of every serialized binding. CodeGraph and baseline each performed supplemental searches. All factual conclusions independently reviewed against source.",
+  "recorded_codegraph_failures": [
+    "S1 get_file_skeleton used invalid path argument (requires file_path)",
+    "S3 and S4 get_flow_evidence used invalid symbol argument (requires symbol_id)",
+    "S5 unsupported get_implementations query",
+    "S6 Packages/manifest.json outside indexed source scope",
+    "S7 Tests outside indexed source scope"
+  ],
+  "recorded_baseline_failures": [
+    "S3 nonexistent Assets/Game/App/Scripts/UI/Routes.cs path",
+    "S7 nonexistent Assets/Game/Tests path"
+  ],
+  "limitations": [
+    "These are tool response tokens, not full model/session tokens or billable tokens",
+    "The skill was charged once; query startup/parameters and agent reasoning were excluded",
+    "One run per arm in one Unity/C# project, no statistical or cross-language generalization",
+    "Source working tree changed concurrently during the benchmark: Grasslands/Data assets appeared under Grasslands/Resources; no project files were changed intentionally by benchmark agents",
+    "Parser-level logger invocation failures in baseline were reported qualitatively but did not enter operations.jsonl",
+    "Aggregate durations are process execution only, not agent latency",
+    "Raw logs contain proprietary project excerpts and stay in gitignored target/tmp"
+  ],
+  "raw_logs": ["target/tmp/bench_20261023_holdout/baseline", "target/tmp/bench_20261023_holdout/cg"],
+  "comparator_output": "target/tmp/bench_20261023_holdout/comparison.json"
+}

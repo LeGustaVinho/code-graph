@@ -8,7 +8,9 @@ pub mod query;
 pub mod schema;
 pub mod store;
 
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
@@ -19,6 +21,40 @@ pub use store::{EdgeRow, Node};
 
 pub const DB_DIR: &str = ".codegraph";
 pub const DB_FILE: &str = "graph.db";
+
+/// Interprocess guard for schema migration and graph writes. Unlike a sentinel
+/// file, the operating system releases this lock if an indexer crashes.
+pub struct WriteLock {
+    _file: File,
+}
+
+pub fn lock_writer(root: &Path) -> Result<WriteLock> {
+    let dir = root.join(DB_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join("writer.lock");
+    // Never delete this file: a contender may already have opened its inode.
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .with_context(|| format!("opening writer lock {}", path.display()))?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(WriteLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!("timed out acquiring graph writer lock {}", path.display());
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("acquiring graph writer lock {}", path.display()));
+            }
+        }
+    }
+}
 
 pub fn db_path(root: &Path) -> PathBuf {
     root.join(DB_DIR).join(DB_FILE)

@@ -494,7 +494,7 @@ The test suite validates:
 - Incremental indexing correctness, cache hits, and cascading cache invalidations.
 - Strict token budget truncation compliance across all MCP tools.
 - Real-time freshness updates reflecting disk edits before tool responses.
-- MCP protocol JSON-RPC conformance and validation on all 28 tools.
+- MCP protocol JSON-RPC conformance and validation on all registered tools.
 - Architecture layer rule evaluation.
 
 ---

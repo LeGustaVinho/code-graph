@@ -516,6 +516,7 @@ impl<'a> Ctx<'a> {
             catch_types,
             detail,
             args: Vec::new(),
+            arg_types: Vec::new(),
         });
     }
 

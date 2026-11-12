@@ -489,13 +489,31 @@ impl<'a> FileResolver<'a> {
         if methods.is_empty() {
             return false;
         }
-        // Overload resolution by arity: keep only the overloads that accept this many arguments.
+        // Arity excludes impossible overloads, but does not establish which C# overload
+        // accepts a particular argument type (e.g. ItemDataRef vs List<ItemDataRef>).
         if methods.len() > 1 {
             if let Some(argc) = r.arg_count {
                 let fit: Vec<usize> = methods.iter().copied().filter(|m| accepts_args(&self.index.syms[*m].sym.params, argc)).collect();
                 if !fit.is_empty() {
                     methods = fit;
                 }
+            }
+        }
+        if self.lang == Language::CSharp && methods.len() > 1 {
+            // The C# extractor records statically known argument types. Resolve a member
+            // only when all arguments match a unique declared signature; otherwise keep
+            // the candidates without claiming that any one of them is an exact caller.
+            // This also applies to calls indexed before argument types were recorded.
+            if let Some(m) = self.csharp_exact_overload(r, &methods) {
+                methods = vec![m];
+            } else if methods.len() <= MAX_OVERLOAD_LINKS {
+                self.emit_unresolved_call(
+                    r,
+                    &r.name,
+                    format!("{} overloads of {} accept this arity; argument types insufficient to select one", methods.len(), r.name),
+                    &methods,
+                );
+                return true;
             }
         }
         if methods.len() > MAX_OVERLOAD_LINKS {
@@ -521,6 +539,104 @@ impl<'a> FileResolver<'a> {
             self.dispatch_virtual(r, &methods);
         }
         true
+    }
+
+    /// Select an overload only when known argument types identify one signature and
+    /// every unknown position has the same parameter type in all alternatives. Lambdas,
+    /// interpolations and expressions without an inferred type must not veto a known
+    /// discriminating argument, but must not be allowed to decide between signatures.
+    /// Named/ref/out/in arguments and generic substitutions remain unresolved.
+    fn csharp_exact_overload(&self, r: &Reference, methods: &[usize]) -> Option<usize> {
+        let argc = r.arg_count? as usize;
+        if argc == 0 || r.arg_types.len() != argc {
+            return None;
+        }
+        if r.arg_types.iter().any(|ty| ty.as_deref() == Some("@csharp:unsupported-argument-binding")) {
+            return None;
+        }
+        let arg_types: Vec<Option<String>> = r
+            .arg_types
+            .iter()
+            .map(|t| t.as_deref().and_then(|raw| self.csharp_argument_type(raw, r)).map(|ty| normalize_csharp_type(&ty)))
+            .collect();
+        // At least one positional argument must have a proved static type.
+        if !arg_types.iter().any(Option::is_some) {
+            return None;
+        }
+        // An unknown argument may be a lambda whose target type influences overload
+        // selection. Only ignore it if the parameter type is identical for every
+        // arity-compatible overload. Optional/defaulted parameters also affect choice.
+        let signatures: Vec<&codegraph_core::ParamInfo> = methods
+            .iter()
+            .map(|m| self.index.syms[*m].sym.params.as_ref())
+            .collect::<Option<_>>()?;
+        let first = *signatures.first()?;
+        if signatures.iter().any(|p| {
+            p.variadic || p.list.len() < argc || p.required != first.required || p.total != first.total
+        }) {
+            return None;
+        }
+        for (position, ty) in arg_types.iter().enumerate() {
+            if ty.is_none() {
+                let common = normalize_csharp_type(first.list[position].ty.as_deref()?);
+                if signatures.iter().skip(1).any(|p| {
+                    p.list[position].ty.as_deref().map(normalize_csharp_type).as_deref() != Some(common.as_str())
+                }) {
+                    return None;
+                }
+            }
+        }
+        let matches: Vec<usize> = methods
+            .iter()
+            .copied()
+            .filter(|m| {
+                let Some(params) = &self.index.syms[*m].sym.params else { return false };
+                params.list.iter().take(argc).zip(&arg_types).all(|(p, arg)| {
+                    arg.as_ref().is_none_or(|ty| {
+                        p.ty.as_deref().is_some_and(|target| normalize_csharp_type(target) == *ty)
+                    })
+                })
+            })
+            .collect();
+        if let [only] = matches.as_slice() { Some(*only) } else { None }
+    }
+
+    /// Resolve a deferred member marker while preserving its generic arguments. The
+    /// general `ref_type` resolves the owning symbol but intentionally strips generics.
+    fn csharp_argument_type(&self, raw: &str, r: &Reference) -> Option<String> {
+        let Some(rest) = raw.strip_prefix("@mt#") else { return Some(raw.to_string()) };
+        let (owner, member) = rest.rsplit_once('#')?;
+        // Awaited values can have a different type from their Task<T> declaration;
+        // until that conversion is modeled, do not select a candidate by this hint.
+        if member.contains('!') {
+            return None;
+        }
+        let t = if owner.is_empty() {
+            self.enclosing_type(&r.enclosing)?
+        } else {
+            match self.ref_type(owner, r, 0) {
+                TypeOf::Project(t, _, _) => t,
+                _ => return None,
+            }
+        };
+        let types: Vec<&str> = self
+            .index
+            .members_named(t, member)
+            .into_iter()
+            .filter_map(|m| self.index.syms[m].sym.type_ref.as_deref())
+            .collect();
+        if let [ty] = types.as_slice() {
+            // A declaration such as Box<T>.Value: T must not be mistaken for
+            // the concrete type of Box<Cost>.Value without type substitution.
+            let owner = &self.index.syms[t].sym.signature;
+            let generic_params = codegraph_core::extract::generic_args(owner);
+            if generic_params.iter().any(|p| p == ty) {
+                return None;
+            }
+            Some((*ty).to_string())
+        } else {
+            None
+        }
     }
 
     /// A call to a virtual member may run any override: link them (inferred), never ambiguity.
@@ -1440,6 +1556,35 @@ impl<'a> FileResolver<'a> {
 /// Overloads still matching a call (by arity) that are all linked; beyond this the call
 /// gets a single inferred link.
 const MAX_OVERLOAD_LINKS: usize = 8;
+
+/// Keep generic arguments and array ranks intact. `clean_type` intentionally erases
+/// them for symbol lookup, which would make `T` and `List<T>` indistinguishable here.
+fn normalize_csharp_type(raw: &str) -> String {
+    let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    let compact = compact.replace("global::", "");
+    // C# keyword aliases are exact synonyms for these framework types.
+    const ALIASES: &[(&str, &str)] = &[
+        ("System.Boolean", "bool"),
+        ("System.Byte", "byte"),
+        ("System.Char", "char"),
+        ("System.Decimal", "decimal"),
+        ("System.Double", "double"),
+        ("System.Int16", "short"),
+        ("System.Int32", "int"),
+        ("System.Int64", "long"),
+        ("System.Object", "object"),
+        ("System.SByte", "sbyte"),
+        ("System.Single", "float"),
+        ("System.String", "string"),
+        ("System.UInt16", "ushort"),
+        ("System.UInt32", "uint"),
+        ("System.UInt64", "ulong"),
+    ];
+    if let Some((_, keyword)) = ALIASES.iter().find(|(full, _)| compact == *full) {
+        return (*keyword).into();
+    }
+    compact
+}
 
 fn accepts_args(params: &Option<codegraph_core::ParamInfo>, argc: u32) -> bool {
     match params {

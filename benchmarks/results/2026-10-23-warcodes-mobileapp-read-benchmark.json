@@ -1,0 +1,40 @@
+{
+  "date": "2026-10-23",
+  "repository": "warcodes-mobileapp",
+  "repository_head": "2a1406b3f3b0aa27a60c1857d153fb346dd2f423",
+  "codegraph_head": "a42e9722114715afb8013072450f2738278b81b9",
+  "codegraph_binary_sha256": "CEBB3FA8A087AA205541B71009E34FE09D62C98A7A4B5378EE1E8BF09E90C5FD",
+  "tokenizer": "o200k_base",
+  "measurement": "recorded reading tool output text with separately counted raw skill instructions; not billed model tokens",
+  "isolation": "two independent subagents; no mutual messages or exchanged results",
+  "baseline": {
+    "by_scenario": {"S1": 1011, "S2": 1522, "S3": 946, "S4": 884, "S5": 3418, "S6": 1307, "S7": 158},
+    "reading_tokens": 9246,
+    "operations": 19,
+    "elapsed_operation_seconds": 7.4,
+    "nonzero_exit_codes": [{"scenario": "S7", "status": 1, "reason": "rg no matches"}]
+  },
+  "codegraph": {
+    "by_scenario": {"S1": 1331, "S2": 1851, "S3": 1119, "S4": 1621, "S5": 1599, "S6": 1022, "S7": 256},
+    "reading_tokens": 8799,
+    "skill_tokens": 830,
+    "total_with_skill": 9629,
+    "operations": 32,
+    "elapsed_operation_seconds": 54.98,
+    "nonzero_exit_codes": [{"scenario": "S7", "status": 1, "reason": "no indexed files under path Tests"}]
+  },
+  "savings_by_scenario": {"S1": -0.31652, "S2": -0.21616, "S3": -0.18288, "S4": -0.83371, "S5": 0.53218, "S6": 0.21806, "S7": -0.62025},
+  "weighted_savings_without_skill": 0.04835,
+  "weighted_savings_with_skill": -0.04142,
+  "arithmetic_mean_scenario_savings": -0.20275,
+  "weighted_target_20_percent_met": false,
+  "scenario_mean_target_20_percent_met": false,
+  "quality_review": "S1-S6 factually equivalent after extra queries; S7 CodeGraph scope not indexed, independent conventional verification sees no tests",
+  "measurement_limitations": [
+    "Output tokens are an o200k_base proxy, not model billing or hidden reasoning",
+    "CodeGraph setup calls outside the meter are excluded",
+    "One CodeGraph S2 reading output was counted although CP1252 UnicodeEncodeError prevented its full console delivery",
+    "One run per arm, one repository"
+  ],
+  "raw_logs": ["target/tmp/read_meter_plain_warcodes.jsonl", "target/tmp/read_meter_cg_warcodes.jsonl"]
+}

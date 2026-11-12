@@ -117,6 +117,7 @@ fn main() -> Result<()> {
         Cmd::Index { path, rebuild, json } => {
             init_logging("warn");
             let root = root_or_cwd(path)?;
+            let _write_lock = codegraph_graph::lock_writer(&root)?;
             let mut conn = codegraph_graph::open(&root)?;
             let progress = Progress::new();
             let show = !json && std::io::IsTerminal::is_terminal(&std::io::stderr());
@@ -193,6 +194,7 @@ fn main() -> Result<()> {
         Cmd::Status { path } => {
             init_logging("warn");
             let root = root_or_cwd(path)?;
+            let _write_lock = codegraph_graph::lock_writer(&root)?;
             let conn = codegraph_graph::open(&root)?;
             let stale = codegraph_graph::stale_files(&root, &conn, None)?;
             let g = codegraph_graph::query::stats(&conn)?;

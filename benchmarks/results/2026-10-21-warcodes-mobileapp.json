@@ -1,0 +1,100 @@
+{
+  "tokenizer": "o200k_base",
+  "measurement": "captured tool-output tokens + skill and verification logs",
+  "quality_gate": "REQUIRES_INDEPENDENT_REVIEW",
+  "baseline": {
+    "main": {
+      "1": 7190,
+      "2": 1985,
+      "3": 4999,
+      "4": 4067,
+      "5": 903,
+      "6": 959,
+      "7": 7019
+    },
+    "verify": {},
+    "skill": 0,
+    "files": {
+      "S1.log": 7190,
+      "S2.log": 1985,
+      "S3.log": 4999,
+      "S4.log": 4067,
+      "S5.log": 903,
+      "S6.log": 959,
+      "S7.log": 7019
+    },
+    "by_scenario": {
+      "1": 7190,
+      "2": 1985,
+      "3": 4999,
+      "4": 4067,
+      "5": 903,
+      "6": 959,
+      "7": 7019
+    },
+    "total": 27122,
+    "missing_scenarios": []
+  },
+  "candidate": {
+    "main": {
+      "1": 1515,
+      "2": 4156,
+      "3": 2888,
+      "4": 809,
+      "5": 1099,
+      "6": 600,
+      "7": 6807
+    },
+    "verify": {
+      "1": 3526,
+      "2": 172,
+      "3": 62,
+      "4": 1042,
+      "5": 2064,
+      "6": 183,
+      "7": 262
+    },
+    "skill": 1366,
+    "files": {
+      "S0.log": 1366,
+      "S1.log": 1515,
+      "S1.verify.log": 3526,
+      "S2.log": 4156,
+      "S2.verify.log": 172,
+      "S3.log": 2888,
+      "S3.verify.log": 62,
+      "S4.log": 809,
+      "S4.verify.log": 1042,
+      "S5.log": 1099,
+      "S5.verify.log": 2064,
+      "S6.log": 600,
+      "S6.verify.log": 183,
+      "S7.log": 6807,
+      "S7.verify.log": 262
+    },
+    "by_scenario": {
+      "1": 5041,
+      "2": 4328,
+      "3": 2950,
+      "4": 1851,
+      "5": 3163,
+      "6": 783,
+      "7": 7069
+    },
+    "total": 26551,
+    "missing_scenarios": []
+  },
+  "scenario_savings": {
+    "1": 0.2988873435326843,
+    "2": -1.180352644836272,
+    "3": 0.409881976395279,
+    "4": 0.544873371035161,
+    "5": -2.502768549280177,
+    "6": 0.1835245046923879,
+    "7": -0.007123521869212057
+  },
+  "weighted_savings": 0.021053019688813457,
+  "arithmetic_mean_scenario_savings": -0.3218682171900213,
+  "weighted_target_met": false,
+  "scenario_mean_target_met": false
+}

@@ -97,6 +97,40 @@ def main() -> None:
                 assert substring in output, f"{name}: {substring!r} missing in {output[:1600]!r}"
             print(f"PASS {name} ({len(output)} chars)")
 
+        # Text references/absence are language-independent, including source
+        # outside a declared symbol. A scoped query must never scan siblings.
+        for label, project, scope, needle in [
+            ("TypeScript", ts, "api/app.ts", "buildApp"),
+            ("Python", ts, "py/factory.py", "create_app"),
+            ("C#", base / "csharp", "Calls.cs", "class"),
+            ("Rust", base / "rust", "src/models.rs", "struct"),
+        ]:
+            found = query(project, "search_source", query=needle, path=scope, limit=5)
+            assert "matching line(s)" in found and "0 matching line(s)" not in found, (label, found)
+            absent = query(project, "search_source", query="absent_ident_927345_x", path=scope)
+            assert "0 matching line(s)" in absent and "1 indexed files scanned" in absent, (label, absent)
+            print(f"PASS {label} scoped source search")
+
+        for label, project, symbol, expected in [
+            ("TypeScript", ts, "BaseService.rate", "selected source excerpt"),
+            ("Python", ts, "create_app.load_user", "selected source excerpt"),
+            ("C#", base / "csharp", "Caller.Run", "selected source excerpt"),
+            ("Rust", base / "rust", "OrderService.checkout", "if order.items.is_empty"),
+        ]:
+            result = query(project, "get_flow_evidence", symbol_id=symbol, max_token_budget=900)
+            assert expected in result, f"{label}: {expected!r} missing from {result}"
+            print(f"PASS {label} flow evidence")
+
+        for label, project, filename, needle in [
+            ("TypeScript", ts, "api/app.ts", "actor"),
+            ("Python", ts, "py/factory.py", "load_user"),
+            ("C#", base / "csharp", "Calls.cs", "FindUser"),
+            ("Rust", base / "rust", "src/services.rs", "checkout"),
+        ]:
+            found = query(project, "get_file_outline", file_path=filename, filter=needle)
+            assert needle in found, f"{label}: filtered outline lost {needle}: {found}"
+            print(f"PASS {label} filtered outline")
+
         for name in ("rust", "csharp"):
             project = base / name
             output = query(project, "get_entrypoints", max_token_budget=400)

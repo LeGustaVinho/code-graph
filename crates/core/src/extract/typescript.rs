@@ -3248,6 +3248,7 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
                         catch_types: Vec::new(),
                         detail: Some("route registered through this helper".into()),
                         args: Vec::new(),
+                        arg_types: Vec::new(),
                     });
                 }
             }

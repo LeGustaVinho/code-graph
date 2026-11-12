@@ -75,6 +75,18 @@ pub fn find_nodes(conn: &Connection, query: &str, limit: usize) -> Result<Vec<No
                     return Ok(vec![h]);
                 }
             }
+        } else if !f.ends_with(':') && !l.is_empty() && f.contains('.') {
+            // file:name → that name (or `outer.name`) declared in the file.
+            if let Some(file) = resolve_file(conn, f)?.first() {
+                let mut st = conn.prepare(&format!(
+                    "SELECT {NODE_COLS} FROM node WHERE file_path = ?1 AND derived = 0 AND kind NOT IN ('module', 'literal') \
+                     AND (name = ?2 OR qualified_name = ?2 OR qualified_name LIKE '%.' || ?2) ORDER BY length(qualified_name), start_line, id LIMIT ?3"
+                ))?;
+                let rows: Vec<Node> = st.query_map(params![file, l, limit as i64], node_from_row)?.flatten().collect();
+                if !rows.is_empty() {
+                    return Ok(rows);
+                }
+            }
         }
     }
     let mut out: Vec<Node> = Vec::new();

@@ -1,4 +1,4 @@
-//! MCP tool tests: token budgets, freshness, protocol conformance and a smoke run of all 28 tools.
+//! MCP tool tests: token budgets, freshness, protocol conformance and a smoke run of all registered tools.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -35,6 +35,189 @@ fn ok(engine: &Engine, tool: &str, args: Value) -> String {
     let (text, is_error) = call_tool(engine, tool, args.clone());
     assert!(!is_error, "{tool} {args} failed: {text}");
     text
+}
+
+#[test]
+fn flow_evidence_preserves_guards_and_calls_across_languages() {
+    let (_tmp, e) = engine();
+    for (symbol, must_include) in [
+        ("OrderService.PlaceOrderAsync", vec!["if (order.Items.Count", "foreach (var item", "SaveChangesAsync", "item.Quantity = 1", "return order"]),
+        ("ItemService.get", vec!["if item_id in CACHE", "self._load(item_id)", "CACHE[item_id] = item", "raise ItemNotFound", "return item"]),
+        ("AuthStore.login", vec!["this.user = user", "hash(user", "return currentToken"]),
+    ] {
+        let condensed = ok(&e, "get_flow_evidence", json!({"symbol_id": symbol}));
+        for phrase in must_include {
+            assert!(condensed.contains(phrase), "{symbol} missed {phrase}: {condensed}");
+        }
+        assert!(condensed.contains("selected source excerpt, not exhaustive"), "{condensed}");
+    }
+    let grouped = ok(&e, "get_flow_evidence", json!({"symbol_id": "OrderService", "filter": "CancelOrderAsync"}));
+    assert!(grouped.contains("CancelOrderAsync") && grouped.contains("if (order == null)"), "{grouped}");
+    assert!(!grouped.contains("PlaceOrderAsync"), "{grouped}");
+}
+
+#[test]
+fn flow_evidence_preserves_rust_guards_and_calls() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("rust");
+    copy_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/edge-cases/rust"), &root);
+    let e = Engine::open(&root).unwrap();
+    let body = ok(&e, "get_flow_evidence", json!({"symbol_id": "OrderService.checkout"}));
+    assert!(body.contains("if order.items.is_empty()"), "{body}");
+    assert!(body.contains("self.repo.find(id)"), "{body}");
+    assert!(body.contains("round_cents(total)"), "{body}");
+}
+
+#[test]
+fn overload_families_are_navigable_without_multiple_id_round_trips() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("csharp");
+    copy_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/edge-cases/csharp"), &root);
+    let e = Engine::open(&root).unwrap();
+    let flow = ok(&e, "get_flow_evidence", json!({"symbol_id": "Params.Write", "max_lines": 12}));
+    assert!(flow.contains("2 overloads") && flow.contains("Write(string format)"), "{flow}");
+    assert!(flow.contains("Write(string format, params object[] args)"), "{flow}");
+    let callers = ok(&e, "get_call_hierarchy", json!({"symbol_id": "Params.Write", "direction": "callers", "depth": 1}));
+    assert!(callers.contains("2 overloads") && callers.contains("Write"), "{callers}");
+}
+
+#[test]
+fn file_outline_filter_keeps_ancestors_without_unrelated_members() {
+    let (_tmp, e) = engine();
+    let outline = ok(&e, "get_file_outline", json!({
+        "file_path": "backend-dotnet/Services/OrderService.cs", "filter": "CancelOrderAsync"
+    }));
+    assert!(outline.contains("class OrderService") && outline.contains("CancelOrderAsync"), "{outline}");
+    assert!(!outline.contains("PlaceOrderAsync") && !outline.contains("ListOrdersAsync"), "{outline}");
+    let none = ok(&e, "get_file_outline", json!({
+        "file_path": "backend-dotnet/Services/OrderService.cs", "filter": "does_not_exist_13529"
+    }));
+    assert!(none.contains("no indexed declarations matching"), "{none}");
+}
+
+#[test]
+fn source_search_covers_supported_languages_scopes_and_absence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    for (relative, source) in [
+        ("csharp/Service.cs", "class TokenTarget {}\n// TokenTarget\n"),
+        ("typescript/api.ts", "export const TokenTarget = 1;\n"),
+        ("javascript/api.js", "const TokenTarget = 3;\n"),
+        ("python/service.py", "TokenTarget = 2\n"),
+        ("rust/lib.rs", "pub struct TokenTarget;\n"),
+    ] {
+        let file = root.join(relative);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, source).unwrap();
+    }
+    let e = Engine::open(&root).unwrap();
+    let all = ok(&e, "search_source", json!({ "query": "TokenTarget", "whole_word": true }));
+    for language in ["csharp", "typescript", "javascript", "python", "rust"] {
+        assert!(all.contains(language), "missing {language} match: {all}");
+    }
+    assert!(all.contains("6 matching line(s)"), "{all}");
+
+    let scoped = ok(&e, "search_source", json!({ "query": "TokenTarget", "path": "python" }));
+    assert!(scoped.contains("1 matching line(s)"), "{scoped}");
+    assert!(scoped.contains("python/service.py:1"), "{scoped}");
+    assert!(!scoped.contains("csharp/"), "{scoped}");
+    let absent = ok(&e, "search_source", json!({ "query": "TokenTargetExtra", "path": "csharp" }));
+    assert!(absent.contains("0 matching line(s)"), "{absent}");
+
+    let partial = ok(&e, "search_source", json!({ "query": "tokentarget", "case_sensitive": false, "limit": 1 }));
+    assert!(partial.contains("6 matching line(s)"), "{partial}");
+    assert!(partial.contains("[MORE: showing 1 of 6 results"), "{partial}");
+
+    let (missing, failed) = call_tool(&e, "search_source", json!({ "query": "TokenTarget", "path": "unknown" }));
+    assert!(failed && missing.contains("does not exist relative to the project root"), "{missing}");
+}
+
+#[test]
+fn source_search_distinguishes_unindexed_directories_from_verified_indexed_absence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(root.join("Tests")).unwrap();
+    std::fs::create_dir_all(root.join("Assets/Tests")).unwrap();
+    std::fs::write(root.join(".codegraphignore"), "/Tests/\n").unwrap();
+    std::fs::write(root.join("Tests/Ignored.cs"), "class HiddenToken {}\n").unwrap();
+    std::fs::write(root.join("Assets/Tests/Included.cs"), "class VisibleToken {}\n").unwrap();
+    std::fs::write(root.join("README.md"), "HiddenToken\n").unwrap();
+    let e = Engine::open(&root).unwrap();
+
+    // An actual directory with ignored files has not been searched: a zero-match
+    // reply would falsely imply that HiddenToken is absent from the directory.
+    let (ignored, failed) = call_tool(&e, "search_source", json!({ "query": "HiddenToken", "path": "Tests" }));
+    assert!(failed && ignored.contains("exists but has no indexed source files"), "{ignored}");
+    assert!(ignored.contains("absence cannot be established"), "{ignored}");
+    assert!(ignored.contains("Assets/Tests"), "indexed nested path suggestion missing: {ignored}");
+
+    let (unsupported, failed) = call_tool(&e, "search_source", json!({ "query": "HiddenToken", "path": "README.md" }));
+    assert!(failed && unsupported.contains("exists but has no indexed source files"), "{unsupported}");
+    let indexed = ok(&e, "search_source", json!({ "query": "VisibleToken", "path": "Assets/Tests" }));
+    assert!(indexed.contains("Assets/Tests/Included.cs:1"), "{indexed}");
+    let normalized = ok(&e, "search_source", json!({ "query": "VisibleToken", "path": ".\\Assets//Tests\\" }));
+    assert!(normalized.contains("Assets/Tests/Included.cs:1"), "{normalized}");
+    if cfg!(windows) {
+        let folded = ok(&e, "search_source", json!({ "query": "VisibleToken", "path": "assets/tests" }));
+        assert!(folded.contains("Assets/Tests/Included.cs:1"), "{folded}");
+    }
+
+    let absent = ok(&e, "search_source", json!({ "query": "HiddenToken", "path": "Assets/Tests" }));
+    assert!(absent.contains("0 matching line(s) in indexed source"), "{absent}");
+    assert!(absent.contains("absence outside the index is unverified"), "{absent}");
+    let root_absent = ok(&e, "search_source", json!({ "query": "HiddenToken" }));
+    assert!(root_absent.contains("0 matching line(s) in indexed source"), "{root_absent}");
+    assert!(root_absent.contains("ignored, unsupported and oversized files were not checked"), "{root_absent}");
+}
+
+#[test]
+fn source_search_empty_test_tree_is_valid_zero_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("Tests/Firestore")).unwrap();
+    std::fs::write(root.join(".codegraphignore"), "/Tests/\n").unwrap();
+    std::fs::write(root.join("Tests/Firestore/notes.md"), "HiddenToken").unwrap();
+    std::fs::write(root.join("Assets.cs"), "class VisibleToken {}").unwrap();
+    let e = Engine::open(root).unwrap();
+
+    let result = ok(&e, "search_source", json!({"query":"HiddenToken","path":"Tests"}));
+    assert!(result.contains("0 matching line(s)"), "{result}");
+    assert!(result.contains("verified empty source scope"), "{result}");
+    assert!(result.contains("0 indexed files scanned"), "{result}");
+
+    // A file that the index would support must not silently become a
+    // verified zero just because the project excluded it from indexing.
+    std::fs::write(root.join("Tests/Firestore/Hidden.cs"), "class HiddenToken {}").unwrap();
+    let (message, failed) = call_tool(&e, "search_source", json!({"query":"HiddenToken","path":"Tests"}));
+    assert!(failed && message.contains("no indexed source files"), "{message}");
+    assert!(message.contains("absence cannot be established"), "{message}");
+}
+
+#[test]
+fn universal_search_exact_restricts_matches_to_case_sensitive_declaration_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("Panels.cs"), "public interface IPanelDataHandler { void BindPanelData(); }\npublic class PanelDataHandler : IPanelDataHandler { public void BindPanelData() {} public void BindPanelDataExtra() {} }\n").unwrap();
+    let e = Engine::open(&root).unwrap();
+
+    let fuzzy = ok(&e, "search_universal", json!({ "query": "PanelDataHandler" }));
+    assert!(fuzzy.contains("IPanelDataHandler"), "fuzzy default should still include substring hits: {fuzzy}");
+
+    let exact = ok(&e, "search_universal", json!({ "query": "PanelDataHandler", "exact": true }));
+    assert!(exact.contains("exact declaration match(es)"), "{exact}");
+    assert!(exact.contains("class PanelDataHandler"), "{exact}");
+    assert!(!exact.contains("interface IPanelDataHandler"), "{exact}");
+
+    let member = ok(&e, "search_universal", json!({ "query": "PanelDataHandler.BindPanelData", "exact": true, "kind": "method" }));
+    assert!(member.contains("1 exact declaration match(es)"), "{member}");
+    assert!(!member.contains("IPanelDataHandler.BindPanelData"), "{member}");
+    assert!(!member.contains("BindPanelDataExtra"), "{member}");
+    let wrong_kind = ok(&e, "search_universal", json!({ "query": "PanelDataHandler.BindPanelData", "exact": true, "kind": "class" }));
+    assert!(wrong_kind.contains("0 exact declaration match(es)"), "{wrong_kind}");
+
+    let case = ok(&e, "search_universal", json!({ "query": "paneldatahandler.bindpaneldata", "exact": true }));
+    assert!(case.contains("0 exact declaration match(es)"), "{case}");
 }
 
 #[test]
@@ -90,7 +273,7 @@ fn mcp_protocol_messages() {
     assert!(server::handle(&e, &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).is_none());
     let list = server::handle(&e, &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })).unwrap();
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 28);
+    assert_eq!(tools.len(), 30);
     for t in tools {
         assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
         assert!(t["description"].as_str().unwrap().len() > 20);
@@ -172,7 +355,7 @@ fn all_28_tools_answer() {
     } else {
         eprintln!("git unavailable: skipping get_structural_diff / get_changed_subgraph");
     }
-    assert_eq!(codegraph_mcp::registry().len(), 28);
+    assert_eq!(codegraph_mcp::registry().len(), 30);
 }
 
 #[test]
@@ -249,6 +432,51 @@ fn skeleton_respects_esm_exports_and_other_languages() {
     assert!(script.contains("runtimeEntry"), "{script}");
     let python = ok(&e, "get_file_skeleton", json!({ "file_path": "src/service.py" }));
     assert!(python.contains("class Worker") && python.contains("run("), "{python}");
+}
+
+#[test]
+fn skeleton_reports_hidden_private_members_and_can_include_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("Actor.cs"),
+        "public class Actor {\n\
+             public void Activate() {}\n\
+             void Start() {}\n\
+             private void OnDestroy() {}\n\
+             protected void OnEnable() {}\n\
+             private class State { public void Reset() {} }\n\
+         }\n").unwrap();
+    std::fs::write(root.join("module.py"), "def _hidden():\n    return 1\n").unwrap();
+    std::fs::write(root.join("api.ts"),
+        "class Unexported { show() {} }\n\
+         export class Exported { public show() {} private secret() {} }\n").unwrap();
+    let e = Engine::open(&root).unwrap();
+
+    let public = ok(&e, "get_file_skeleton", json!({ "file_path": "Actor.cs" }));
+    assert!(public.contains("class Actor") && public.contains("Activate()") && public.contains("OnEnable()"), "{public}");
+    assert!(!public.contains("Start()") && !public.contains("OnDestroy()") && !public.contains("class State"), "{public}");
+    assert!(public.contains("private declaration(s) omitted") && public.contains("include_private=true"), "{public}");
+    let complete = ok(&e, "get_file_skeleton", json!({ "file_path": "Actor.cs", "include_private": true }));
+    for expected in ["Start(): void", "OnDestroy(): void", "class State", "Reset(): void"] {
+        assert!(complete.contains(expected), "missing {expected}: {complete}");
+    }
+    assert!(complete.contains("[private]") && !complete.contains("private declaration(s) omitted"), "{complete}");
+
+    let hidden_only = ok(&e, "get_file_skeleton", json!({ "file_path": "module.py" }));
+    assert!(hidden_only.contains("private declaration(s) omitted") && hidden_only.contains("(no declarations in selected scope)"), "{hidden_only}");
+    assert!(!hidden_only.contains("def _hidden"), "{hidden_only}");
+    let python_full = ok(&e, "get_file_skeleton", json!({ "file_path": "module.py", "include_private": true }));
+    assert!(python_full.contains("_hidden(") && python_full.contains("[private]"), "{python_full}");
+
+    let esm = ok(&e, "get_file_skeleton", json!({ "file_path": "api.ts", "include_private": true }));
+    assert!(esm.contains("Exported") && esm.contains("secret()") && esm.contains("[private]"), "{esm}");
+    assert!(!esm.contains("Unexported"), "{esm}");
+    assert!(esm.contains("non-exported ES module declaration(s) omitted"), "{esm}");
+
+    let limited = ok(&e, "get_file_skeleton", json!({ "file_path": "Actor.cs", "max_token_budget": 125 }));
+    assert!(estimate_tokens(&limited) <= 125, "{limited}");
+    assert!(limited.contains("private declaration(s) omitted"), "{limited}");
 }
 
 #[test]
