@@ -9,7 +9,7 @@ Start from a known path or symbol. Use `path:Name` in `symbol_id`. Try `max_toke
 
 - Orient with `get_project_overview` or `get_entrypoints`. Find indexed paths by literal name or suffix with `find_files(query,path?)`.
 - Locate declarations with `search_universal(query,exact:true,kind?)`. Omit `exact` for fuzzy search.
-- Find text and comments with `search_source(query,path?,whole_word?)`. Both searches support `group_by_file:true`.
+- Find text and comments with `search_source(query,path?,whole_word?)`, or `queries:[...]` for one scope. Both searches support `group_by_file:true`.
 - Read APIs with `get_file_skeleton` (`include_private:true` for private members) or `get_file_outline` (`include_signatures:true`). Read selected statements with `get_flow_evidence`. Outline `names` and flow `members` match exactly. Use `filter` instead for substrings.
 - Verify omitted logic with `get_symbol_body(symbol_id)`. Ranges require `start_line` and `end_line` (1-based inclusive, within the symbol). Use `file_path` with both bounds to cross declarations.
 - Navigate with `get_call_hierarchy` (`direction`, `show_sites:true`), `get_type_contract`, `get_type_hierarchy` and `get_tests_for_symbol`. Disambiguate overloads by signature, `sym_...` ID or `Name/<arity>` where supported. Exact edges can still be overload-ambiguous.

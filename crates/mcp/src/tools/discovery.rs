@@ -103,15 +103,17 @@ pub fn search_universal(ctx: &Ctx, p: SearchParams) -> ToolResult {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SourceSearchParams {
-    /// Exact text to find (not a regex).
-    pub query: String,
+    /// Exact text to find (not a regex). Provide either query or queries.
+    pub query: Option<String>,
+    /// Search 1–8 texts in one pass over the same source scope. Compact output only.
+    pub queries: Option<Vec<String>>,
     /// Optional root-relative file or directory; excludes every other path.
     pub path: Option<String>,
     /// Match only whole identifiers/words (default false).
     pub whole_word: Option<bool>,
     /// Case-sensitive comparison (default true).
     pub case_sensitive: Option<bool>,
-    /// Maximum matching lines to include (default 30, max 200).
+    /// Maximum matching lines per query (default 30, max 200).
     pub limit: Option<usize>,
     /// Indent subsequent matching lines in the same file and reuse the first path. Text output only.
     pub group_by_file: Option<bool>,
@@ -273,10 +275,35 @@ fn scope_has_no_source_files(root: &Path, dir: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
+struct SourceMatches<'a> {
+    needle: &'a str,
+    search_needle: Cow<'a, str>,
+    matched: usize,
+    items: Vec<String>,
+    shown_in_file: bool,
+}
+
 pub fn search_source(ctx: &Ctx, p: SourceSearchParams) -> ToolResult {
-    let needle = p.query.trim();
-    if needle.is_empty() {
-        return Err(super::ToolError::BadArgs("query must not be empty".into()));
+    let multi = p.queries.is_some();
+    let needles = match (&p.query, &p.queries) {
+        (Some(query), None) => std::slice::from_ref(query),
+        (None, Some(queries)) if (1..=8).contains(&queries.len()) => queries.as_slice(),
+        (None, Some(_)) => return Err(super::ToolError::BadArgs("queries must contain 1–8 search texts".into())),
+        _ => return Err(super::ToolError::BadArgs("provide exactly one of query or queries".into())),
+    };
+    let case_sensitive = p.case_sensitive.unwrap_or(true);
+    let mut terms = Vec::with_capacity(needles.len());
+    for (i, needle) in needles.iter().enumerate() {
+        let needle = needle.trim();
+        if needle.is_empty() {
+            let label = if multi { format!("queries[{}]", i) } else { "query".to_owned() };
+            return Err(super::ToolError::BadArgs(format!("{label} must not be empty")));
+        }
+        terms.push(SourceMatches { needle, search_needle: search_text(needle, case_sensitive), matched: 0, items: Vec::new(), shown_in_file: false });
+    }
+    let json = wants_json(&p.format);
+    if multi && json {
+        return Err(super::ToolError::BadArgs("format=json requires a single query; queries supports compact output".into()));
     }
     let scope = normalize_scope(p.path.as_deref().unwrap_or(""))?;
     let scope = scope.as_str();
@@ -289,12 +316,8 @@ pub fn search_source(ctx: &Ctx, p: SourceSearchParams) -> ToolResult {
     let mut unindexed = 0usize;
     let mut unreadable = 0usize;
     let mut lossy_decoded = 0usize;
-    let mut matched = 0usize;
     let limit = p.limit.unwrap_or(30).clamp(1, 200);
-    let case_sensitive = p.case_sensitive.unwrap_or(true);
-    let search_needle = search_text(needle, case_sensitive);
     let whole_word = p.whole_word.unwrap_or(false);
-    let json = wants_json(&p.format);
     let group_by_file = p.group_by_file.unwrap_or_default();
     let mut out = Out::new();
     for (file, status) in indexed.collect::<Result<Vec<_>, _>>()? {
@@ -320,26 +343,33 @@ pub fn search_source(ctx: &Ctx, p: SourceSearchParams) -> ToolResult {
         if matches!(content, Cow::Owned(_)) {
             lossy_decoded += 1;
         }
-        let mut shown_in_file = false;
+        for term in &mut terms {
+            term.shown_in_file = false;
+        }
         for (i, line) in content.lines().enumerate() {
-            let Some(found) = first_text_match(&search_text(line, case_sensitive), &search_needle, whole_word) else { continue };
-            matched += 1;
-            if matched <= limit {
-                if json {
-                    out.item(json!({
+            let haystack = search_text(line, case_sensitive);
+            for term in &mut terms {
+                let Some(found) = first_text_match(&haystack, &term.search_needle, whole_word) else { continue };
+                term.matched += 1;
+                if term.matched > limit {
+                    continue;
+                }
+                let item = if json {
+                    json!({
                         "file": file,
                         "line": i + 1,
                         "text": line.trim(),
-                    }).to_string());
+                    }).to_string()
                 } else {
                     let excerpt = source_excerpt(line, found, case_sensitive);
-                    if group_by_file && shown_in_file {
-                        out.item(format!("  :{} | {excerpt}", i + 1));
+                    if group_by_file && term.shown_in_file {
+                        format!("  :{} | {excerpt}", i + 1)
                     } else {
-                        out.item(format!("{file}:{} | {excerpt}", i + 1));
+                        format!("{file}:{} | {excerpt}", i + 1)
                     }
-                    shown_in_file = true;
-                }
+                };
+                term.items.push(item);
+                term.shown_in_file = true;
             }
         }
     }
@@ -351,9 +381,14 @@ pub fn search_source(ctx: &Ctx, p: SourceSearchParams) -> ToolResult {
         if exists && unindexed == 0
             && scope_has_no_source_files(&ctx.engine.root, &ctx.engine.root.join(scope)).unwrap_or(false)
         {
-            out.h(format!(
-                "0 matching line(s) for '{needle}' under {scope}: no supported source files exist in this directory or its subdirectories (0 indexed files scanned)."
-            ));
+            if multi {
+                out.h(format!("All {} queries have 0 matching lines under {scope} (0 indexed files scanned).", terms.len()));
+            } else {
+                let needle = terms[0].needle;
+                out.h(format!(
+                    "0 matching line(s) for '{needle}' under {scope}: no supported source files exist in this directory or its subdirectories (0 indexed files scanned)."
+                ));
+            }
             out.h("This is a verified empty source scope; unsupported file formats were not searched.");
             return Ok(out);
         }
@@ -369,12 +404,41 @@ pub fn search_source(ctx: &Ctx, p: SourceSearchParams) -> ToolResult {
         return Err(super::ToolError::NotFound(message));
     }
     let label = if scope.is_empty() { "." } else { scope };
-    out.h(format!("{matched} matching line(s) in indexed source for '{needle}' under {label} ({files} indexed files scanned, {unreadable} unreadable, {lossy_decoded} lossy UTF-8, {unindexed} stale/error files excluded)"));
+    let coverage = format!("{files} indexed files scanned, {unreadable} unreadable, {lossy_decoded} lossy UTF-8, {unindexed} stale/error files excluded");
+    if multi {
+        out.h(format!("{} source queries under {label} ({coverage})", terms.len()));
+        render_source_queries(&mut out, terms, limit);
+        return Ok(out);
+    }
+    let term = terms.pop().unwrap();
+    let SourceMatches { needle, matched, items, .. } = term;
+    out.h(format!("{matched} matching line(s) in indexed source for '{needle}' under {label} ({coverage})"));
     if matched == 0 {
         out.h("No matches in the indexed, readable source files searched; ignored, unsupported and oversized files were not checked, so absence outside the index is unverified.");
     }
+    out.items = items;
     out.unshown = matched.saturating_sub(limit);
     Ok(out)
+}
+
+fn render_source_queries(out: &mut Out, terms: Vec<SourceMatches<'_>>, limit: usize) {
+    let counts = terms.iter().map(|t| t.matched.to_string()).collect::<Vec<_>>().join(", ");
+    let over_limit: usize = terms.iter().map(|t| t.matched.saturating_sub(limit)).sum();
+    let omissions = if over_limit > 0 { format!(" {over_limit} hit(s) over the per-query limit.") } else { String::new() };
+    out.h(format!("Matching lines by query order: [{counts}]. Limit {limit} per query.{omissions} Counts cover indexed, readable source only."));
+    for (i, term) in terms.into_iter().enumerate() {
+        let label = codegraph_core::extract::truncate(term.needle, 80);
+        let heading = format!("{}. {label:?}", i + 1);
+        let mut hits = term.items.into_iter();
+        if let Some(hit) = hits.next() {
+            // The first location shares its item with the label, so a token cut
+            // cannot leave an empty section or an orphaned relative coordinate.
+            out.item(format!("{heading}\n{hit}"));
+            out.items.extend(hits);
+        } else {
+            out.item(format!("{heading} (0 matches)"));
+        }
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
