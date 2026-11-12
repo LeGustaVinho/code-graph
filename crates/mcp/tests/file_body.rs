@@ -40,8 +40,20 @@ fn file_body_validates_selection_index_coverage_and_live_file_size() {
     let entry = root.join("entry.ts");
     std::fs::write(&entry, "export const value = 1;\n").unwrap();
     std::fs::write(root.join("notes.txt"), "unindexed\n").unwrap();
+    std::fs::write(root.join(".env"), "PRIVATE_VALUE=do-not-return\n").unwrap();
+    std::fs::write(root.join("appsettings.json"), r#"{"PrivateValue":"do-not-return"}"#).unwrap();
     let engine = Engine::open(root).unwrap();
+    let configs: i64 = engine
+        .reader()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM file_meta WHERE status = 'indexed' AND language = 'config'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(configs, 2);
 
+    for file in [".env", "appsettings.json"] {
+        let (text, error) = call_tool(&engine, "get_symbol_body", json!({ "file_path": file, "start_line": 1, "end_line": 1 }));
+        assert!(error && text.contains("use get_config_matrix") && !text.contains("do-not-return"), "{text}");
+    }
     for (args, message) in [
         (json!({ "file_path": "entry.ts", "start_line": 0, "end_line": 1 }), "ordered and positive"),
         (json!({ "file_path": "entry.ts", "start_line": 2, "end_line": 1 }), "ordered and positive"),
@@ -68,7 +80,7 @@ fn file_body_validates_selection_index_coverage_and_live_file_size() {
 
 #[cfg(unix)]
 #[test]
-fn file_body_rejects_indexed_paths_replaced_by_outside_symlinks() {
+fn file_body_rejects_indexed_paths_replaced_by_outside_or_config_symlinks() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
     std::fs::create_dir(&root).unwrap();
@@ -86,5 +98,13 @@ fn file_body_rejects_indexed_paths_replaced_by_outside_symlinks() {
     std::os::unix::fs::symlink(&outside, &entry).unwrap();
     let (text, error) = call_tool(&engine, "get_symbol_body", json!({ "file_path": "entry.ts", "start_line": 1, "end_line": 1 }));
     assert!(error && text.contains("resolves outside the project root"), "{text}");
+    assert_eq!(hash(), before);
+
+    let config = root.join(".env");
+    std::fs::write(&config, "PRIVATE_VALUE=do-not-return\n").unwrap();
+    std::fs::remove_file(&entry).unwrap();
+    std::os::unix::fs::symlink(&config, &entry).unwrap();
+    let (text, error) = call_tool(&engine, "get_symbol_body", json!({ "file_path": "entry.ts", "start_line": 1, "end_line": 1 }));
+    assert!(error && text.contains("use get_config_matrix") && !text.contains("do-not-return"), "{text}");
     assert_eq!(hash(), before);
 }

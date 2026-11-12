@@ -418,6 +418,9 @@ fn read_file_excerpt(root: &Path, file: &str) -> Result<String, ToolError> {
     if !path.starts_with(&root) {
         return Err(ToolError::BadArgs(format!("file '{file}' resolves outside the project root")));
     }
+    if [Path::new(file), path.as_path()].into_iter().any(|p| Language::from_path(p) == Some(Language::Config)) {
+        return Err(ToolError::BadArgs("configuration files are unavailable as raw source; use get_config_matrix".into()));
+    }
     let metadata = path.metadata().map_err(reading)?;
     if !metadata.is_file() {
         return Err(ToolError::BadArgs(format!("'{file}' is not a regular file")));
