@@ -184,7 +184,7 @@ pub fn registry() -> Vec<ToolDef> {
         tool!("get_data_model", "Fields, types, primary/foreign keys and relationships (1:N, N:1, N:N) of a data model (EF Core, Prisma, TypeORM, SQLAlchemy, Django, diesel, SeaORM...). Omit model_name to list all.", data::ModelParams, data::get_data_model),
         tool!("get_config_matrix", "Every environment variable / configuration key read by the code, where it is defined, defaults, and missing definitions.", data::ConfigParams, data::get_config_matrix),
         tool!("get_type_contract", "Public contract of a type: base types and member signatures without implementations.", data::ContractParams, data::get_type_contract),
-        tool!("get_symbol_body", "Exact source of one symbol with preserved line numbers (optionally without comments, capped by max_lines).", data::BodyParams, data::get_symbol_body),
+        tool!("get_symbol_body", "Numbered source for a symbol or an indexed file range. Use file_path with start_line and end_line to read across declarations.", data::BodyParams, data::get_symbol_body),
         tool!("get_flow_evidence", "Selected control, assignment and call statements with source line numbers. For a type, members=[name,...] selects exact member names in one call; filter is an alternative substring selector. Excerpt is incomplete; inspect omitted logic as needed.", data::FlowEvidenceParams, data::get_flow_evidence),
         tool!("get_file_outline", "Dense hierarchical file outline with line ranges and capabilities. names=[name,...] selects exact declarations (ancestors retained); include_signatures=true adds signatures. filter is a substring alternative.", data::OutlineParams, data::get_file_outline),
         // 5.6 Governance, tests & git
@@ -234,11 +234,16 @@ pub fn run_tool(ctx: &Ctx, name: &str, args: Value) -> Result<String, ToolError>
 
 /// Entry point used by the MCP server: freshness check, then run. Returns (text, is_error).
 pub fn call_tool(engine: &Engine, name: &str, args: Value) -> (String, bool) {
-    if let Ok(c) = engine.reader() {
-        let hints = hint_files(&c, &args);
-        drop(c);
-        if let Err(e) = engine.ensure_fresh(&hints) {
-            tracing::warn!("freshness check failed: {e:#}");
+    // A file excerpt reads live bytes after checking its path. It does not need
+    // symbol reindexing before that check.
+    let reads_file = name == "get_symbol_body" && args.get("file_path").is_some_and(Value::is_string);
+    if !reads_file {
+        if let Ok(c) = engine.reader() {
+            let hints = hint_files(&c, &args);
+            drop(c);
+            if let Err(e) = engine.ensure_fresh(&hints) {
+                tracing::warn!("freshness check failed: {e:#}");
+            }
         }
     }
     let conn = match engine.reader() {

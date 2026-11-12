@@ -333,7 +333,7 @@ CodeGraph equips AI agents with specialized analytical tools designed to minimiz
 - **`get_data_model`**: Inspects ORM schemas (EF Core, Prisma, TypeORM, SQLAlchemy, Django, Pydantic, SQLModel). Returns fields, types, primary keys, foreign keys, and relationship cardinalities (`1:1`, `1:N`, `N:M`).
 - **`get_config_matrix`**: Produces a cross-reference matrix of configuration keys and environment variables read by the code versus where they are defined (e.g. `appsettings.json`, `.env`), highlighting missing definitions.
 - **`get_type_contract`**: Extracts the public surface contract of a type without implementation bodies.
-- **`get_symbol_body`**: Fetches the exact source lines of a single symbol, optionally stripping comments and capping output length.
+- **`get_symbol_body`**: Fetches the exact source lines of a single symbol, optionally stripping comments and capping output length. To read across declarations in an indexed file, use `file_path` with both `start_line` and `end_line` (absolute, inclusive) instead of `symbol_id`.
 - **`get_file_outline`**: Provides a dense, structured outline of a file showing kinds, signatures, line numbers, cyclomatic complexities, and capability tags.
 
 ### 6. Governance, Testing & Git

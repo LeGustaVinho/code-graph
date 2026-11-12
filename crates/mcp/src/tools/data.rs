@@ -1,8 +1,12 @@
 //! 5.5 Data contracts, configuration & surgical extraction.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 
 use codegraph_core::render;
+use codegraph_core::walk::MAX_FILE_BYTES;
 use codegraph_core::{Language, SymbolKind};
 use codegraph_graph::query;
 use codegraph_graph::store::{node_from_row, NODE_COLS};
@@ -11,6 +15,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
+use super::discovery::normalize_scope;
 use super::fmt::{display, node_line};
 use super::{nodes_map, resolve_file_arg, resolve_navigation_symbols, resolve_symbol, wants_json, Ctx, Out, ToolError, ToolResult};
 
@@ -388,8 +393,10 @@ pub fn get_type_contract(ctx: &Ctx, p: ContractParams) -> ToolResult {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BodyParams {
-    /// Symbol id or name.
-    pub symbol_id: String,
+    /// Symbol id or name. Choose either symbol_id or file_path.
+    pub symbol_id: Option<String>,
+    /// Indexed file path or unique suffix. Requires both absolute line bounds.
+    pub file_path: Option<String>,
     /// Remove comments (line numbers are preserved).
     pub strip_comments: Option<bool>,
     /// Maximum number of lines to return.
@@ -402,57 +409,112 @@ pub struct BodyParams {
     pub format: Option<String>,
 }
 
-pub fn get_symbol_body(ctx: &Ctx, p: BodyParams) -> ToolResult {
-    let n = resolve_symbol(ctx.conn, &p.symbol_id)?;
-    if n.sym.kind == SymbolKind::Literal {
-        return Err(ToolError::BadArgs("literal nodes have no body; use find_literal".into()));
+/// Check the live file before reading it, including when a path was replaced
+/// after indexing.
+fn read_file_excerpt(root: &Path, file: &str) -> Result<String, ToolError> {
+    let reading = |error| ToolError::Internal(anyhow::anyhow!("reading {file}: {error}"));
+    let root = root.canonicalize().map_err(reading)?;
+    let path = root.join(file).canonicalize().map_err(reading)?;
+    if !path.starts_with(&root) {
+        return Err(ToolError::BadArgs(format!("file '{file}' resolves outside the project root")));
     }
-    let selection = match (p.start_line, p.end_line) {
-        (None, None) => None,
-        (Some(from), Some(to)) if from > 0 && from <= to && from >= n.sym.start_line && to <= n.sym.end_line => {
-            Some((from as usize, to as usize))
+    let metadata = path.metadata().map_err(reading)?;
+    if !metadata.is_file() {
+        return Err(ToolError::BadArgs(format!("'{file}' is not a regular file")));
+    }
+    let too_large = || ToolError::BadArgs(format!("'{file}' exceeds the {MAX_FILE_BYTES}-byte source limit"));
+    if metadata.len() > MAX_FILE_BYTES {
+        return Err(too_large());
+    }
+    let mut source = String::new();
+    File::open(path).map_err(reading)?.take(MAX_FILE_BYTES + 1).read_to_string(&mut source).map_err(reading)?;
+    if source.len() as u64 > MAX_FILE_BYTES {
+        return Err(too_large());
+    }
+    Ok(source)
+}
+
+pub fn get_symbol_body(ctx: &Ctx, p: BodyParams) -> ToolResult {
+    let (file, node) = match (p.symbol_id.as_deref(), p.file_path.as_deref()) {
+        (Some(id), None) => {
+            let n = resolve_symbol(ctx.conn, id)?;
+            if n.sym.kind == SymbolKind::Literal {
+                return Err(ToolError::BadArgs("literal nodes have no body; use find_literal".into()));
+            }
+            (n.file_path.clone(), Some(n))
         }
+        (None, Some(path)) => {
+            let path = normalize_scope(path)?;
+            if path.is_empty() {
+                return Err(ToolError::BadArgs("file_path must name an indexed file".into()));
+            }
+            (resolve_file_arg(ctx.conn, &path)?, None)
+        }
+        _ => return Err(ToolError::BadArgs("provide either symbol_id or file_path".into())),
+    };
+    let selection = match (p.start_line, p.end_line) {
+        (None, None) if node.is_some() => None,
         (Some(from), Some(to)) => {
-            return Err(ToolError::BadArgs(format!(
-                "invalid absolute file line range {from}..{to}; start_line and end_line must be ordered, positive, and inside symbol {}:{}-{}",
-                n.file_path, n.sym.start_line, n.sym.end_line
-            )));
+            let ordered = from > 0 && from <= to;
+            if let Some(n) = &node {
+                if !ordered || from < n.sym.start_line || to > n.sym.end_line {
+                    return Err(ToolError::BadArgs(format!(
+                        "invalid absolute file line range {from}..{to}; start_line and end_line must be ordered, positive, and inside symbol {}:{}-{}",
+                        file, n.sym.start_line, n.sym.end_line
+                    )));
+                }
+            } else if !ordered {
+                return Err(ToolError::BadArgs(format!(
+                    "invalid absolute file line range {from}..{to}; both bounds must be ordered and positive"
+                )));
+            }
+            Some((from as usize, to as usize))
         }
         _ => return Err(ToolError::BadArgs("start_line and end_line must be provided together (absolute, inclusive file lines)".into())),
     };
-    let path = ctx.engine.root.join(&n.file_path);
-    let source = std::fs::read_to_string(&path).map_err(|e| ToolError::Internal(anyhow::anyhow!("reading {}: {e}", n.file_path)))?;
+    let source = if node.is_some() {
+        std::fs::read_to_string(ctx.engine.root.join(&file)).map_err(|e| ToolError::Internal(anyhow::anyhow!("reading {file}: {e}")))?
+    } else {
+        read_file_excerpt(&ctx.engine.root, &file)?
+    };
     let strip = p.strip_comments.unwrap_or(false);
-    let lang = Language::from_path(&path);
-    let text = match (strip, lang) {
-        (true, Some(l)) if l.has_tree_sitter() => render::strip_comments(l, &source),
-        _ => source.clone(),
+    let stripped = match (strip, Language::from_path(Path::new(&file))) {
+        (true, Some(l)) if l.has_tree_sitter() => Some(render::strip_comments(l, &source)),
+        _ => None,
     };
     let original: Vec<&str> = source.lines().collect();
-    let lines: Vec<&str> = text.lines().collect();
-    let start = n.sym.start_line.max(1) as usize;
-    let end = (n.sym.end_line as usize).min(lines.len());
+    let stripped_lines: Option<Vec<&str>> = stripped.as_deref().map(|text| text.lines().collect());
+    let lines = stripped_lines.as_deref().unwrap_or(&original);
+    let start = node.as_ref().map_or(1, |n| n.sym.start_line.max(1) as usize);
+    let end = node.as_ref().map_or(lines.len(), |n| (n.sym.end_line as usize).min(lines.len()));
     if let Some((from, to)) = selection {
         if to > original.len() || to > lines.len() {
             return Err(ToolError::BadArgs(format!(
-                "requested file lines {from}..{to} exceed available source lines ({} in {})",
-                original.len(), n.file_path
+                "requested file lines {from}..{to} exceed available source lines ({} in {file})",
+                original.len()
             )));
         }
     }
     let mut out = Out::new();
-    out.h(format!("{} | {}", node_line(&n), n.sym.signature));
-    if let Some((from, to)) = selection {
-        out.h(format!("file lines {from}..{to} (absolute, inclusive)"));
+    if let Some(n) = &node {
+        out.h(format!("{} | {}", node_line(n), n.sym.signature));
+        if let Some((from, to)) = selection {
+            out.h(format!("file lines {from}..{to} (absolute, inclusive)"));
+        }
+    } else if let Some((from, to)) = selection {
+        out.h(format!("{file}:{from}-{to}"));
     }
-    // The body's common indentation is dropped (a method nested in a class or a closure would
-    // otherwise repeat it on every line); relative indentation is kept.
-    let indent = (start..=end)
-        .filter_map(|i| lines.get(i - 1))
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())
-        .min()
-        .unwrap_or(0);
+    // Drop common indentation only when returning a whole symbol body.
+    let indent = if selection.is_none() {
+        (start..=end)
+            .filter_map(|i| lines.get(i - 1))
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.len() - l.trim_start().len())
+            .min()
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let mut body: Vec<String> = Vec::new();
     let (render_start, render_end) = selection.unwrap_or((start, end));
     for i in render_start..=render_end {
