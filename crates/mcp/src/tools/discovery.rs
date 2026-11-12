@@ -1,5 +1,6 @@
 //! 5.2 Discovery: search_universal, find_literal, find_variable_or_const.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Instant;
@@ -119,16 +120,19 @@ fn identifier_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-fn text_matches(line: &str, needle: &str, case_sensitive: bool, whole_word: bool) -> bool {
-    let (haystack, needle) = if case_sensitive {
-        (line.to_owned(), needle.to_owned())
+fn search_text(text: &str, case_sensitive: bool) -> Cow<'_, str> {
+    if case_sensitive {
+        Cow::Borrowed(text)
     } else {
-        (line.to_lowercase(), needle.to_lowercase())
-    };
-    if !whole_word {
-        return haystack.contains(&needle);
+        Cow::Owned(text.to_lowercase())
     }
-    haystack.match_indices(&needle).any(|(start, _)| {
+}
+
+fn text_matches(haystack: &str, needle: &str, whole_word: bool) -> bool {
+    if !whole_word {
+        return haystack.contains(needle);
+    }
+    haystack.match_indices(needle).any(|(start, _)| {
         let end = start + needle.len();
         !haystack[..start].chars().next_back().is_some_and(identifier_char)
             && !haystack[end..].chars().next().is_some_and(identifier_char)
@@ -146,7 +150,7 @@ fn matches_scope(file: &str, scope: &str) -> bool {
             prefix.eq_ignore_ascii_case(scope) && file.as_bytes().get(scope.len()) == Some(&b'/')
         });
     }
-    file == scope || file.starts_with(&format!("{scope}/"))
+    file == scope || file.strip_prefix(scope).is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// Root-relative scope suggestions from known indexed files (without walking
@@ -224,6 +228,7 @@ pub fn search_source(ctx: &Ctx, p: SourceSearchParams) -> ToolResult {
     let mut matched = 0usize;
     let limit = p.limit.unwrap_or(30).clamp(1, 200);
     let case_sensitive = p.case_sensitive.unwrap_or(true);
+    let search_needle = search_text(needle, case_sensitive);
     let whole_word = p.whole_word.unwrap_or(false);
     let json = wants_json(&p.format);
     let mut out = Out::new();
@@ -247,11 +252,11 @@ pub fn search_source(ctx: &Ctx, p: SourceSearchParams) -> ToolResult {
         // Legacy source files may carry a non-UTF-8 comment or string. Preserve
         // searchable ASCII identifiers and report that decoding was lossy.
         let content = String::from_utf8_lossy(&bytes);
-        if matches!(content, std::borrow::Cow::Owned(_)) {
+        if matches!(content, Cow::Owned(_)) {
             lossy_decoded += 1;
         }
         for (i, line) in content.lines().enumerate() {
-            if !text_matches(line, needle, case_sensitive, whole_word) {
+            if !text_matches(&search_text(line, case_sensitive), &search_needle, whole_word) {
                 continue;
             }
             matched += 1;
