@@ -37,9 +37,11 @@ pub struct BatchParams {
     pub format: Option<String>,
 }
 
+pub(super) const MAX_BATCH_OPERATIONS: usize = 20;
+
 pub fn batch_query(ctx: &Ctx, p: BatchParams) -> ToolResult {
-    if p.operations.is_empty() || p.operations.len() > 20 {
-        return Err(ToolError::BadArgs("operations must contain 1..=20 items".into()));
+    if p.operations.is_empty() || p.operations.len() > MAX_BATCH_OPERATIONS {
+        return Err(ToolError::BadArgs(format!("operations must contain 1..={MAX_BATCH_OPERATIONS} items")));
     }
     let n = p.operations.len();
     let per_op = p.max_token_budget.map(|b| (b / n).max(40));

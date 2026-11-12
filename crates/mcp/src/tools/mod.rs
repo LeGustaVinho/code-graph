@@ -31,7 +31,7 @@ use codegraph_graph::query;
 use codegraph_graph::Node;
 use rusqlite::Connection;
 use schemars::JsonSchema;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 
 use crate::engine::Engine;
@@ -195,11 +195,9 @@ pub fn registry() -> Vec<ToolDef> {
     ]
 }
 
-/// Files referenced by a tool call (used for the targeted freshness check).
-fn hint_files(conn: &Connection, args: &Value) -> (Vec<String>, bool) {
-    let mut out = Vec::new();
+fn collect_file_hints(conn: &Connection, args: &Value, out: &mut Vec<String>) -> bool {
     let mut scoped = false;
-    let Some(obj) = args.as_object() else { return (out, scoped) };
+    let Some(obj) = args.as_object() else { return scoped };
     for (k, v) in obj {
         let mut vals: Vec<&str> = Vec::new();
         match v {
@@ -239,14 +237,44 @@ fn hint_files(conn: &Connection, args: &Value) -> (Vec<String>, bool) {
             }
         }
     }
+    scoped
+}
+
+fn reads_live_file(name: &str, args: &Value) -> bool {
+    name == "get_symbol_body" && args.get("file_path").is_some_and(Value::is_string)
+}
+
+/// Collect all freshness hints before opening the batch's read context.
+fn hint_files(conn: &Connection, name: &str, args: &Value) -> (Vec<String>, bool) {
+    let mut out = Vec::new();
+    let mut scoped = false;
+    if name == "batch_query" {
+        let batch = args
+            .get("operations")
+            .and_then(Value::as_array)
+            .filter(|ops| !ops.is_empty() && ops.len() <= tokens::MAX_BATCH_OPERATIONS)
+            .and_then(|_| tokens::BatchParams::deserialize(args).ok());
+        if let Some(batch) = batch {
+            let tools = registry();
+            for operation in batch.operations {
+                let tool = operation.tool.as_str();
+                let Some(args) = operation.args.as_ref() else { continue };
+                if tool != "batch_query" && !reads_live_file(tool, args) && tools.iter().any(|def| def.name == tool) {
+                    scoped |= collect_file_hints(conn, args, &mut out);
+                }
+            }
+        }
+    } else {
+        scoped = collect_file_hints(conn, args, &mut out);
+    }
     out.sort();
     out.dedup();
     (out, scoped)
 }
 
-fn refresh_new_scoped_targets(engine: &Engine, args: &Value, previous: &[String]) {
+fn refresh_new_scoped_targets(engine: &Engine, name: &str, args: &Value, previous: &[String]) {
     let Ok(conn) = engine.reader() else { return };
-    let (mut targets, _) = hint_files(&conn, args);
+    let (mut targets, _) = hint_files(&conn, name, args);
     drop(conn);
     targets.retain(|path| previous.binary_search(path).is_err());
     if !targets.is_empty() {
@@ -271,13 +299,12 @@ pub fn run_tool(ctx: &Ctx, name: &str, args: Value) -> Result<String, ToolError>
 pub fn call_tool(engine: &Engine, name: &str, args: Value) -> (String, bool) {
     // A file excerpt reads live bytes after checking its path. It does not need
     // symbol reindexing before that check.
-    let reads_file = name == "get_symbol_body" && args.get("file_path").is_some_and(Value::is_string);
-    if !reads_file {
+    if !reads_live_file(name, &args) {
         if let Ok(c) = engine.reader() {
-            let (hints, scoped) = hint_files(&c, &args);
+            let (hints, scoped) = hint_files(&c, name, &args);
             drop(c);
             match engine.ensure_fresh(&hints) {
-                Ok(Some(_)) if scoped => refresh_new_scoped_targets(engine, &args, &hints),
+                Ok(Some(_)) if scoped => refresh_new_scoped_targets(engine, name, &args, &hints),
                 Err(e) => tracing::warn!("freshness check failed: {e:#}"),
                 _ => {}
             }
