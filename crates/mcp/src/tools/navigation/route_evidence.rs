@@ -98,6 +98,9 @@ fn render_registration(
         return Ok(None);
     };
     excerpt_node(out, "register", call, src, 320);
+    if route.framework == "fastify" && matches!(route.method.as_str(), "POST" | "PUT" | "PATCH") {
+        render_preceding_parsers(out, call, src);
+    }
     let Some(callee) = call.child_by_field_name("function").filter(|n| n.kind() == "identifier") else { return Ok(None) };
     let args = arguments(call);
     let wrapper = unique(edges.iter().filter_map(|edge| {
@@ -131,6 +134,69 @@ fn render_registration(
     Ok(Some(wrapper.sym.id.clone()))
 }
 
+fn render_preceding_parsers(out: &mut Out, call: SyntaxNode<'_>, src: &str) {
+    let Some((receiver, _)) = direct_member_call(call, src) else { return };
+    let Some(statement) = call.parent().filter(|n| n.kind() == "expression_statement") else { return };
+    let Some(scope) = statement.parent().filter(|n| matches!(n.kind(), "statement_block" | "program")) else { return };
+    if !src[scope.start_byte()..statement.start_byte()].contains("ContentTypeParser") {
+        return;
+    }
+
+    // Only quote direct siblings of the registration, stopping at a possible
+    // change to the receiver binding. These excerpts describe source order.
+    let mut parsers = Vec::new();
+    let mut previous = statement.prev_named_sibling();
+    while let Some(statement) = previous {
+        if may_rebind(statement, receiver, src) {
+            break;
+        }
+        previous = statement.prev_named_sibling();
+        if statement.kind() != "expression_statement" {
+            continue;
+        }
+        let Some(parser) = statement.named_child(0).filter(|n| !n.has_error()) else { continue };
+        if direct_member_call(parser, src).is_some_and(|(object, method)| {
+            object == receiver && matches!(method, "addContentTypeParser" | "removeContentTypeParser" | "removeAllContentTypeParsers")
+        }) {
+            parsers.push(parser);
+            if parsers.len() == 3 {
+                break;
+            }
+        }
+    }
+    for parser in parsers.into_iter().rev() {
+        excerpt_node(out, "preceding parser", parser, src, 260);
+    }
+}
+
+fn direct_member_call<'s>(call: SyntaxNode<'_>, src: &'s str) -> Option<(&'s str, &'s str)> {
+    if call.kind() != "call_expression" || call.child_by_field_name("optional_chain").is_some() {
+        return None;
+    }
+    let callee = call.child_by_field_name("function").filter(|n| n.kind() == "member_expression")?;
+    if callee.child_by_field_name("optional_chain").is_some() {
+        return None;
+    }
+    let object = callee.child_by_field_name("object").filter(|n| n.kind() == "identifier")?;
+    Some((text(object, src), text(callee.child_by_field_name("property")?, src)))
+}
+
+fn may_rebind(statement: SyntaxNode<'_>, receiver: &str, src: &str) -> bool {
+    descendants(statement, None).into_iter().any(|n| {
+        let target = match n.kind() {
+            "variable_declarator" | "function_declaration" | "class_declaration" => n.child_by_field_name("name"),
+            "assignment_expression" | "augmented_assignment_expression" | "for_in_statement" => n.child_by_field_name("left"),
+            "update_expression" => n.child_by_field_name("argument"),
+            _ => None,
+        };
+        target.is_some_and(|target| {
+            descendants(target, None)
+                .into_iter()
+                .any(|node| matches!(node.kind(), "identifier" | "shorthand_property_identifier_pattern") && text(node, src) == receiver)
+        })
+    })
+}
+
 fn indexed_wrappers(ctx: &Ctx, route: &ApiRoute) -> Result<Vec<String>, ToolError> {
     let facts: Option<String> =
         ctx.conn.query_row("SELECT facts FROM file_meta WHERE file_path = ?1", [&route.file], |r| r.get(0)).optional()?.flatten();
@@ -149,23 +215,40 @@ fn indexed_wrappers(ctx: &Ctx, route: &ApiRoute) -> Result<Vec<String>, ToolErro
 }
 
 fn registration_call<'a>(root: SyntaxNode<'a>, route: &ApiRoute, src: &str, wrappers: &[String]) -> Option<SyntaxNode<'a>> {
-    unique(descendants(root, Some(route.line)).into_iter().filter(|&n| {
-        if n.kind() != "call_expression" || line_of(n) != route.line || n.has_error() {
-            return false;
-        }
+    let calls: Vec<_> = descendants(root, Some(route.line))
+        .into_iter()
+        .filter(|&n| n.kind() == "call_expression" && line_of(n) == route.line && !n.has_error())
+        .collect();
+    let member_matches = |member: &str| member.eq_ignore_ascii_case(&route.method) || member == "all" && route.method == "ANY";
+    // Indexed Fastify paths may include a plugin prefix absent from the literal
+    // registration. A line alone cannot choose between competing direct calls.
+    let ambiguous_direct = route.framework == "fastify"
+        && calls
+            .iter()
+            .filter(|n| {
+                n.child_by_field_name("function")
+                    .and_then(|f| f.child_by_field_name("property"))
+                    .is_some_and(|p| text(p, src) == "route" || member_matches(text(p, src)))
+            })
+            .take(2)
+            .count()
+            > 1;
+    unique(calls.into_iter().filter(|&n| {
         let Some(callee) = n.child_by_field_name("function") else { return false };
         let route_matches = |a| string_like(a, src).is_some_and(|p| normalize_route(&p) == route.normalized);
         let args = arguments(n);
         if callee.kind() == "identifier" && wrappers.iter().any(|name| name == text(callee, src)) {
             return args.into_iter().any(route_matches);
         }
+        if ambiguous_direct {
+            return false;
+        }
         let Some(member) = callee.child_by_field_name("property").map(|p| text(p, src)) else { return false };
         if member == "route" {
             let [options] = args.as_slice() else { return false };
             return property(*options, "url", src).or_else(|| property(*options, "path", src)).is_some_and(route_matches);
         }
-        (member.eq_ignore_ascii_case(&route.method) || member == "all" && route.method == "ANY")
-            && args.first().copied().is_some_and(route_matches)
+        member_matches(member) && args.first().copied().is_some_and(route_matches)
     }))
 }
 

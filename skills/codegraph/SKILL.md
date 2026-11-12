@@ -20,7 +20,7 @@ Use installed `mcp__codegraph__*` tools, or CLI: `codegraph query <tool> --root 
 | Method flow / guards / mutations | `get_flow_evidence(symbol_id,members:[...]?,max_lines?)` |
 | Callers / callees | `get_call_hierarchy(symbol_id,direction:"callers"|"callees",depth:1,show_sites:true)` |
 | Tests / config | `get_tests_for_symbol(symbol_id)`, `get_config_matrix(filter?,path?)` |
-| HTTP registration, body wiring, direct calls | `trace_fullstack_flow(api_route_or_call,route_evidence:true)` |
+| HTTP registration, body/parser wiring, direct calls | `trace_fullstack_flow(api_route_or_call,route_evidence:true)` |
 | Fullstack flows / DI / side effects | `trace_fullstack_flow`, `resolve_dependency_injection`, `get_state_mutations`, `trace_error_flow` |
 
 `names`/`members` select multiple **exact** names in one query; `filter` is a substring alternative. `include_signatures:true` adds signatures to selected outline members. A type flow is an incomplete selection: inspect missing branches with `get_symbol_body(symbol_id,start_line?,end_line?)` (absolute inclusive bounds inside that symbol). For lines across declarations, use `get_symbol_body(file_path,start_line,end_line)`. Public skeletons omit private methods unless requested. For overloaded methods use an exact signature, `sym_...` ID or `Name/<arity>` where supported. An `exact` call edge can still be overload-ambiguous; Unity Inspector and dynamic bindings may lack static edges. **Honor the requested file types:** C# code-only reference searches must remain in `.cs` files, including conventional fallbacks; inspect Unity `.prefab`/`.unity` bindings only when explicitly requested.
