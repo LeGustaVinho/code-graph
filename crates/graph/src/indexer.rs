@@ -8,13 +8,13 @@ use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use codegraph_core::walk::{discover, discover_counting, mtime_of, SourceFile};
+use codegraph_core::walk::{discover, discover_counting, mtime_of, IgnoreRules, SourceFile};
 use codegraph_core::{extract_file, DiRegistration, FileFacts, GlobalHandler, HttpCall, Import, ImportKind, Language, RouteDecl};
 use codegraph_semantic::global::{self, CallRow, HandlerRow, HttpCallRow, LiteralRow, RouteRow, ThrowRow};
 use codegraph_semantic::index::{IndexedSymbol, SymbolIndex};
 use codegraph_semantic::{models, resolve, Confidence, Edge};
 use rayon::prelude::*;
-use rusqlite::{params, params_from_iter, Connection, Transaction};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 
 use crate::progress::{Progress, Stage};
@@ -130,37 +130,34 @@ pub fn index_paths_with(root: &Path, conn: &mut Connection, rel_paths: &[String]
 
 /// Files whose mtime/size differ from the index (no hashing), plus deleted files.
 pub fn stale_files(root: &Path, conn: &Connection, only: Option<&[String]>) -> Result<Vec<String>> {
-    let mut meta: HashMap<String, (i64, i64)> = HashMap::new();
-    {
-        let mut st = conn.prepare("SELECT file_path, last_mtime, size FROM file_meta")?;
-        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))))?;
-        for r in rows.flatten() {
-            meta.insert(r.0, r.1);
-        }
-    }
     let mut stale = Vec::new();
     match only {
         Some(paths) => {
-            let rules = codegraph_core::walk::IgnoreRules::load(root);
+            let mut st = conn.prepare_cached("SELECT last_mtime, size FROM file_meta WHERE file_path = ?1")?;
+            let mut rules = None;
             for p in paths {
+                let indexed = st.query_row([p], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).optional()?;
                 let abs = root.join(p);
-                match (std::fs::metadata(&abs), meta.get(p)) {
-                    (Ok(m), Some((mt, sz))) => {
-                        if mtime_of(&m) != *mt || m.len() as i64 != *sz {
-                            stale.push(p.clone());
-                        }
-                    }
+                let changed = match (std::fs::metadata(&abs), indexed) {
+                    (Ok(m), Some((mt, sz))) => mtime_of(&m) != mt || m.len() as i64 != sz,
                     (Ok(m), None) => {
-                        if m.is_file() && Language::from_path(&abs).is_some() && !rules.is_ignored(p) {
-                            stale.push(p.clone());
-                        }
+                        m.is_file()
+                            && Language::from_path(&abs).is_some()
+                            && !rules.get_or_insert_with(|| IgnoreRules::load(root)).is_ignored(p)
                     }
-                    (Err(_), Some(_)) => stale.push(p.clone()),
-                    (Err(_), None) => {}
+                    (Err(_), previous) => previous.is_some(),
+                };
+                if changed {
+                    stale.push(p.clone());
                 }
             }
         }
         None => {
+            let meta: HashMap<String, (i64, i64)> = {
+                let mut st = conn.prepare("SELECT file_path, last_mtime, size FROM file_meta")?;
+                let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))))?;
+                rows.flatten().collect()
+            };
             let files = discover(root);
             let mut seen = HashSet::new();
             for f in files {
