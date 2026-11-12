@@ -57,8 +57,9 @@ pub fn resolve_file(conn: &Connection, input: &str) -> Result<Vec<String>> {
 
 /// Find the one exact target and the recorded module specifiers for a binding.
 fn exact_import_binding(conn: &Connection, file: &str, local: &str) -> Result<Option<(Node, Vec<Option<String>>)>> {
+    // Read the file's edges before filtering imports; the relation index scans the project.
     let mut st = conn.prepare_cached(
-        "SELECT target_id, json_group_array(DISTINCT json_extract(metadata, '$.module')) FROM edge
+        "SELECT target_id, json_group_array(DISTINCT json_extract(metadata, '$.module')) FROM edge INDEXED BY edge_source_file
          WHERE source_file = ?1 AND derived = 0 AND relation = 'IMPORTS' AND confidence = 'exact' AND target_id IS NOT NULL
            AND CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.local') END = ?2 COLLATE BINARY
          GROUP BY target_id LIMIT 2",
