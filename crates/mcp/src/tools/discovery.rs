@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::path::Path;
 use std::time::Instant;
 
@@ -112,6 +113,8 @@ pub struct SourceSearchParams {
     pub case_sensitive: Option<bool>,
     /// Maximum matching lines to include (default 30, max 200).
     pub limit: Option<usize>,
+    /// Indent subsequent matching lines in the same file and reuse the first path. Text output only.
+    pub group_by_file: Option<bool>,
     pub max_token_budget: Option<usize>,
     pub format: Option<String>,
 }
@@ -128,15 +131,66 @@ fn search_text(text: &str, case_sensitive: bool) -> Cow<'_, str> {
     }
 }
 
-fn text_matches(haystack: &str, needle: &str, whole_word: bool) -> bool {
-    if !whole_word {
-        return haystack.contains(needle);
+fn first_text_match(haystack: &str, needle: &str, whole_word: bool) -> Option<Range<usize>> {
+    let start = if whole_word {
+        haystack.match_indices(needle).find_map(|(start, _)| {
+            let end = start + needle.len();
+            let whole = !haystack[..start].chars().next_back().is_some_and(identifier_char)
+                && !haystack[end..].chars().next().is_some_and(identifier_char);
+            whole.then_some(start)
+        })
+    } else {
+        haystack.find(needle)
+    }?;
+    Some(start..start + needle.len())
+}
+
+/// Translate a lowercase byte range to the source scalars that contributed it.
+/// Contextual Greek sigma changes the lowercase character but keeps its byte width.
+fn source_match(line: &str, lowered: Range<usize>) -> Range<usize> {
+    let mut start = 0;
+    let mut lower_offset = 0;
+    for (offset, ch) in line.char_indices() {
+        if lower_offset <= lowered.start {
+            start = offset;
+        }
+        lower_offset += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+        if lower_offset >= lowered.end {
+            return start..offset + ch.len_utf8();
+        }
     }
-    haystack.match_indices(needle).any(|(start, _)| {
-        let end = start + needle.len();
-        !haystack[..start].chars().next_back().is_some_and(identifier_char)
-            && !haystack[end..].chars().next().is_some_and(identifier_char)
-    })
+    start..line.len()
+}
+
+const SOURCE_EXCERPT_CHARS: usize = 180;
+
+fn source_excerpt(line: &str, found: Range<usize>, case_sensitive: bool) -> Cow<'_, str> {
+    let after_indent = line.trim_start();
+    let text = after_indent.trim_end();
+    let mut boundaries = text.char_indices();
+    let Some((prefix_end, _)) = boundaries.nth(SOURCE_EXCERPT_CHARS - 1) else { return Cow::Borrowed(text) };
+    if boundaries.next().is_none() {
+        return Cow::Borrowed(text);
+    }
+
+    let original = if case_sensitive || line.is_ascii() { found } else { source_match(line, found) };
+    let indent = line.len() - after_indent.len();
+    // The trimmed query is nonempty and its endpoints are not whitespace.
+    let span = original.start - indent..original.end - indent;
+    if span.end <= prefix_end {
+        return Cow::Owned(format!("{}…", &text[..prefix_end]));
+    }
+
+    // Reserve room for the omission markers. A match larger than the window
+    // starts at the beginning of the match and is clipped at a character boundary.
+    let width = SOURCE_EXCERPT_CHARS - 2;
+    let match_width = text[span.clone()].chars().take(width).count();
+    let left = (width - match_width) / 2;
+    let start = if left == 0 { span.start } else { text[..span.start].char_indices().rev().nth(left - 1).map_or(0, |(i, _)| i) };
+    let end = text[start..].char_indices().nth(width).map_or(text.len(), |(i, _)| start + i);
+    let before = if start > 0 { "…" } else { "" };
+    let after = if end < text.len() { "…" } else { "" };
+    Cow::Owned(format!("{before}{}{after}", &text[start..end]))
 }
 
 fn matches_scope(file: &str, scope: &str) -> bool {
@@ -231,6 +285,7 @@ pub fn search_source(ctx: &Ctx, p: SourceSearchParams) -> ToolResult {
     let search_needle = search_text(needle, case_sensitive);
     let whole_word = p.whole_word.unwrap_or(false);
     let json = wants_json(&p.format);
+    let group_by_file = p.group_by_file.unwrap_or_default();
     let mut out = Out::new();
     for (file, status) in indexed.collect::<Result<Vec<_>, _>>()? {
         if status == "indexed" {
@@ -255,10 +310,9 @@ pub fn search_source(ctx: &Ctx, p: SourceSearchParams) -> ToolResult {
         if matches!(content, Cow::Owned(_)) {
             lossy_decoded += 1;
         }
+        let mut shown_in_file = false;
         for (i, line) in content.lines().enumerate() {
-            if !text_matches(&search_text(line, case_sensitive), &search_needle, whole_word) {
-                continue;
-            }
+            let Some(found) = first_text_match(&search_text(line, case_sensitive), &search_needle, whole_word) else { continue };
             matched += 1;
             if matched <= limit {
                 if json {
@@ -268,7 +322,13 @@ pub fn search_source(ctx: &Ctx, p: SourceSearchParams) -> ToolResult {
                         "text": line.trim(),
                     }).to_string());
                 } else {
-                    out.item(format!("{}:{} | {}", file, i + 1, codegraph_core::extract::truncate(line.trim(), 180)));
+                    let excerpt = source_excerpt(line, found, case_sensitive);
+                    if group_by_file && shown_in_file {
+                        out.item(format!("  :{} | {excerpt}", i + 1));
+                    } else {
+                        out.item(format!("{file}:{} | {excerpt}", i + 1));
+                    }
+                    shown_in_file = true;
                 }
             }
         }
