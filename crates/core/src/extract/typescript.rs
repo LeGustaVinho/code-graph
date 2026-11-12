@@ -135,6 +135,23 @@ struct State {
     /// Helpers that read the environment variable named by a parameter
     /// (`const required = (name) => env[name]`), scoped to the declaring function/module.
     env_accessors: HashMap<(String, String), (usize, &'static str)>,
+    fastify_factories: Vec<String>,
+    /// The first parameter of each inline `register` callback gets its receiver's prefix.
+    /// A callback without a proven Fastify receiver is still isolated from name heuristics.
+    fastify_callbacks: HashMap<usize, Option<FastifyPlugin>>,
+    register_depth: usize,
+}
+
+#[derive(Clone)]
+struct FastifyReceiver {
+    /// `None` means the plugin's effective URL prefix is unknown.
+    prefix: Option<String>,
+    mount_parent: String,
+}
+
+struct FastifyPlugin {
+    receiver: FastifyReceiver,
+    first_write: Option<usize>,
 }
 
 /// The owner of the currently visited helper declaration. A nested helper belongs to its
@@ -157,6 +174,8 @@ struct RouteWrapper {
     url: usize,
     handler: Option<usize>,
     framework: &'static str,
+    fastify: Option<FastifyReceiver>,
+    definition: Option<usize>,
 }
 
 /// Index of `name` among the parameters of the innermost enclosing function, with that
@@ -294,6 +313,9 @@ pub(crate) fn extract(ctx: &mut Ctx, root: Node) {
                     if SERVER_PACKAGES.contains(&m.as_str()) {
                         st.server_file = true;
                         st.framework = st.framework.or(Some(server_framework(&m)));
+                    }
+                    if m == "fastify" {
+                        st.fastify_factories.extend(fastify_imports(ctx, ch));
                     }
                     // Playwright specs import `test` from the runner or from a fixtures module.
                     let imports_test = ctx.text(ch).contains("test") && (m.starts_with('.') || m.starts_with('@') || m.starts_with('~'));
@@ -2815,10 +2837,21 @@ fn inline_function(ctx: &mut Ctx, st: &mut State, node: Node) {
     if let Some(h) = hint {
         apply_param_hint(ctx, params_node, &h, &mut locals);
     }
-    fastify_param_types(st, &mut locals);
+    let plugin = st.fastify_callbacks.get(&node.id());
+    if matches!(plugin, Some(Some(_))) {
+        if let Some(param) = first_parameter(node).filter(|p| p.kind() == "identifier") {
+            if let Some((_, ty)) = locals.iter_mut().find(|(name, _)| name == ctx.text(param)) {
+                ty.get_or_insert_with(|| "FastifyInstance".into());
+            }
+        }
+    } else if plugin.is_none() && st.register_depth == 0 {
+        fastify_param_types(st, &mut locals);
+    }
+    let is_register_callback = plugin.is_some();
+    let saved_wrappers = (is_register_callback || st.register_depth > 0).then(|| st.route_wrappers.clone());
     // Inline functions are part of the enclosing symbol; their parameters are locals of it.
     let mut created_scope = false;
-    if !ctx.in_function() {
+    if !ctx.in_function() || is_register_callback || st.register_depth > 0 {
         // Top-level anonymous function (e.g. IIFE / callback): give it a function scope bound to the
         // enclosing symbol so locals don't leak into module scope.
         let id = ctx.enclosing();
@@ -2829,6 +2862,9 @@ fn inline_function(ctx: &mut Ctx, st: &mut State, node: Node) {
             ..Default::default()
         });
         created_scope = true;
+    }
+    if is_register_callback {
+        st.register_depth += 1;
     }
     for (n, t) in locals {
         ctx.declare_local(&n, t);
@@ -2844,6 +2880,12 @@ fn inline_function(ctx: &mut Ctx, st: &mut State, node: Node) {
     }
     if created_scope {
         ctx.pop_scope();
+    }
+    if is_register_callback {
+        st.register_depth -= 1;
+    }
+    if let Some(wrappers) = saved_wrappers {
+        st.route_wrappers = wrappers;
     }
 }
 
@@ -3151,6 +3193,27 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
     // ---- Server routes (express-like) ----
     let lname = name.to_ascii_lowercase();
     let is_route_verb = HTTP_VERBS.contains(&lname.as_str()) || lname == "all";
+    let scoped_router_call = st.register_depth > 0 && (is_route_verb || matches!(name.as_str(), "route" | "addHook" | "decorate" | "use"));
+    let fastify = if !st.fastify_factories.is_empty() && (name == "register" || scoped_router_call) {
+        recv_node.and_then(|r| fastify_receiver(ctx, st, r))
+    } else {
+        None
+    };
+    if name == "register" && !st.fastify_factories.is_empty() {
+        if let Some(callback) = arg_list.first().filter(|n| is_function_value(**n)) {
+            let plugin = fastify.clone().map(|mut instance| {
+                let prefix = fastify_register_prefix(ctx, arg_list.get(1).copied());
+                instance.prefix = instance.prefix.zip(prefix).map(|(parent, child)| {
+                    if child.is_empty() { parent } else { mount_join(&parent, &child) }
+                });
+                let first_write = first_parameter(*callback)
+                    .filter(|p| p.kind() == "identifier")
+                    .and_then(|p| first_parameter_write(ctx, *callback, ctx.text(p)));
+                FastifyPlugin { receiver: instance, first_write }
+            });
+            st.fastify_callbacks.insert(callback.id(), plugin);
+        }
+    }
     // `router.route('/x').get(h)`: the path comes from the `route()` call.
     let chained_path = recv_node.filter(|r| r.kind() == "call_expression").and_then(|r| {
         let f = r.child_by_field_name("function")?;
@@ -3158,18 +3221,24 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
         (prop == "route").then(|| r.child_by_field_name("arguments").and_then(|a| first_string_arg(a, ctx.src)).map(|(s, _)| s))?
     });
     let rtype_base = rtype.as_deref().filter(|t| !t.starts_with("@mt#")).map(clean_type).unwrap_or_default();
-    let routerish = recv_last == "app"
+    let router_name = recv_last == "app"
         || recv_last == "router"
         || recv_last == "server"
         || recv_last == "fastify"
         || recv_last.ends_with("router")
         || recv_last == "routes"
-        || recv_last == "api" && st.server_file
-        || ROUTER_TYPES.contains(&rtype_base.as_str())
-        || chained_path.is_some();
+        || recv_last == "api" && st.server_file;
+    let requires_router_proof = st.register_depth > 0 && recv_node.is_some_and(|r| needs_fastify_proof(ctx, st, r));
+    let express = requires_router_proof && router_name && recv_node.is_some_and(|r| express_receiver(ctx, r));
+    let routerish = fastify.is_some()
+        || express
+        || !requires_router_proof && (router_name || chained_path.is_some())
+        || ROUTER_TYPES.contains(&rtype_base.as_str()) && (!requires_router_proof || rtype_base != "FastifyInstance");
     // The router variable the route is declared on (`router` in `router.route('/x').get(…)`).
     let recv_base = receiver.as_deref().unwrap_or("").split(['.', '(']).next().unwrap_or("").to_string();
     let framework = match rtype_base.as_str() {
+        _ if fastify.is_some() => "fastify",
+        _ if express => "express",
         "Hono" => "hono",
         "FastifyInstance" => "fastify",
         "Koa" | "KoaRouter" => "koa",
@@ -3183,12 +3252,14 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
         if let Some(path) = path.filter(|p| p.starts_with('/') || p == "*") {
             is_server_route = true;
             let handler = *arg_list.last().unwrap();
-            handled_args.extend(server_route(ctx, st, framework, &method, &path, handler, &recv_base, line));
+            handled_args.extend(server_route(ctx, st, framework, &method, &path, handler, &recv_base, fastify.as_ref(), line));
         } else if let Some((wrapper, url)) = param_arg(ctx, arg_list.first().copied()) {
             // `const get = (path, h) => router.get(path, h)`: a route-registering helper.
             let handler = param_arg(ctx, arg_list.last().copied()).map(|(_, i)| i).filter(|i| *i != url);
             if let Some(owner) = helper_owner(ctx) {
-                st.route_wrappers.insert((owner, wrapper), RouteWrapper { method: Err(method), url, handler, framework });
+                st.route_wrappers.insert((owner, wrapper), RouteWrapper {
+                    method: Err(method), url, handler, framework, fastify: fastify.clone(), definition: enclosing_function(node).map(|f| f.id()),
+                });
             }
         }
     }
@@ -3200,7 +3271,7 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
         if let (Some(url), Some(handler)) = (url.filter(|u| u.starts_with('/')), handler) {
             is_server_route = true;
             let method = object_string_prop(ctx, opts, "method").unwrap_or_else(|| "ANY".into()).to_ascii_uppercase();
-            if server_route(ctx, st, framework, &method, &url, handler, &recv_base, line).is_some() {
+            if server_route(ctx, st, framework, &method, &url, handler, &recv_base, fastify.as_ref(), line).is_some() {
                 // The options object is still walked (other keys); the handler body is done.
                 st.walked_handlers.push(handler.id());
             }
@@ -3213,13 +3284,24 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
             };
             let handler = param_arg(ctx, handler).map(|(_, i)| i);
             if let Some(owner) = helper_owner(ctx) {
-                st.route_wrappers.insert((owner, wrapper), RouteWrapper { method, url, handler, framework });
+                st.route_wrappers.insert((owner, wrapper), RouteWrapper {
+                    method, url, handler, framework, fastify: fastify.clone(), definition: enclosing_function(node).map(|f| f.id()),
+                });
             }
         }
     }
     // A call of a route-registering helper: `route('POST', '/v1/friends', schema, handler)`.
     if receiver.is_none() && !is_server_route {
-        if let Some(w) = visible_helper(ctx, &st.route_wrappers, &name) {
+        let wrapper = visible_helper(ctx, &st.route_wrappers, &name).filter(|w| {
+            if st.register_depth == 0 {
+                return true;
+            }
+            match lexical_binding(ctx, func, &name) {
+                Some(LexicalBinding::Const(f) | LexicalBinding::Function(f)) => w.definition == Some(f.id()),
+                _ => false,
+            }
+        });
+        if let Some(w) = wrapper {
             let path = arg_list.get(w.url).and_then(|a| string_like(*a, ctx.src)).filter(|p| p.starts_with('/'));
             let method = match &w.method {
                 Ok(i) => arg_list.get(*i).and_then(|a| string_like(*a, ctx.src)).map(|m| m.to_ascii_uppercase()),
@@ -3231,10 +3313,11 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
             };
             if let (Some(path), Some(method), Some(handler)) = (path, method, handler) {
                 is_server_route = true;
-                handled_args.extend(server_route(ctx, st, w.framework, &method, &path, handler, "", line));
+                let first_route = ctx.facts.routes.len();
+                handled_args.extend(server_route(ctx, st, w.framework, &method, &path, handler, "", w.fastify.as_ref(), line));
                 // The helper's own request logic (auth, rate limits, …) runs around the handler:
                 // link the route to it so flows from the route include it.
-                let hid = ctx.facts.routes.last().map(|r| r.handler.clone()).filter(|h| !h.starts_with("ref:"));
+                let hid = ctx.facts.routes.get(first_route).map(|r| r.handler.clone()).filter(|h| !h.starts_with("ref:"));
                 if let Some(hid) = hid {
                     ctx.facts.refs.push(Reference {
                         kind: RefKind::Call,
@@ -3311,8 +3394,14 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
     if st.server_file && name == "register" && arg_list.first().map(|a| ctx.text(*a).to_ascii_lowercase().contains("autoload")).unwrap_or(false) {
         if let Some(opts) = arg_list.get(1).copied() {
             let dir = object_prop(ctx, opts, "dir").map(|d| string_args(ctx, d).join("/"));
-            let prefix = object_prop(ctx, opts, "options").and_then(|o| object_string_prop(ctx, o, "prefix")).unwrap_or_default();
-            if let Some(dir) = dir.filter(|d| !d.is_empty()) {
+            let options = object_prop(ctx, opts, "options");
+            let prefix = match fastify.as_ref().filter(|_| st.register_depth > 0) {
+                Some(instance) => instance.prefix.as_deref().zip(fastify_register_prefix(ctx, options)).map(|(outer, inner)| {
+                    if inner.is_empty() { outer.to_owned() } else { mount_join(outer, &inner) }
+                }),
+                None => Some(options.and_then(|o| object_string_prop(ctx, o, "prefix")).unwrap_or_default()),
+            };
+            if let (Some(dir), Some(prefix)) = (dir.filter(|d| !d.is_empty()), prefix) {
                 let base = ctx.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
                 let full = normalize_rel(&format!("{base}/{dir}"));
                 ctx.facts.route_prefixes.push(format!("autoload:{prefix}|{full}"));
@@ -3324,6 +3413,9 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
     if st.server_file && routerish && !is_route_verb {
         let mount = match name.as_str() {
             "use" => first_str.clone().filter(|p| p.starts_with('/')).map(|p| (p, arg_list.iter().skip(1).copied().collect::<Vec<_>>())),
+            "register" if st.register_depth > 0 && fastify.is_some() => fastify_register_prefix(ctx, arg_list.get(1).copied())
+                .filter(|p| !p.is_empty() || fastify.as_ref().and_then(|r| r.prefix.as_deref()).is_some_and(|parent| !parent.is_empty()))
+                .map(|p| (p, arg_list.first().copied().into_iter().collect())),
             "register" => arg_list
                 .get(1)
                 .and_then(|o| object_string_prop(ctx, *o, "prefix"))
@@ -3331,7 +3423,11 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
                 .map(|p| (p, arg_list.first().copied().into_iter().collect())),
             _ => None,
         };
-        if let Some((prefix, targets)) = mount {
+        let mount = mount.and_then(|(prefix, targets)| match &fastify {
+            Some(instance) => instance.prefix.as_deref().map(|p| (mount_join(p, &prefix), targets, instance.mount_parent.clone())),
+            None => Some((prefix, targets, recv_base.clone())),
+        });
+        if let Some((prefix, targets, parent)) = mount {
             for t in targets {
                 let target = match t.kind() {
                     "identifier" => Some(ctx.text(t).to_string()),
@@ -3339,7 +3435,7 @@ fn call(ctx: &mut Ctx, st: &mut State, node: Node) {
                     _ => None,
                 };
                 if let Some(target) = target {
-                    st.mounts.push(Mount { prefix: prefix.clone(), target, parent: recv_base.clone() });
+                    st.mounts.push(Mount { prefix: prefix.clone(), target, parent: parent.clone() });
                 }
             }
         }
@@ -3917,8 +4013,17 @@ fn server_route<'t>(
     path: &str,
     handler: Node<'t>,
     recv: &str,
+    fastify: Option<&FastifyReceiver>,
     line: u32,
 ) -> Option<Node<'t>> {
+    let mounted;
+    let (path, recv) = if let Some(instance) = fastify {
+        let prefix = instance.prefix.as_deref()?;
+        mounted = if prefix.is_empty() { path.to_owned() } else { mount_join(prefix, path) };
+        (mounted.as_str(), instance.mount_parent.as_str())
+    } else {
+        (path, recv)
+    };
     let walked = if is_function_value(handler) {
         let label = format!("{method} {path}");
         let id = handler_symbol(ctx, st, framework, &label, &format!("route {method} {path}"), handler);
@@ -4011,6 +4116,277 @@ fn fastify_param_types(st: &State, locals: &mut [(String, Option<String>)]) {
             _ => None,
         };
     }
+}
+
+/// Runtime factory bindings imported directly from `fastify`.
+fn fastify_imports(ctx: &Ctx, stmt: Node) -> Vec<String> {
+    if children(stmt).iter().any(|n| n.kind() == "type") {
+        return Vec::new();
+    }
+    let Some(clause) = named_children(stmt).into_iter().find(|n| n.kind() == "import_clause") else { return Vec::new() };
+    let mut factories = Vec::new();
+    for item in named_children(clause) {
+        match item.kind() {
+            "identifier" => factories.push(ctx.text(item).to_owned()),
+            "named_imports" => {
+                factories.extend(named_children(item).into_iter().filter_map(|spec| {
+                    let name = spec.child_by_field_name("name")?;
+                    (matches!(ctx.text(name), "fastify" | "default") && !children(spec).iter().any(|n| n.kind() == "type"))
+                        .then(|| ctx.text(spec.child_by_field_name("alias").unwrap_or(name)).to_owned())
+                }));
+            }
+            _ => {}
+        }
+    }
+    factories
+}
+
+fn parameter_pattern(n: Node) -> Option<Node> {
+    if matches!(n.kind(), "required_parameter" | "optional_parameter") {
+        n.child_by_field_name("pattern")
+    } else {
+        Some(n)
+    }
+}
+
+fn parameters(func: Node) -> Vec<Node> {
+    if let Some(single) = func.child_by_field_name("parameter") {
+        return vec![single];
+    }
+    func.child_by_field_name("parameters")
+        .map(|p| named_children(p).into_iter().filter(|n| n.kind() != "comment").collect())
+        .unwrap_or_default()
+}
+
+fn first_parameter(func: Node) -> Option<Node> {
+    parameters(func).first().copied().and_then(parameter_pattern)
+}
+
+enum LexicalBinding<'t> {
+    Const(Node<'t>),
+    Function(Node<'t>),
+    Parameter { function: Node<'t>, index: usize },
+    Other,
+}
+
+fn pattern_binds(ctx: &Ctx, pattern: Node, name: &str) -> bool {
+    if pattern.kind() == "identifier" {
+        return ctx.text(pattern) == name;
+    }
+    let mut locals = Vec::new();
+    pattern_locals(ctx, pattern, None, &mut locals);
+    locals.iter().any(|(local, _)| local == name)
+}
+
+fn declaration_binding<'t>(ctx: &Ctx, mut declaration: Node<'t>, name: &str) -> Option<LexicalBinding<'t>> {
+    if declaration.kind() == "export_statement" {
+        declaration = declaration.child_by_field_name("declaration")?;
+    }
+    if matches!(declaration.kind(), "lexical_declaration" | "variable_declaration") {
+        let is_const = declaration.child(0).is_some_and(|kw| kw.kind() == "const");
+        return named_children(declaration).into_iter().find_map(|d| {
+            let pattern = d.child_by_field_name("name").filter(|n| pattern_binds(ctx, *n, name))?;
+            Some(match d.child_by_field_name("value") {
+                Some(value) if is_const && pattern.kind() == "identifier" => LexicalBinding::Const(value),
+                _ => LexicalBinding::Other,
+            })
+        });
+    }
+    if matches!(declaration.kind(), "function_declaration" | "generator_function_declaration" | "class_declaration") {
+        let binding = declaration.child_by_field_name("name")?;
+        return (ctx.text(binding) == name).then(|| {
+            if declaration.kind() == "class_declaration" { LexicalBinding::Other } else { LexicalBinding::Function(declaration) }
+        });
+    }
+    None
+}
+
+fn function_scope(node: Node) -> bool {
+    is_function_value(node) || matches!(node.kind(), "function_declaration" | "generator_function_declaration" | "method_definition")
+}
+
+fn enclosing_function(node: Node) -> Option<Node> {
+    std::iter::successors(node.parent(), |n| n.parent()).find(|n| function_scope(*n))
+}
+
+fn hoisted_var(ctx: &Ctx, root: Node, name: &str) -> bool {
+    let mut pending = vec![root];
+    while let Some(n) = pending.pop() {
+        if function_scope(n) || matches!(n.kind(), "class_declaration" | "class" | "class_static_block") {
+            continue;
+        }
+        if n.kind() == "variable_declaration" && declaration_binding(ctx, n, name).is_some() {
+            return true;
+        }
+        if n.kind() == "for_in_statement" && n.child_by_field_name("kind").is_some_and(|k| k.kind() == "var")
+            && n.child_by_field_name("left").is_some_and(|p| pattern_binds(ctx, p, name))
+        {
+            return true;
+        }
+        pending.extend(named_children(n));
+    }
+    false
+}
+
+/// Resolve the binding at the receiver's AST location. Inline function scopes in the graph
+/// can share a symbol id, and therefore cannot identify a plugin's first parameter by name.
+fn lexical_binding<'t>(ctx: &Ctx, node: Node<'t>, name: &str) -> Option<LexicalBinding<'t>> {
+    for scope in std::iter::successors(node.parent(), |n| n.parent()) {
+        match scope.kind() {
+            "program" | "statement_block" | "switch_body" => {
+                let direct = named_children(scope).into_iter();
+                let binding = if scope.kind() == "switch_body" {
+                    direct.flat_map(named_children).find_map(|n| declaration_binding(ctx, n, name))
+                } else {
+                    direct.into_iter().find_map(|n| declaration_binding(ctx, n, name))
+                };
+                if binding.is_some() {
+                    return binding;
+                }
+                if scope.kind() == "program" && hoisted_var(ctx, scope, name) {
+                    return Some(LexicalBinding::Other);
+                }
+            }
+            "for_statement" => {
+                if let Some(binding) = scope.child_by_field_name("initializer").and_then(|d| declaration_binding(ctx, d, name)) {
+                    return Some(binding);
+                }
+            }
+            "for_in_statement" | "catch_clause" => {
+                let pattern = if scope.kind() == "catch_clause" {
+                    scope.child_by_field_name("parameter")
+                } else {
+                    scope.child_by_field_name("kind").and_then(|_| scope.child_by_field_name("left"))
+                };
+                if pattern.is_some_and(|p| pattern_binds(ctx, p, name)) {
+                    return Some(LexicalBinding::Other);
+                }
+            }
+            _ if function_scope(scope) => {
+                for (index, param) in parameters(scope).into_iter().enumerate() {
+                    if parameter_pattern(param).is_some_and(|p| pattern_binds(ctx, p, name)) {
+                        return Some(LexicalBinding::Parameter { function: scope, index });
+                    }
+                }
+                let self_name = scope.kind() != "method_definition" && scope.child_by_field_name("name").is_some_and(|n| ctx.text(n) == name);
+                if self_name || scope.child_by_field_name("body").is_some_and(|b| hoisted_var(ctx, b, name)) {
+                    return Some(LexicalBinding::Other);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn fastify_receiver(ctx: &Ctx, st: &State, receiver: Node) -> Option<FastifyReceiver> {
+    let (init, mount_parent) = match receiver.kind() {
+        "identifier" => {
+            let name = ctx.text(receiver);
+            match lexical_binding(ctx, receiver, name)? {
+                LexicalBinding::Const(init) if init.end_byte() <= receiver.start_byte() => (init, name.to_owned()),
+                LexicalBinding::Parameter { function, index: 0 }
+                    if first_parameter(function).is_some_and(|p| p.kind() == "identifier") =>
+                {
+                    let plugin = st.fastify_callbacks.get(&function.id())?.as_ref()?;
+                    return plugin.first_write.map_or(true, |w| w >= receiver.start_byte()).then(|| plugin.receiver.clone());
+                }
+                _ => return None,
+            }
+        }
+        "call_expression" => (receiver, String::new()),
+        _ => return None,
+    };
+    let factory = init.child_by_field_name("function").filter(|f| init.kind() == "call_expression" && f.kind() == "identifier")?;
+    let name = ctx.text(factory);
+    (st.fastify_factories.iter().any(|f| f == name) && lexical_binding(ctx, factory, name).is_none())
+        .then(|| FastifyReceiver { prefix: Some(String::new()), mount_parent })
+}
+
+/// Preserve a real Express router inside a Fastify callback without trusting a name such as `app`.
+fn express_receiver(ctx: &Ctx, receiver: Node) -> bool {
+    let Some(LexicalBinding::Const(init)) = lexical_binding(ctx, receiver, ctx.text(receiver)) else { return false };
+    if init.kind() != "call_expression" || init.end_byte() > receiver.start_byte() {
+        return false;
+    }
+    let Some(callee) = init.child_by_field_name("function") else { return false };
+    let (factory, member) = if callee.kind() == "identifier" {
+        (callee, false)
+    } else if callee.kind() == "member_expression" && callee.child_by_field_name("property").is_some_and(|p| ctx.text(p) == "Router") {
+        let Some(factory) = callee.child_by_field_name("object").filter(|n| n.kind() == "identifier") else { return false };
+        (factory, true)
+    } else {
+        return false;
+    };
+    let name = ctx.text(factory);
+    lexical_binding(ctx, factory, name).is_none()
+        && ctx.facts.imports.iter().any(|i| {
+            i.module == "express" && i.local.as_deref() == Some(name)
+                && (i.imported.as_deref() == Some("default") || !member && i.imported.as_deref() == Some("Router"))
+        })
+}
+
+fn first_parameter_write(ctx: &Ctx, function: Node, name: &str) -> Option<usize> {
+    let mut pending: Vec<_> = function.child_by_field_name("body").into_iter().collect();
+    let mut first = None;
+    while let Some(node) = pending.pop() {
+        if first.is_some_and(|offset| node.start_byte() >= offset) {
+            continue;
+        }
+        let target = match node.kind() {
+            "assignment_expression" | "augmented_assignment_expression" => node.child_by_field_name("left"),
+            "update_expression" => node.child_by_field_name("argument"),
+            "for_in_statement" if node.child_by_field_name("kind").is_none() => node.child_by_field_name("left"),
+            _ => None,
+        };
+        if let Some(target) = target.filter(|n| pattern_binds(ctx, *n, name)) {
+            if matches!(lexical_binding(ctx, target, name), Some(LexicalBinding::Parameter { function: owner, index: 0 }) if owner == function) {
+                first = Some(node.start_byte());
+                continue;
+            }
+        }
+        pending.extend(named_children(node));
+    }
+    first
+}
+
+fn needs_fastify_proof(ctx: &Ctx, st: &State, receiver: Node) -> bool {
+    std::iter::successors(receiver.parent(), |n| n.parent()).filter(|n| function_scope(*n)).any(|function| {
+        st.fastify_callbacks.get(&function.id()).is_some_and(|plugin| {
+            plugin.is_some()
+                || receiver.kind() == "identifier"
+                    && parameters(function).into_iter().filter_map(parameter_pattern).any(|p| pattern_binds(ctx, p, ctx.text(receiver)))
+        })
+    })
+}
+
+fn fastify_register_prefix(ctx: &Ctx, options: Option<Node>) -> Option<String> {
+    let Some(options) = options else { return Some(String::new()) };
+    if options.kind() != "object" {
+        return None;
+    }
+    for field in named_children(options).into_iter().rev() {
+        if field.kind() == "comment" {
+            continue;
+        }
+        let key = match field.kind() {
+            "pair" => field.child_by_field_name("key"),
+            "method_definition" => field.child_by_field_name("name"),
+            "shorthand_property_identifier" => Some(field),
+            _ => None,
+        }?;
+        if key.kind() == "computed_property_name" {
+            return None;
+        }
+        if ctx.text(key).trim_matches(['"', '\'']) == "prefix" {
+            let value = field.child_by_field_name("value")?;
+            if named_children(value).iter().any(|n| matches!(n.kind(), "template_substitution" | "escape_sequence")) {
+                return None;
+            }
+            return string_like(value, ctx.src).filter(|p| p.is_empty() || p.starts_with('/'));
+        }
+    }
+    Some(String::new())
 }
 
 /// `require('./users')` / `import('./users')` passed straight to `app.use(…)`.

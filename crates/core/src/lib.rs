@@ -19,6 +19,6 @@ pub use extract::extract_file;
 /// Bump whenever extraction output changes so cached indexes are rebuilt.
 // Increment when extracted facts change shape or semantics: existing graphs
 // must be rebuilt to populate C# call-argument type evidence.
-pub const EXTRACTOR_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+x12");
+pub const EXTRACTOR_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+x13");
 pub use lang::Language;
 pub use model::*;
