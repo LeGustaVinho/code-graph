@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::fmt::{display, node_line, node_line_sig};
+use super::fmt::{display, node_line, node_line_sig, node_line_sig_relative};
 use super::{nodes_map, wants_json, Ctx, Out, ToolResult};
 
 #[derive(Deserialize, JsonSchema)]
@@ -27,6 +27,8 @@ pub struct SearchParams {
     pub kind: Option<String>,
     /// Maximum results (default 20).
     pub limit: Option<usize>,
+    /// Indent consecutive hits in the same file and reuse the first hit's path. Preserves rank. Text output only.
+    pub group_by_file: Option<bool>,
     pub max_token_budget: Option<usize>,
     /// "compact" (default) or "json".
     pub format: Option<String>,
@@ -72,9 +74,21 @@ pub fn search_universal(ctx: &Ctx, p: SearchParams) -> ToolResult {
     let mut out = Out::new();
     let total_label = if total >= 1000 { "1000+".to_string() } else { total.to_string() };
     out.h(format!("{total_label} {}match(es) for '{}' ({:.1} ms)", if exact { "exact declaration " } else { "" }, p.query, t0.elapsed().as_secs_f64() * 1000.0));
-    let json = wants_json(&p.format);
-    for n in &rows {
-        out.item(if json { node_json(n) } else { node_line_sig(n) });
+    if wants_json(&p.format) {
+        for n in &rows {
+            out.item(node_json(n));
+        }
+    } else if p.group_by_file.unwrap_or_default() {
+        for run in rows.chunk_by(|a, b| a.file_path == b.file_path) {
+            out.item(node_line_sig(&run[0]));
+            for n in &run[1..] {
+                out.item(node_line_sig_relative(n));
+            }
+        }
+    } else {
+        for n in &rows {
+            out.item(node_line_sig(n));
+        }
     }
     out.unshown = total.saturating_sub(rows.len());
     Ok(out)

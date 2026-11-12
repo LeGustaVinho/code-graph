@@ -307,7 +307,7 @@ CodeGraph equips AI agents with 28 specialized analytical tools designed to mini
 - **`get_flow_diagram`**: Generates a compact Mermaid flowchart (3–6 hops) around a symbol. Line styles represent confidence (`solid` = exact, `dotted` = inferred, `cross` = unresolved).
 
 ### 2. Symbol & Literal Discovery
-- **`search_universal`**: Sub-millisecond ranked FTS5 trigram search across classes, functions, variables, constants, and data models. Supports kind filtering and token limits.
+- **`search_universal`**: Sub-millisecond ranked FTS5 trigram search across classes, functions, variables, constants, and data models. Supports kind filtering and token limits. Set `group_by_file: true` to share the file path across adjacent matches while retaining search rank, line ranges, and signatures. Indented matches use the path from the preceding unindented match. JSON output retains a full path per match.
 - **`find_literal`**: Pinpoints string/number literals (URLs, route patterns, SQL fragments, error messages, config keys) with exact coordinates and enclosing symbols.
 - **`find_variable_or_const`**: Locates variable, constant, or property declarations alongside all read (`READS_VAR`) and write (`WRITES_VAR`) sites.
 

@@ -11,7 +11,7 @@ Use installed `mcp__codegraph__*` tools, or CLI: `codegraph query <tool> --root 
 
 | Goal | Tool |
 | --- | --- |
-| Exact declaration | `search_universal(query,exact:true,kind?)`; omit `exact` for fuzzy discovery |
+| Exact declaration | `search_universal(query,exact:true,kind?)`; omit `exact` for fuzzy discovery. Use `group_by_file:true` for multiple hits in the same file |
 | Text uses, comments, scoped absence | `search_source(query,path?,whole_word?)` |
 | File API / named members | `get_file_skeleton(file_path,include_private?)` or `get_file_outline(file_path,names:[...],include_signatures:true?)` |
 | Type members / implementations | `get_type_contract(type_id)`, `get_type_hierarchy(symbol_id,direction?)` |

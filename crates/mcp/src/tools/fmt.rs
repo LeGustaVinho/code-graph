@@ -45,12 +45,30 @@ pub fn node_line(n: &Node) -> String {
 }
 
 pub fn node_line_sig(n: &Node) -> String {
-    let mut s = node_line(n);
+    with_signature(n, node_line(n))
+}
+
+/// A search hit in the same file as the preceding unindented hit.
+pub(crate) fn node_line_sig_relative(n: &Node) -> String {
+    let kind = kind_abbrev(n.sym.kind);
+    let name = display(n);
+    let coords = n.coords();
+    let range = coords.strip_prefix(n.file_path.as_str()).unwrap_or(&coords);
+    let line = if n.sym.kind == SymbolKind::Module && name == n.file_path {
+        // The module's display name is already given by the shared path.
+        format!("  {kind} {range}")
+    } else {
+        format!("  {kind} {name} {range}")
+    };
+    with_signature(n, line)
+}
+
+fn with_signature(n: &Node, mut line: String) -> String {
     if !n.sym.signature.is_empty() && n.sym.kind != SymbolKind::Module && n.sym.kind != SymbolKind::Literal {
         // Search hits only need enough of the signature to tell overloads apart.
-        s.push_str(&format!(" | {}", codegraph_core::extract::truncate(&n.sym.signature, 110)));
+        line.push_str(&format!(" | {}", codegraph_core::extract::truncate(&n.sym.signature, 110)));
     }
-    s
+    line
 }
 
 pub fn short_evidence(e: &EdgeRow, max: usize) -> String {
