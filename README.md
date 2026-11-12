@@ -444,7 +444,7 @@ codegraph [COMMAND] [OPTIONS]
 | `mcp` (alias: `serve`) | `[--root <path>] [--no-watch]` | Launches the MCP server over stdio for AI coding assistants. |
 | `ui` | `[path] [--port <p>] [--host <h>] [--no-open]` | Starts the local interactive Graph Explorer (defaults to `127.0.0.1:4321`). |
 | `query` | `<tool> [--args <json>] [--root <path>]` | Runs an MCP tool directly from the terminal and prints the formatted output. |
-| `tools` | `[--json]` | Lists the registered MCP tools and their parameter schemas. |
+| `tools` | `[TOOL] [--json]` | Lists tools as text or compact JSON. Pass a tool name with `--json` to fetch only its schema, e.g. `codegraph tools search_universal --json`. |
 | `status` | `[path]` | Displays index metadata, stale file counts, node counts, and edge statistics. |
 | `dump-ast` | `<file>` | Dumps the Tree-sitter syntax tree with line ranges (useful for debugging). |
 | `facts` | `<file>` | Outputs extracted syntactic facts (symbols, refs, imports, mutations) as JSON. |

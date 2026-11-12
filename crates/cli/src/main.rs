@@ -69,8 +69,12 @@ enum Cmd {
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// List the MCP tools (use --json for full input schemas)
+    /// List MCP tools or show one input schema
     Tools {
+        /// Exact tool name (requires --json)
+        #[arg(value_name = "TOOL", requires = "json")]
+        tool: Option<String>,
+        /// Print tool definitions and input schemas as compact JSON
         #[arg(long)]
         json: bool,
     },
@@ -182,9 +186,14 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Cmd::Tools { json } => {
+        Cmd::Tools { tool, json } => {
             if json {
-                println!("{}", serde_json::to_string_pretty(&codegraph_mcp::server::tools_list())?);
+                let definitions = match tool.as_deref() {
+                    Some(name) => codegraph_mcp::server::tools_list_for(name)
+                        .with_context(|| format!("unknown tool '{name}'; run codegraph tools to list names"))?,
+                    None => codegraph_mcp::server::tools_list(),
+                };
+                println!("{definitions}");
             } else {
                 for (i, t) in codegraph_mcp::registry().iter().enumerate() {
                     println!("{:>2}. {:<30} {}", i + 1, t.name, t.description);

@@ -28,10 +28,18 @@ fn ok(id: &Value, result: Value) -> Value {
 }
 
 pub fn tools_list() -> Value {
-    let tools: Vec<Value> = tools::registry()
-        .into_iter()
-        .map(|t| json!({ "name": t.name, "description": t.description, "inputSchema": (t.schema)() }))
-        .collect();
+    tool_definitions(tools::registry())
+}
+
+/// Returns the same tool list envelope with a single exact name.
+pub fn tools_list_for(name: &str) -> Option<Value> {
+    let tool = tools::registry().into_iter().find(|tool| tool.name == name)?;
+    Some(tool_definitions([tool]))
+}
+
+fn tool_definitions(definitions: impl IntoIterator<Item = tools::ToolDef>) -> Value {
+    let tools: Vec<Value> =
+        definitions.into_iter().map(|t| json!({ "name": t.name, "description": t.description, "inputSchema": (t.schema)() })).collect();
     json!({ "tools": tools })
 }
 

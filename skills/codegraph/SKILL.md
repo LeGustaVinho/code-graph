@@ -5,7 +5,7 @@ description: Navigate C#, TypeScript/JS/TSX/JSX, Vue/Svelte, Python, Rust, Prism
 
 # CodeGraph navigation
 
-Use installed `mcp__codegraph__*` tools, or CLI: `codegraph query <tool> --root <repo> --args <json>` (Windows binary: `D:\Entidades\Gustavo\Projects\CodeGraph\target\release\codegraph.exe`). Pass JSON as a separate safely quoted argument. Output defaults to compact. Some tools also accept JSON output.
+Use installed `mcp__codegraph__*` tools, or CLI: `codegraph query <tool> --root <repo> --args <json>` (Windows binary: `D:\Entidades\Gustavo\Projects\CodeGraph\target\release\codegraph.exe`). Pass JSON as a separate safely quoted argument. Output defaults to compact. Some tools also accept JSON output. For a CLI tool's parameters, run `codegraph tools TOOL --json`.
 
 **Start with the smallest sufficient evidence.** Pass an already-known symbol or file straight to its tool; discovery is unnecessary. Usually set `max_token_budget:500`, `depth:1`, then expand only omitted evidence. Stop when file:line evidence answers the question. Count fallbacks and failed queries.
 
