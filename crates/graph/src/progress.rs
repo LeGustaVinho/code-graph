@@ -86,6 +86,11 @@ impl Progress {
         self.done.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Lets the source walker update discovery progress as files are found.
+    pub(crate) fn done_counter(&self) -> &AtomicUsize {
+        &self.done
+    }
+
     pub fn set_done(&self, done: usize) {
         self.done.store(done, Ordering::Relaxed);
     }
@@ -112,6 +117,22 @@ impl Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_updates_progress_through_the_shared_counter() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(project.path().join("README.md"), "# Project").unwrap();
+
+        let progress = Progress::new();
+        progress.begin(Stage::Discover, 0);
+        let files = codegraph_core::walk::discover_counting(project.path(), progress.done_counter());
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.stage, Stage::Discover);
+        assert_eq!(snapshot.total, 0);
+        assert_eq!(files.len(), 1);
+        assert_eq!(snapshot.done, files.len());
+    }
 
     #[test]
     fn percent_moves_within_the_stage_span() {

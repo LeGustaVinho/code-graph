@@ -60,18 +60,9 @@ pub fn index_project(root: &Path, conn: &mut Connection, opts: IndexOptions) -> 
 pub fn index_project_with(root: &Path, conn: &mut Connection, opts: IndexOptions, progress: &Progress) -> Result<IndexStats> {
     progress.begin(Stage::Discover, 0);
     let td = Instant::now();
-    let files = {
-        let found = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|s| {
-            let walk = s.spawn(|| discover_counting(root, &found));
-            while !walk.is_finished() {
-                progress.set_done(found.load(std::sync::atomic::Ordering::Relaxed));
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            walk.join().unwrap_or_default()
-        })
-    };
-    progress.set_done(files.len());
+    // Report discovery failure before computing removals from its result.
+    let files =
+        catch_unwind(|| discover_counting(root, progress.done_counter())).map_err(|_| anyhow::anyhow!("source discovery panicked"))?;
     tracing::debug!("discover: {} files in {} ms", files.len(), td.elapsed().as_millis());
     let on_disk: HashSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
     let known: Vec<String> = {
