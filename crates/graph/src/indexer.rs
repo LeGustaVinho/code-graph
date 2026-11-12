@@ -72,14 +72,14 @@ pub fn index_project_with(root: &Path, conn: &mut Connection, opts: IndexOptions
     };
     let removed: Vec<String> = known.into_iter().filter(|k| !on_disk.contains(k)).collect();
     // A different extractor build invalidates every cached fact.
-    let mut opts = opts;
-    if crate::store::get_meta(conn, "extractor_version").as_deref() != Some(codegraph_core::EXTRACTOR_VERSION) {
-        opts.rebuild = true;
-    }
+    let extractor_changed = store::get_meta(conn, "extractor_version").as_deref() != Some(codegraph_core::EXTRACTOR_VERSION);
+    let opts = IndexOptions { rebuild: opts.rebuild || extractor_changed };
     let stats = run(root, conn, files, removed, opts, progress);
     progress.begin(Stage::Done, 0);
     let stats = stats?;
-    crate::store::set_meta(conn, "extractor_version", codegraph_core::EXTRACTOR_VERSION)?;
+    if extractor_changed {
+        store::set_meta(conn, "extractor_version", codegraph_core::EXTRACTOR_VERSION)?;
+    }
     Ok(stats)
 }
 
@@ -211,15 +211,19 @@ fn run(
 
     // 2. Parallel Blake3 hashing + 3. parallel parsing of modified files.
     progress.begin(Stage::Read, to_hash.len());
-    let results: Vec<(SourceFile, String, Option<Vec<u8>>)> = to_hash
-        .into_par_iter()
-        .filter_map(|f| {
-            progress.tick();
-            let bytes = std::fs::read(&f.abs_path).ok()?;
-            let hash = codegraph_core::hash::content_hash(&bytes);
-            Some((f, hash, Some(bytes)))
-        })
-        .collect();
+    let results: Vec<(SourceFile, String, Option<Vec<u8>>)> = if to_hash.is_empty() {
+        Vec::new()
+    } else {
+        to_hash
+            .into_par_iter()
+            .filter_map(|f| {
+                progress.tick();
+                let bytes = std::fs::read(&f.abs_path).ok()?;
+                let hash = codegraph_core::hash::content_hash(&bytes);
+                Some((f, hash, Some(bytes)))
+            })
+            .collect()
+    };
     let mut touched = Vec::new();
     let mut to_parse = Vec::new();
     for (f, hash, bytes) in results {
@@ -235,23 +239,27 @@ fn run(
     // (row ids depend on insertion order).
     let mut to_parse: Vec<(usize, _)> = to_parse.into_iter().enumerate().collect();
     to_parse.sort_by_key(|(i, (_, _, bytes))| (std::cmp::Reverse(bytes.len()), *i));
-    let mut parsed: Vec<(usize, Parsed)> = extraction_pool().install(|| {
-        to_parse
-            .into_par_iter()
-            .with_max_len(1)
-            .map(|(i, (f, hash, bytes))| {
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                let rel = f.rel_path.clone();
-                let lang = f.language;
-                let facts =
-                    catch_unwind(AssertUnwindSafe(|| extract_file(&rel, lang, &text))).map_err(|_| "extractor panicked".to_string());
-                let stored = facts.as_ref().map(StoredFacts::of).unwrap_or_default();
-                let facts_json = if facts.is_ok() { serde_json::to_string(&stored).unwrap_or_default() } else { String::new() };
-                progress.tick();
-                (i, Parsed { file: f, hash, facts, stored, facts_json })
-            })
-            .collect()
-    });
+    let mut parsed: Vec<(usize, Parsed)> = if to_parse.is_empty() {
+        Vec::new()
+    } else {
+        extraction_pool().install(|| {
+            to_parse
+                .into_par_iter()
+                .with_max_len(1)
+                .map(|(i, (f, hash, bytes))| {
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    let rel = f.rel_path.clone();
+                    let lang = f.language;
+                    let facts =
+                        catch_unwind(AssertUnwindSafe(|| extract_file(&rel, lang, &text))).map_err(|_| "extractor panicked".to_string());
+                    let stored = facts.as_ref().map(StoredFacts::of).unwrap_or_default();
+                    let facts_json = if facts.is_ok() { serde_json::to_string(&stored).unwrap_or_default() } else { String::new() };
+                    progress.tick();
+                    (i, Parsed { file: f, hash, facts, stored, facts_json })
+                })
+                .collect()
+        })
+    };
     parsed.sort_by_key(|(i, _)| *i);
     let parsed: Vec<Parsed> = parsed.into_iter().map(|(_, p)| p).collect();
     stats.files_parsed = parsed.len();

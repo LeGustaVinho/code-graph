@@ -79,7 +79,9 @@ fn first_index_then_cache_hits() {
     assert!(s1.files_parsed >= 25, "{s1:?}");
     assert_eq!(s1.parse_errors, 0);
     assert_integrity(&conn);
+    let changes = conn.total_changes();
     let s2 = index_project(&root, &mut conn, IndexOptions::default()).unwrap();
+    assert_eq!(conn.total_changes(), changes, "a cache hit should leave the database untouched");
     assert_eq!(s2.files_parsed, 0, "unchanged files must not be reprocessed");
     assert_eq!(s2.files_hashed, 0, "mtime/size pre-filter avoids even hashing");
     assert_eq!(s2.files_unchanged, s1.files_total);
