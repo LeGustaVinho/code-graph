@@ -253,7 +253,7 @@ cp -r skills/codegraph ~/.codex/skills/
 cp -r skills/codegraph ~/.gemini/config/skills/
 ```
 
-If `codegraph` isn't on your `PATH`, edit the **Binary** line in the copied `SKILL.md` to point at your executable.
+Put `codegraph` on your `PATH` or use the executable's path in the copied skill's CLI command.
 
 ---
 

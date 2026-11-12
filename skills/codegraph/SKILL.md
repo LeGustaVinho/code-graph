@@ -1,28 +1,20 @@
 ---
 name: codegraph
-description: Navigate C#, TypeScript/JS/TSX/JSX, Vue/Svelte, Python, Rust, Prisma and configuration with indexed code symbols, flows, callers, tests, routes and types.
+description: Navigate indexed C#, TypeScript/JavaScript, Vue/Svelte, Python, Rust and Prisma code with CodeGraph.
 ---
 
-# CodeGraph navigation
+Use `mcp__codegraph__*` or `codegraph query TOOL --root REPO --args JSON`. Pass JSON as one safely quoted argument. Use the executable in CodeGraph's `target/release` if needed. List or inspect schemas with `codegraph tools [TOOL] --json`.
 
-Use installed `mcp__codegraph__*` tools, or CLI: `codegraph query <tool> --root <repo> --args <json>` (Windows binary: `D:\Entidades\Gustavo\Projects\CodeGraph\target\release\codegraph.exe`). Pass JSON as a separate safely quoted argument. Output defaults to compact. Some tools also accept JSON output. For a CLI tool's parameters, run `codegraph tools TOOL --json`.
+Start from a known path or symbol. Use `path:Name` in `symbol_id`. Try `max_token_budget:500` and `depth:1` where supported. Batch independent calls with `batch_query`. Expand only missing evidence. Cite file:line. Count failures and fallbacks.
 
-**Start with the smallest sufficient evidence.** Pass a known symbol or file straight to its tool. Use `path:Name` to qualify a declaration by file. Usually set `max_token_budget:500`, `depth:1`, then expand only omitted evidence. Stop when file:line evidence answers the question. Count fallbacks and failed queries.
+- Orient with `get_project_overview` or `get_entrypoints`. Find indexed paths by literal name or suffix with `find_files(query,path?)`.
+- Locate declarations with `search_universal(query,exact:true,kind?)`. Omit `exact` for fuzzy search.
+- Find text and comments with `search_source(query,path?,whole_word?)`. Both searches support `group_by_file:true`.
+- Read APIs with `get_file_skeleton` (`include_private:true` for private members) or `get_file_outline` (`include_signatures:true`). Read selected statements with `get_flow_evidence`. Outline `names` and flow `members` match exactly. Use `filter` instead for substrings.
+- Verify omitted logic with `get_symbol_body(symbol_id)`. Ranges require `start_line` and `end_line` (1-based inclusive, within the symbol). Use `file_path` with both bounds to cross declarations.
+- Navigate with `get_call_hierarchy` (`direction`, `show_sites:true`), `get_type_contract`, `get_type_hierarchy` and `get_tests_for_symbol`. Disambiguate overloads by signature, `sym_...` ID or `Name/<arity>` where supported. Exact edges can still be overload-ambiguous.
+- Trace HTTP registration, parsers and calls with `trace_fullstack_flow(api_route_or_call,route_evidence:true)`. Verify backend behavior at its source. Use `resolve_dependency_injection`, `get_state_mutations`, `trace_error_flow` or `get_config_matrix` as needed.
 
-| Goal | Tool |
-| --- | --- |
-| Project orientation | `get_project_overview(limit?,max_token_budget?)` for indexed languages, code directories and sampled entrypoints |
-| Locate an indexed file | `find_files(query,path?)` by filename or suffix, e.g. `renderer/main` |
-| Exact declaration | `search_universal(query,exact:true,kind?)`; omit `exact` for fuzzy discovery. Use `group_by_file:true` for multiple hits in the same file |
-| Text uses, comments, scoped absence | `search_source(query,path?,whole_word?,group_by_file?)` |
-| File API / named members | `get_file_skeleton(file_path,include_private?)` or `get_file_outline(file_path,names:[...],include_signatures:true?)` |
-| Type members / implementations | `get_type_contract(type_id)`, `get_type_hierarchy(symbol_id,direction?)` |
-| Method flow / guards / mutations | `get_flow_evidence(symbol_id,members:[...]?,max_lines?)` |
-| Callers / callees | `get_call_hierarchy(symbol_id,direction:"callers"|"callees",depth:1,show_sites:true)` |
-| Tests / config | `get_tests_for_symbol(symbol_id)`, `get_config_matrix(filter?,path?)` |
-| HTTP registration, body/parser wiring, direct calls | `trace_fullstack_flow(api_route_or_call,route_evidence:true)` |
-| Fullstack flows / DI / side effects | `trace_fullstack_flow`, `resolve_dependency_injection`, `get_state_mutations`, `trace_error_flow` |
+Zero text matches cover indexed, readable files only. A verified empty source scope has no supported files and needs no fallback. Verify missing paths, ignored files and index gaps before claiming absence. Use targeted conventional reads for verification or when CodeGraph is unavailable. Disclose fallbacks.
 
-`names`/`members` select multiple **exact** names in one query; `filter` is a substring alternative. `include_signatures:true` adds signatures to selected outline members. A type flow is an incomplete selection: inspect missing branches with `get_symbol_body(symbol_id,start_line?,end_line?)` (absolute inclusive bounds inside that symbol). For lines across declarations, use `get_symbol_body(file_path,start_line,end_line)`. Public skeletons omit private methods unless requested. For overloaded methods use an exact signature, `sym_...` ID or `Name/<arity>` where supported. An `exact` call edge can still be overload-ambiguous; Unity Inspector and dynamic bindings may lack static edges. **Honor the requested file types:** C# code-only reference searches must remain in `.cs` files, including conventional fallbacks; inspect Unity `.prefab`/`.unity` bindings only when explicitly requested.
-
-A zero text match covers only indexed, readable files. A `verified empty source scope` means the directory contains no supported source files and needs no fallback. Missing paths, ignored source files and other incomplete index coverage still require conventional verification before claiming absence. Never infer server behavior from a client call alone. Other tools: `batch_query`, `get_entrypoints`, `find_literal`, `get_data_model`, `get_impact_radius`, `get_structural_diff`. If CodeGraph is unavailable, use targeted conventional reads and disclose the fallback.
+Honor requested file types, including in fallbacks. Keep C# code-only references in `.cs`. Unity Inspector and dynamic bindings may evade static edges. Inspect `.prefab`/`.unity` only on request.
