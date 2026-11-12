@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
+use codegraph_semantic::index::{dirname, js_path_variants, normalize_path, strip_js_ext};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::Serialize;
 
@@ -54,7 +55,82 @@ pub fn resolve_file(conn: &Connection, input: &str) -> Result<Vec<String>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Finds nodes matching an id, qualified name, `Type.member`, name or `file:line` reference.
+/// Find the one exact target and the recorded module specifiers for a binding.
+fn exact_import_binding(conn: &Connection, file: &str, local: &str) -> Result<Option<(Node, Vec<Option<String>>)>> {
+    let mut st = conn.prepare_cached(
+        "SELECT target_id, json_group_array(DISTINCT json_extract(metadata, '$.module')) FROM edge
+         WHERE source_file = ?1 AND derived = 0 AND relation = 'IMPORTS' AND confidence = 'exact' AND target_id IS NOT NULL
+           AND CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.local') END = ?2 COLLATE BINARY
+         GROUP BY target_id LIMIT 2",
+    )?;
+    let mut targets = st.query_map(params![file, local], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    let Some((id, modules)) = targets.next().transpose()? else { return Ok(None) };
+    if targets.next().transpose()?.is_some() {
+        return Ok(None);
+    }
+    Ok(node(conn, &id)?.map(|target| (target, serde_json::from_str(&modules).unwrap_or_default())))
+}
+
+/// A module target can identify a file to refresh before its declaration exists.
+pub fn exact_import_file(conn: &Connection, file: &str, local: &str) -> Result<Option<String>> {
+    Ok(exact_import_binding(conn, file, local)?.map(|(target, _)| target.file_path))
+}
+
+fn indexed_js_path(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let candidates: Vec<_> = js_path_variants(key).collect();
+    let bind = vec!["?"; candidates.len()].join(",");
+    // SymbolIndex inserts file paths in sorted order, replacing earlier paths
+    // with the same module key. Match that order for literal candidate paths.
+    let mut st = conn.prepare_cached(&format!(
+        "SELECT file_path FROM file_meta WHERE file_path IN ({bind}) AND status = 'indexed'
+         AND language IN ('typescript', 'javascript') ORDER BY file_path DESC LIMIT 1"
+    ))?;
+    Ok(st.query_row(params_from_iter(candidates), |row| row.get(0)).optional()?)
+}
+
+fn relative_js_import_file(conn: &Connection, file: &str, specifier: &str) -> Result<Option<String>> {
+    if !matches!(specifier, "." | "..") && !specifier.starts_with("./") && !specifier.starts_with("../") {
+        return Ok(None);
+    }
+    let dir = dirname(file);
+    let mut depth = dir.split('/').filter(|segment| !segment.is_empty()).count();
+    for segment in specifier.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." if depth == 0 => return Ok(None),
+            ".." => depth -= 1,
+            _ => depth += 1,
+        }
+    }
+    let base = normalize_path(&format!("{dir}/{specifier}"));
+    if let Some(target) = indexed_js_path(conn, strip_js_ext(&base))? {
+        return Ok(Some(target));
+    }
+    indexed_js_path(conn, &format!("{base}/index"))
+}
+
+fn scoped_import_declaration(conn: &Connection, file: &str, local: &str) -> Result<Option<Node>> {
+    let Some((target, modules)) = exact_import_binding(conn, file, local)? else { return Ok(None) };
+    if matches!(target.sym.kind, codegraph_core::SymbolKind::Module | codegraph_core::SymbolKind::Literal) {
+        return Ok(None);
+    }
+    if matches!(target.language.as_str(), "typescript" | "javascript") {
+        // The import edge's confidence proves module resolution. Only follow a
+        // JS/TS declaration when it is exported by that very module.
+        if !target.sym.is_exported || modules.is_empty() {
+            return Ok(None);
+        }
+        for specifier in modules {
+            let Some(specifier) = specifier else { return Ok(None) };
+            if relative_js_import_file(conn, file, &specifier)?.as_deref() != Some(target.file_path.as_str()) {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(target))
+}
+
+/// Finds nodes matching an id, qualified name, `Type.member`, name, `file:name` or `file:line` reference.
 pub fn find_nodes(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>> {
     let q = query.trim();
     if q.is_empty() {
@@ -77,8 +153,9 @@ pub fn find_nodes(conn: &Connection, query: &str, limit: usize) -> Result<Vec<No
                 }
             }
         } else if !f.ends_with(':') && !l.is_empty() && f.contains('.') {
-            // file:name → that name (or `outer.name`) declared in the file.
-            if let Some(file) = resolve_file(conn, f)?.first() {
+            // file:name → a local declaration or a proven import binding.
+            let files = resolve_file(conn, f)?;
+            if let Some(file) = files.first() {
                 let suffix = format!(".{l}");
                 // Match case exactly before trying the legacy case-insensitive
                 // qualified suffix. This keeps open distinct from Command.Open.
@@ -92,6 +169,11 @@ pub fn find_nodes(conn: &Connection, query: &str, limit: usize) -> Result<Vec<No
                         st.query_map(params![file, l, suffix, limit as i64], node_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
                     if !rows.is_empty() {
                         return Ok(rows);
+                    }
+                    if collation == "BINARY" && files.len() == 1 && limit > 0 {
+                        if let Some(target) = scoped_import_declaration(conn, file, l)? {
+                            return Ok(vec![target]);
+                        }
                     }
                 }
             }

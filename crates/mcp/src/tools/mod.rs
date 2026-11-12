@@ -196,9 +196,10 @@ pub fn registry() -> Vec<ToolDef> {
 }
 
 /// Files referenced by a tool call (used for the targeted freshness check).
-fn hint_files(conn: &Connection, args: &Value) -> Vec<String> {
+fn hint_files(conn: &Connection, args: &Value) -> (Vec<String>, bool) {
     let mut out = Vec::new();
-    let Some(obj) = args.as_object() else { return out };
+    let mut scoped = false;
+    let Some(obj) = args.as_object() else { return (out, scoped) };
     for (k, v) in obj {
         let mut vals: Vec<&str> = Vec::new();
         match v {
@@ -210,15 +211,49 @@ fn hint_files(conn: &Connection, args: &Value) -> Vec<String> {
             if k == "file_path" || k == "path" {
                 out.extend(query::resolve_file(conn, s).unwrap_or_default().into_iter().take(1));
             } else if matches!(k.as_str(), "symbol_id" | "symbol" | "symbols" | "source" | "target" | "type_id") {
-                if let Ok(nodes) = query::find_nodes(conn, s, 2) {
-                    out.extend(nodes.into_iter().map(|n| n.file_path));
+                let (base, _, _) = split_overload(s);
+                // Refresh the importer's own file even when its previous index
+                // has no symbol or import binding for the requested name.
+                let importer = base
+                    .rsplit_once(':')
+                    .filter(|(file, name)| !file.ends_with(':') && !name.is_empty() && file.contains('.'))
+                    .and_then(|(file, name)| {
+                        let mut files = query::resolve_file(conn, file).ok()?;
+                        (files.len() == 1).then(|| (files.pop().unwrap(), name))
+                    });
+                let nodes = match query::find_nodes(conn, s, 2) {
+                    Ok(nodes) if nodes.is_empty() && base != s.trim() => query::find_nodes(conn, base, 2).unwrap_or_default(),
+                    Ok(nodes) => nodes,
+                    Err(_) => Vec::new(),
+                };
+                if let Some((file, name)) = importer {
+                    scoped = true;
+                    if nodes.iter().all(|node| node.file_path == file) {
+                        if let Ok(Some(target)) = query::exact_import_file(conn, &file, name) {
+                            out.push(target);
+                        }
+                    }
+                    out.push(file);
                 }
+                out.extend(nodes.into_iter().map(|n| n.file_path));
             }
         }
     }
     out.sort();
     out.dedup();
-    out
+    (out, scoped)
+}
+
+fn refresh_new_scoped_targets(engine: &Engine, args: &Value, previous: &[String]) {
+    let Ok(conn) = engine.reader() else { return };
+    let (mut targets, _) = hint_files(&conn, args);
+    drop(conn);
+    targets.retain(|path| previous.binary_search(path).is_err());
+    if !targets.is_empty() {
+        if let Err(e) = engine.ensure_fresh(&targets) {
+            tracing::warn!("freshness check for updated scoped target failed: {e:#}");
+        }
+    }
 }
 
 /// Runs a tool without freshness checks (used by `batch_query`).
@@ -239,10 +274,12 @@ pub fn call_tool(engine: &Engine, name: &str, args: Value) -> (String, bool) {
     let reads_file = name == "get_symbol_body" && args.get("file_path").is_some_and(Value::is_string);
     if !reads_file {
         if let Ok(c) = engine.reader() {
-            let hints = hint_files(&c, &args);
+            let (hints, scoped) = hint_files(&c, &args);
             drop(c);
-            if let Err(e) = engine.ensure_fresh(&hints) {
-                tracing::warn!("freshness check failed: {e:#}");
+            match engine.ensure_fresh(&hints) {
+                Ok(Some(_)) if scoped => refresh_new_scoped_targets(engine, &args, &hints),
+                Err(e) => tracing::warn!("freshness check failed: {e:#}"),
+                _ => {}
             }
         }
     }

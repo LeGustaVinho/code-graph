@@ -84,13 +84,21 @@ pub struct SymbolIndex {
 
 const JS_EXTS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"];
 
-fn strip_js_ext(path: &str) -> &str {
+/// Removes the extension ignored by the JS/TS module index.
+pub fn strip_js_ext(path: &str) -> &str {
     for e in JS_EXTS {
         if let Some(p) = path.strip_suffix(e) {
             return p;
         }
     }
     path
+}
+
+/// Literal file names that would be recorded under this JS/TS module key.
+pub fn js_path_variants(key: &str) -> impl Iterator<Item = String> + '_ {
+    std::iter::once(key.to_owned())
+        .chain(JS_EXTS.iter().map(move |ext| format!("{key}{ext}")))
+        .filter(move |path| strip_js_ext(path) == key)
 }
 
 /// `**` matches any number of path segments, `*` / `?` / `{a,b}` within one segment.

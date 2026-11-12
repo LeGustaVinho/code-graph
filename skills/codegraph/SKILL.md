@@ -5,7 +5,7 @@ description: Navigate indexed C#, TypeScript/JavaScript, Vue/Svelte, Python, Rus
 
 Use `mcp__codegraph__*` or `codegraph query TOOL --root REPO --args JSON`. Pass JSON as one safely quoted argument. Use the executable in CodeGraph's `target/release` if needed. List or inspect schemas with `codegraph tools [TOOL] --json`.
 
-Start from a known path or symbol. Use `path:Name` in `symbol_id`. Try `max_token_budget:500` and `depth:1` where supported. Batch independent calls with `batch_query`. Expand only missing evidence. Cite file:line. Count failures and fallbacks.
+Start from a known path or symbol. Use `path:Name` in `symbol_id` for local declarations or resolved imports. Try `max_token_budget:500` and `depth:1` where supported. Batch independent calls with `batch_query`. Expand only missing evidence. Cite file:line. Count failures and fallbacks.
 
 - Orient with `get_project_overview(path?)` or `get_entrypoints`. Find indexed paths by literal name or suffix with `find_files(query,path?)`.
 - Locate declarations with `search_universal(query,exact:true,kind?)`. Omit `exact` for fuzzy search.
