@@ -5,12 +5,13 @@ description: Navigate C#, TypeScript/JS/TSX/JSX, Vue/Svelte, Python, Rust, Prism
 
 # CodeGraph navigation
 
-Use installed `mcp__codegraph__*` tools, or CLI: `codegraph query <tool> --root <repo> --args <json>` (Windows binary: `D:\Entidades\Gustavo\Projects\CodeGraph\target\release\codegraph.exe`). Pass JSON as a separate safely quoted argument. Output defaults to compact; JSON is opt-in.
+Use installed `mcp__codegraph__*` tools, or CLI: `codegraph query <tool> --root <repo> --args <json>` (Windows binary: `D:\Entidades\Gustavo\Projects\CodeGraph\target\release\codegraph.exe`). Pass JSON as a separate safely quoted argument. Output defaults to compact. Some tools also accept JSON output.
 
 **Start with the smallest sufficient evidence.** Pass an already-known symbol or file straight to its tool; discovery is unnecessary. Usually set `max_token_budget:500`, `depth:1`, then expand only omitted evidence. Stop when file:line evidence answers the question. Count fallbacks and failed queries.
 
 | Goal | Tool |
 | --- | --- |
+| Project orientation | `get_project_overview(limit?,max_token_budget?)` for indexed languages, code directories and sampled entrypoints |
 | Exact declaration | `search_universal(query,exact:true,kind?)`; omit `exact` for fuzzy discovery. Use `group_by_file:true` for multiple hits in the same file |
 | Text uses, comments, scoped absence | `search_source(query,path?,whole_word?)` |
 | File API / named members | `get_file_skeleton(file_path,include_private?)` or `get_file_outline(file_path,names:[...],include_signatures:true?)` |

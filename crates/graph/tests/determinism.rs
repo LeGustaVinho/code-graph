@@ -156,6 +156,7 @@ fn tool_calls() -> Vec<(&'static str, Value)> {
         ("get_file_skeleton", json!({ "file_path": "backend-python/app/services.py" })),
         ("simulate_signature_change", json!({ "symbol_id": "OrderService.PlaceOrderAsync", "new_param_count": 3 })),
         ("get_flow_diagram", json!({ "symbols": ["OrderList", "OrderService.CancelOrderAsync"] })),
+        ("get_project_overview", json!({})),
         ("search_universal", json!({ "query": "Order" })),
         ("search_source", json!({ "query": "IHandler", "path": "backend-dotnet/Handlers", "limit": 10 })),
         ("search_universal", json!({ "query": "Handler", "limit": 50 })),

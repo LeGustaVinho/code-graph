@@ -3,7 +3,7 @@ name = "codegraph-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CodeGraph MCP server (JSON-RPC 2.0 over stdio) exposing 28 analytical tools with token budgets"
+description = "CodeGraph MCP server (JSON-RPC 2.0 over stdio) exposing analytical tools with token budgets"
 
 [dependencies]
 codegraph-core.workspace = true

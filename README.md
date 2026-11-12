@@ -33,7 +33,7 @@
   - [Windsurf & VS Code Extensions](#windsurf--vs-code-extensions)
 - [Agent Skills (Claude Code, Codex, Antigravity)](#agent-skills-claude-code-codex-antigravity)
 - [Confidence Levels & Evidence Tracing](#confidence-levels--evidence-tracing)
-- [MCP Toolset (28 Analytical Tools)](#mcp-toolset-28-analytical-tools)
+- [MCP Toolset](#mcp-toolset)
 - [Interactive Graph Explorer (`codegraph ui`)](#interactive-graph-explorer-codegraph-ui)
 - [Architecture Governance & Boundary Enforcement](#architecture-governance--boundary-enforcement)
 - [Supported Languages & Ecosystems](#supported-languages--ecosystems)
@@ -53,7 +53,7 @@ Modern AI coding assistants (Claude Code, Cursor, Copilot, Antigravity, Roo Code
 **CodeGraph** solves this by parsing your repository into a **deep semantic knowledge graph** stored in an embedded SQLite database (`WAL` mode + `FTS5` trigram tokenization). Every relationship is assigned a **formal confidence level** backed by concrete source evidence.
 
 CodeGraph exposes this graph through three interfaces:
-1. **MCP Server** (JSON-RPC 2.0 over `stdio`): 28 high-precision analytical tools with strict token budget controls (`max_token_budget`) and automatic freshness verification.
+1. **MCP Server** (JSON-RPC 2.0 over `stdio`): analytical tools with strict token budget controls (`max_token_budget`) and automatic freshness verification.
 2. **Interactive Visual Explorer** (`http://localhost:4321`): Embedded Axum web server and Cytoscape.js SPA with dark/light themes, keyboard navigation, and multilingual support (English, Portuguese, Spanish).
 3. **Command-Line Interface (CLI)**: Fast commands for indexing, querying, inspecting AST facts, and checking architectural boundaries.
 
@@ -101,7 +101,7 @@ flowchart TD
     end
 
     subgraph Interfaces["Surfaces"]
-        MCP["MCP Server (stdio, JSON-RPC 2.0)\n28 Analytical Tools + Token Budgets"]
+        MCP["MCP Server (stdio, JSON-RPC 2.0)\nAnalytical Tools + Token Budgets"]
         UI["Axum Web Server + Cytoscape SPA\n(http://localhost:4321)"]
         CLI["CLI Commands\n(index, query, status, dump-ast, facts)"]
     end
@@ -274,9 +274,9 @@ src/auth.ts:10 AuthStore.login -> src/utils/hash.ts:3 hash [exact: direct import
 
 ---
 
-## MCP Toolset (28 Analytical Tools)
+## MCP Toolset
 
-CodeGraph equips AI agents with 28 specialized analytical tools designed to minimize context window consumption while delivering comprehensive architectural insights:
+CodeGraph equips AI agents with specialized analytical tools designed to minimize context window consumption while delivering comprehensive architectural insights:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -306,7 +306,8 @@ CodeGraph equips AI agents with 28 specialized analytical tools designed to mini
 - **`simulate_signature_change`**: Simulates modifying a function's parameter count: flags broken callers, interface contract discrepancies, and overloaded callsites before code is edited.
 - **`get_flow_diagram`**: Generates a compact Mermaid flowchart (3–6 hops) around a symbol. Line styles represent confidence (`solid` = exact, `dotted` = inferred, `cross` = unresolved).
 
-### 2. Symbol & Literal Discovery
+### 2. Project, Symbol & Literal Discovery
+- **`get_project_overview`**: Start an unfamiliar project with index coverage, language counts, groups by the first two directory levels, and representative non-test entrypoints with file and line evidence. Use `limit` to bound samples per section (default 8), or `max_token_budget` to bound the response.
 - **`search_universal`**: Sub-millisecond ranked FTS5 trigram search across classes, functions, variables, constants, and data models. Supports kind filtering and token limits. Set `group_by_file: true` to share the file path across adjacent matches while retaining search rank, line ranges, and signatures. Indented matches use the path from the preceding unindented match. JSON output retains a full path per match.
 - **`find_literal`**: Pinpoints string/number literals (URLs, route patterns, SQL fragments, error messages, config keys) with exact coordinates and enclosing symbols.
 - **`find_variable_or_const`**: Locates variable, constant, or property declarations alongside all read (`READS_VAR`) and write (`WRITES_VAR`) sites.
@@ -443,7 +444,7 @@ codegraph [COMMAND] [OPTIONS]
 | `mcp` (alias: `serve`) | `[--root <path>] [--no-watch]` | Launches the MCP server over stdio for AI coding assistants. |
 | `ui` | `[path] [--port <p>] [--host <h>] [--no-open]` | Starts the local interactive Graph Explorer (defaults to `127.0.0.1:4321`). |
 | `query` | `<tool> [--args <json>] [--root <path>]` | Runs an MCP tool directly from the terminal and prints the formatted output. |
-| `tools` | `[--json]` | Lists all 28 registered MCP tools and their parameter schemas. |
+| `tools` | `[--json]` | Lists the registered MCP tools and their parameter schemas. |
 | `status` | `[path]` | Displays index metadata, stale file counts, node counts, and edge statistics. |
 | `dump-ast` | `<file>` | Dumps the Tree-sitter syntax tree with line ranges (useful for debugging). |
 | `facts` | `<file>` | Outputs extracted syntactic facts (symbols, refs, imports, mutations) as JSON. |

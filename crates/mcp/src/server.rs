@@ -16,7 +16,7 @@ pub const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-
 
 const INSTRUCTIONS: &str = "CodeGraph indexes this repository into a semantic graph (C#, TypeScript/JavaScript incl. Vue/Svelte components, Python, Rust, Prisma). \
 Every relation carries a confidence level: exact (proven by imports/types/DI), inferred (naming, identical HTTP routes) or unresolved (ambiguous/dynamic). \
-Results use exact `path:start-end` coordinates. Prefer get_file_skeleton / get_file_outline / get_symbol_body over reading whole files, \
+Start unfamiliar projects with get_project_overview. Results use path and line coordinates. Prefer get_file_skeleton / get_file_outline / get_symbol_body over reading whole files, \
 use search_universal to locate symbols, and pass max_token_budget to bound any answer. batch_query runs several tools in one call.";
 
 fn error(id: &Value, code: i64, message: &str) -> Value {

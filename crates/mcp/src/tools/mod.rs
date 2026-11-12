@@ -1,4 +1,4 @@
-//! The 28 analytical MCP tools.
+//! Analytical MCP tools.
 //!
 //! Every tool returns an [`Out`] (header lines + result items). The dispatcher applies
 //! the optional `max_token_budget` uniformly, emitting an explicit
@@ -17,6 +17,8 @@ mod git;
 mod governance;
 #[allow(dead_code)]
 mod navigation;
+#[allow(dead_code)]
+mod overview;
 #[allow(dead_code)]
 mod tokens;
 
@@ -157,6 +159,7 @@ pub fn registry() -> Vec<ToolDef> {
         tool!("simulate_signature_change", "Simulate changing a function's parameter count: lists call sites that would break (arg count mismatch), overrides/interface declarations to update, and ambiguous call sites.", tokens::SimulateParams, tokens::simulate_signature_change),
         tool!("get_flow_diagram", "Tiny Mermaid flowchart (3-6 edges) of calls between the given symbols, or around a single symbol. Line style encodes confidence (solid exact, dotted inferred, x unresolved).", tokens::FlowParams, tokens::get_flow_diagram),
         // 5.2 Discovery
+        tool!("get_project_overview", "Orient in an indexed project: code coverage, languages, directory groups and representative entrypoints with locations.", overview::OverviewParams, overview::get_project_overview),
         tool!("search_universal", "Find declarations by ranked fuzzy search (name, signature, path). Use exact=true for case-sensitive exact name/qualified_name matches to exclude similar symbols; optional kind and token budget.", discovery::SearchParams, discovery::search_universal),
         tool!("search_source", "Find literal source-text occurrences (including comments) with file:line evidence in indexed readable files, optionally restricted to root-relative file/directory. Existing directories with no supported source files return a verified empty scope; directories with unindexed supported source retain an explicit error. Supports whole_word and case_sensitive.", discovery::SourceSearchParams, discovery::search_source),
         tool!("find_literal", "Find string/number literals (routes, error messages, config keys, SQL) with exact locations and enclosing symbols.", discovery::LiteralParams, discovery::find_literal),
