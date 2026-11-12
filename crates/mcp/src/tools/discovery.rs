@@ -193,7 +193,23 @@ fn source_excerpt(line: &str, found: Range<usize>, case_sensitive: bool) -> Cow<
     Cow::Owned(format!("{before}{}{after}", &text[start..end]))
 }
 
-fn matches_scope(file: &str, scope: &str) -> bool {
+pub(super) fn normalize_scope(path: &str) -> Result<String, super::ToolError> {
+    use std::path::Component;
+
+    let path = path.trim().replace('\\', "/");
+    let path = path.trim_start_matches("./").trim_end_matches('/');
+    let path = if path == "." { "" } else { path };
+    let mut parts = Vec::new();
+    for part in Path::new(path).components() {
+        let Component::Normal(name) = part else {
+            return Err(super::ToolError::BadArgs("path must be relative to project root".into()));
+        };
+        parts.push(name.to_string_lossy());
+    }
+    Ok(parts.join("/"))
+}
+
+pub(super) fn matches_scope(file: &str, scope: &str) -> bool {
     if scope.is_empty() {
         return true;
     }
@@ -262,13 +278,7 @@ pub fn search_source(ctx: &Ctx, p: SourceSearchParams) -> ToolResult {
     if needle.is_empty() {
         return Err(super::ToolError::BadArgs("query must not be empty".into()));
     }
-    let scope = p.path.as_deref().unwrap_or("").trim().replace('\\', "/");
-    let scope = scope.trim_start_matches("./").trim_end_matches('/');
-    let scope = if scope == "." { "" } else { scope };
-    if !scope.is_empty() && !Path::new(scope).components().all(|c| matches!(c, std::path::Component::Normal(_))) {
-        return Err(super::ToolError::BadArgs("path must be relative to project root".into()));
-    }
-    let scope = Path::new(scope).components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join("/");
+    let scope = normalize_scope(p.path.as_deref().unwrap_or(""))?;
     let scope = scope.as_str();
     let mut st = ctx.conn.prepare(
         "SELECT file_path, status FROM file_meta ORDER BY file_path",

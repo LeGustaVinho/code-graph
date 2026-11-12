@@ -10,6 +10,8 @@ mod behavior;
 mod data;
 #[allow(dead_code)]
 mod discovery;
+#[allow(dead_code)]
+mod files;
 pub mod fmt;
 #[allow(dead_code)]
 mod git;
@@ -159,6 +161,7 @@ pub fn registry() -> Vec<ToolDef> {
         tool!("simulate_signature_change", "Simulate changing a function's parameter count: lists call sites that would break (arg count mismatch), overrides/interface declarations to update, and ambiguous call sites.", tokens::SimulateParams, tokens::simulate_signature_change),
         tool!("get_flow_diagram", "Tiny Mermaid flowchart (3-6 edges) of calls between the given symbols, or around a single symbol. Line style encodes confidence (solid exact, dotted inferred, x unresolved).", tokens::FlowParams, tokens::get_flow_diagram),
         // 5.2 Discovery
+        tool!("find_files", "Find indexed paths by literal filename or path suffix, optionally under a root-relative path. Ranks exact names before prefixes and substrings.", files::FindFilesParams, files::find_files),
         tool!("get_project_overview", "Orient in an indexed project: code coverage, languages, directory groups and representative entrypoints with locations.", overview::OverviewParams, overview::get_project_overview),
         tool!("search_universal", "Find declarations by ranked fuzzy search (name, signature, path). Use exact=true for case-sensitive exact name/qualified_name matches to exclude similar symbols; optional kind and token budget.", discovery::SearchParams, discovery::search_universal),
         tool!("search_source", "Find literal source-text occurrences (including comments) with file:line evidence in indexed readable files, optionally restricted to root-relative file/directory. Existing directories with no supported source files return a verified empty scope; directories with unindexed supported source retain an explicit error. Supports whole_word and case_sensitive.", discovery::SourceSearchParams, discovery::search_source),

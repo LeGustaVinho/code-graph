@@ -12,6 +12,7 @@ Use installed `mcp__codegraph__*` tools, or CLI: `codegraph query <tool> --root 
 | Goal | Tool |
 | --- | --- |
 | Project orientation | `get_project_overview(limit?,max_token_budget?)` for indexed languages, code directories and sampled entrypoints |
+| Locate an indexed file | `find_files(query,path?)` by filename or suffix, e.g. `renderer/main` |
 | Exact declaration | `search_universal(query,exact:true,kind?)`; omit `exact` for fuzzy discovery. Use `group_by_file:true` for multiple hits in the same file |
 | Text uses, comments, scoped absence | `search_source(query,path?,whole_word?,group_by_file?)` |
 | File API / named members | `get_file_skeleton(file_path,include_private?)` or `get_file_outline(file_path,names:[...],include_signatures:true?)` |

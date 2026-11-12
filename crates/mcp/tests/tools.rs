@@ -273,7 +273,7 @@ fn mcp_protocol_messages() {
     assert!(server::handle(&e, &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).is_none());
     let list = server::handle(&e, &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })).unwrap();
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 31);
+    assert_eq!(tools.len(), 32);
     for t in tools {
         assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
         assert!(t["description"].as_str().unwrap().len() > 20);
@@ -314,6 +314,7 @@ fn all_tools_answer() {
         ),
         ("get_flow_diagram", json!({ "symbols": ["OrderList", "OrderService.CancelOrderAsync"] }), "flowchart LR"),
         ("get_project_overview", json!({}), "Code areas:"),
+        ("find_files", json!({ "query": "OrderService.cs" }), "backend-dotnet/Services/OrderService.cs"),
         ("search_universal", json!({ "query": "ItemServ" }), "class ItemService"),
         ("find_literal", json!({ "query": "/api/orders", "exact": true }), "frontend-react/src/api/orders.ts:11"),
         ("find_variable_or_const", json!({ "name": "CACHE" }), "W backend-python/app/services.py:20"),
@@ -356,7 +357,7 @@ fn all_tools_answer() {
     } else {
         eprintln!("git unavailable: skipping get_structural_diff / get_changed_subgraph");
     }
-    assert_eq!(codegraph_mcp::registry().len(), 31);
+    assert_eq!(codegraph_mcp::registry().len(), 32);
 }
 
 #[test]
