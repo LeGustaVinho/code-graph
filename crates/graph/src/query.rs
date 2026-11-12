@@ -46,11 +46,12 @@ pub fn resolve_file(conn: &Connection, input: &str) -> Result<Vec<String>> {
     if let Some(e) = exact {
         return Ok(vec![e]);
     }
-    let mut st = conn.prepare("SELECT file_path FROM file_meta WHERE file_path LIKE ?1 ORDER BY length(file_path), file_path LIMIT 20")?;
-    let rows = st.query_map([format!("%{norm}")], |r| r.get::<_, String>(0))?;
-    let v: Vec<String> =
-        rows.flatten().filter(|p| p.ends_with(&norm) && (p.len() == norm.len() || p[..p.len() - norm.len()].ends_with('/'))).collect();
-    Ok(v)
+    // Apply the literal path-component boundary before the result limit.
+    let mut st = conn.prepare(
+        "SELECT file_path FROM file_meta WHERE substr(file_path, -length(?1)) = ?1 ORDER BY length(file_path), file_path LIMIT 20",
+    )?;
+    let rows = st.query_map([format!("/{norm}")], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Finds nodes matching an id, qualified name, `Type.member`, name or `file:line` reference.
@@ -78,13 +79,20 @@ pub fn find_nodes(conn: &Connection, query: &str, limit: usize) -> Result<Vec<No
         } else if !f.ends_with(':') && !l.is_empty() && f.contains('.') {
             // file:name → that name (or `outer.name`) declared in the file.
             if let Some(file) = resolve_file(conn, f)?.first() {
-                let mut st = conn.prepare(&format!(
-                    "SELECT {NODE_COLS} FROM node WHERE file_path = ?1 AND derived = 0 AND kind NOT IN ('module', 'literal') \
-                     AND (name = ?2 OR qualified_name = ?2 OR qualified_name LIKE '%.' || ?2) ORDER BY length(qualified_name), start_line, id LIMIT ?3"
-                ))?;
-                let rows: Vec<Node> = st.query_map(params![file, l, limit as i64], node_from_row)?.flatten().collect();
-                if !rows.is_empty() {
-                    return Ok(rows);
+                let suffix = format!(".{l}");
+                // Match case exactly before trying the legacy case-insensitive
+                // qualified suffix. This keeps open distinct from Command.Open.
+                for collation in ["BINARY", "NOCASE"] {
+                    let mut st = conn.prepare(&format!(
+                        "SELECT {NODE_COLS} FROM node WHERE file_path = ?1 AND derived = 0 AND kind NOT IN ('module', 'literal') \
+                         AND (name = ?2 OR qualified_name = ?2 OR substr(qualified_name, -length(?3)) = ?3 COLLATE {collation}) \
+                         ORDER BY length(qualified_name), start_line, id LIMIT ?4"
+                    ))?;
+                    let rows =
+                        st.query_map(params![file, l, suffix, limit as i64], node_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    if !rows.is_empty() {
+                        return Ok(rows);
+                    }
                 }
             }
         }
