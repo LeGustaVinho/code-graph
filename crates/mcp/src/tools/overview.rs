@@ -1,5 +1,7 @@
 //! A compact orientation pass over the indexed project.
 
+mod runtime;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use codegraph_core::extract::truncate;
@@ -15,6 +17,8 @@ use super::{Ctx, Out, ToolResult};
 pub struct OverviewParams {
     /// Optional root-relative file or directory. Counts and samples only cover this indexed scope.
     pub path: Option<String>,
+    /// Show configured Electron and Tauri boot evidence instead of the general overview.
+    pub runtime: Option<bool>,
     /// Maximum code areas and entrypoint samples per section (default 8, max 30).
     pub limit: Option<usize>,
     /// Optional output token budget.
@@ -148,6 +152,9 @@ pub fn get_project_overview(ctx: &Ctx, p: OverviewParams) -> ToolResult {
     let limit = p.limit.unwrap_or(8).clamp(1, 30);
     let scope = normalize_scope(p.path.as_deref().unwrap_or(""))?;
     let scope = scope.as_str();
+    if p.runtime.unwrap_or_default() {
+        return runtime::render(ctx, scope, limit);
+    }
     // The watcher may commit between queries. Keep coverage and samples on one snapshot.
     let tx = ctx.conn.unchecked_transaction()?;
     let inventory = inventory(&tx, scope)?;

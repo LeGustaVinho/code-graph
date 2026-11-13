@@ -5,7 +5,7 @@ description: Navigate indexed C#, TypeScript/JavaScript, Vue/Svelte, Python, Rus
 
 Use CodeGraph MCP or `codegraph query TOOL --root REPO --args JSON` (one quoted JSON argument, binary in CodeGraph `target/release`). Start from known paths or symbols, use `max_token_budget:500` and `depth:1` where supported, and cite file:line.
 
-- Orient with `get_project_overview(path?)`. Find indexed filenames or suffixes with `find_files(query,path?)`.
+- Orient with `get_project_overview(path?)`. Set `runtime:true` for Electron/Tauri boot evidence. Find indexed filenames or suffixes with `find_files(query,path?)`.
 - Find declarations with `search_universal(query,exact:true,kind?)` or omit `exact` for fuzzy search. For text and comments use `search_source(query,path?,whole_word?)` or `queries:[...]` in one scope. Both support `group_by_file:true`.
 - Use `get_file_outline(file_path,names?,include_signatures?)` or `get_flow_evidence(symbol_id,members?)`. `names`/`members` match exactly. Use `filter` instead for substrings.
 - Use `get_symbol_body(symbol_id)`. For ranges, both `start_line`/`end_line` are inclusive absolute lines within the symbol. With both bounds, use `file_path` instead to cross declarations.
