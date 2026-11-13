@@ -226,6 +226,12 @@ For extensions supporting MCP servers over standard input/output (e.g. Continue,
 > [!TIP]
 > If `--root` is omitted from `args`, CodeGraph checks the `CODEGRAPH_ROOT` environment variable and falls back to the current working directory. Logs are written exclusively to `stderr` (`CODEGRAPH_LOG=debug` or `warn`), leaving `stdout` clean for JSON-RPC messages.
 
+### Compact MCP tool catalog
+
+Add `"--tool-profile", "compact"` to the MCP `args` array and restart the server to advertise a smaller catalog. The default `full` profile advertises every tool. In compact mode, call `get_tool_schema` with no arguments for the names of all tools or with `{"name":"get_file_skeleton"}` for one exact schema. Run tools outside the advertised catalog with `batch_query`, using `{"operations":[{"tool":"get_file_skeleton","args":{"file_path":"src/main.rs"}}]}` for example.
+
+`get_tool_schema` is available through the compact MCP server. The CLI commands `codegraph tools --json` and `codegraph query` still use the full registry. MCP clients may pass a different representation of tool definitions to the model, so context savings vary by client.
+
 ---
 
 ## Agent Skills (Claude Code, Codex, Antigravity)
@@ -443,7 +449,7 @@ codegraph [COMMAND] [OPTIONS]
 | Command | Arguments / Flags | Description |
 |---|---|---|
 | `index` | `[path] [--rebuild] [--json]` | Incrementally indexes the specified directory (defaults to current dir). |
-| `mcp` (alias: `serve`) | `[--root <path>] [--no-watch]` | Launches the MCP server over stdio for AI coding assistants. |
+| `mcp` (alias: `serve`) | `[--root <path>] [--no-watch] [--tool-profile <profile>]` | Launches the MCP server over stdio. Use `full` (default) or `compact` for the advertised tool catalog. |
 | `ui` | `[path] [--port <p>] [--host <h>] [--no-open]` | Starts the local interactive Graph Explorer (defaults to `127.0.0.1:4321`). |
 | `query` | `<tool> [--args <json>] [--root <path>]` | Runs an MCP tool directly from the terminal and prints the formatted output. |
 | `tools` | `[TOOL] [--json]` | Lists tools as text or compact JSON. Pass a tool name with `--json` to fetch only its schema, e.g. `codegraph tools search_universal --json`. |

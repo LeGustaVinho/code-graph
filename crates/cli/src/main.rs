@@ -4,9 +4,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use codegraph_core::lang::{parse, Language};
 use codegraph_graph::{index_project_with, IndexOptions, Progress, Stage};
+use codegraph_mcp::server::ToolProfile;
 use codegraph_mcp::Engine;
 
 #[derive(Parser)]
@@ -19,6 +20,12 @@ use codegraph_mcp::Engine;
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum McpToolProfile {
+    Full,
+    Compact,
 }
 
 #[derive(Subcommand)]
@@ -45,6 +52,9 @@ enum Cmd {
         /// Disable the file watcher (stat-based freshness checks are used instead)
         #[arg(long)]
         no_watch: bool,
+        /// Choose which tools the MCP server advertises.
+        #[arg(long, value_enum, default_value = "full")]
+        tool_profile: McpToolProfile,
     },
     /// Serve the interactive Graph Explorer (http://localhost:4321)
     Ui {
@@ -153,7 +163,7 @@ fn main() -> Result<()> {
                 println!("  database: {}", codegraph_graph::db_path(&root).display());
             }
         }
-        Cmd::Mcp { root, path, no_watch } => {
+        Cmd::Mcp { root, path, no_watch, tool_profile } => {
             init_logging("warn");
             let root = root_or_cwd(root.or(path))?;
             let engine = Engine::open(&root)?;
@@ -161,7 +171,11 @@ fn main() -> Result<()> {
                 engine.start_watcher();
             }
             let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-            rt.block_on(codegraph_mcp::server::serve_stdio(engine))?;
+            let profile = match tool_profile {
+                McpToolProfile::Full => ToolProfile::Full,
+                McpToolProfile::Compact => ToolProfile::Compact,
+            };
+            rt.block_on(codegraph_mcp::server::serve_stdio_with_profile(engine, profile))?;
         }
         Cmd::Ui { path, port, host, no_open } => {
             init_logging("info");
